@@ -12,6 +12,15 @@
       ignoreTests: false,
     },
     {
+      description: "Auto-merge Cargo Patch Upgrades",
+      matchManagers: ["cargo"],
+      automerge: true,
+      automergeType: "pr",
+      matchUpdateTypes: ["patch", "digest"],
+      minimumReleaseAge: "3 days",
+      ignoreTests: false,
+    },
+    {
       description: "Auto-merge GitHub Actions",
       matchManagers: ["github-actions"],
       automerge: true,
