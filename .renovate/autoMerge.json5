@@ -2,6 +2,16 @@
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   packageRules: [
     {
+      description: "Auto-merge yt-dlp",
+      automerge: true,
+      automergeType: "pr",
+      matchUpdateTypes: ["major"],
+      matchPackageNames: [
+        "/yt-dlp/"
+      ],
+      ignoreTests: false,
+    },
+    {
       description: "Auto-merge GitHub Actions",
       matchManagers: ["github-actions"],
       automerge: true,
