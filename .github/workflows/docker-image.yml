@@ -11,7 +11,7 @@ jobs:
   cargo_version_bump:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       - name: Bump patch version
         run: |
           # Get the current version
@@ -41,7 +41,7 @@ jobs:
       runs-on: ubuntu-latest
       steps:
         - name: checkout repo
-          uses: actions/checkout@v6
+          uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         - name: Bump patch version
           run: |
             # Get the current version
@@ -52,14 +52,14 @@ jobs:
             sh .github/workflows/remove_dev_deps_and_version.sh stable
           shell: bash
         - name: Set up Docker Buildx
-          uses: docker/setup-buildx-action@v3
+          uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         - name: Login to DockerHub
-          uses: docker/login-action@v3
+          uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
           with:
             username: ${{ secrets.DOCKERHUB_USERNAME }}
             password: ${{ secrets.DOCKERHUB_TOKEN }}
         - name: Build and push
-          uses: docker/build-push-action@v6
+          uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
           with:
             context: ./
             file: ./Dockerfile
@@ -75,7 +75,7 @@ jobs:
       runs-on: ubuntu-latest
       steps:
         - name: checkout repo
-          uses: actions/checkout@v6
+          uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         - name: Bump patch version
           run: |
             # Get the current version
@@ -86,16 +86,16 @@ jobs:
             sh .github/workflows/remove_dev_deps_and_version.sh stable
           shell: bash
         - name: Set up QEMU
-          uses: docker/setup-qemu-action@v3
+          uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         - name: Set up Docker Buildx
-          uses: docker/setup-buildx-action@v3
+          uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         - name: Login to DockerHub
-          uses: docker/login-action@v3
+          uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
           with:
             username: ${{ secrets.DOCKERHUB_USERNAME }}
             password: ${{ secrets.DOCKERHUB_TOKEN }}
         - name: Build and push
-          uses: docker/build-push-action@v6
+          uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
           with:
             context: ./
             file: ./Dockerfile
@@ -111,11 +111,11 @@ jobs:
       runs-on: ubuntu-latest
       steps:
         - name: Set Swap Space
-          uses: pierotofy/set-swap-space@v1.0
+          uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
           with:
             swap-size-gb: 10
         - name: checkout repo
-          uses: actions/checkout@v6
+          uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         - name: get version
           run: |
             # Get the current version
@@ -126,16 +126,16 @@ jobs:
             sh .github/workflows/remove_dev_deps_and_version.sh stable
           shell: bash
         - name: Set up QEMU
-          uses: docker/setup-qemu-action@v3
+          uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         - name: Set up Docker Buildx
-          uses: docker/setup-buildx-action@v3
+          uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         - name: Login to DockerHub
-          uses: docker/login-action@v3
+          uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
           with:
             username: ${{ secrets.DOCKERHUB_USERNAME }}
             password: ${{ secrets.DOCKERHUB_TOKEN }}
         - name: Build and push
-          uses: docker/build-push-action@v6
+          uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
           with:
             context: ./
             file: ./Dockerfile
@@ -151,14 +151,14 @@ jobs:
       runs-on: ubuntu-latest
       steps:
         - name: checkout repo
-          uses: actions/checkout@v6
+          uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         - name: get version
           run: |
             # Get the current version
             VERSION=$(grep -oP '^version = "\K[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml)
             echo "VERSION=${VERSION}" >> $GITHUB_ENV
         - name: Login to DockerHub
-          uses: docker/login-action@v3
+          uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
           with:
             username: ${{ secrets.DOCKERHUB_USERNAME }}
             password: ${{ secrets.DOCKERHUB_TOKEN }}
