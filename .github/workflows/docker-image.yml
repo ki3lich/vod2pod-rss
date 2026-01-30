@@ -29,12 +29,7 @@ jobs:
           git config --local user.name "GitHub Action"
           git tag -a v$VERSION -m "version $VERSION"
           git commit -a -m "Bump patch version to $NEW_VERSION"
-          git push origin HEAD --follow-tags
-          git fetch --unshallow
-          git checkout main
-          git merge stable
-          git push origin HEAD --follow-tags
-          git checkout stable
+          git push origin main --follow-tags
 
   build_and_push_amd64:
     needs: cargo_version_bump
