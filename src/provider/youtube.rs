@@ -457,6 +457,7 @@ fn get_youtube_hub() -> YouTube<hyper_rustls::HttpsConnector<hyper::client::Http
     let auth = google_youtube3::client::NoToken;
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
+        .expect("Failed to load native root certificates")
         .https_only()
         .enable_http1()
         .build();
