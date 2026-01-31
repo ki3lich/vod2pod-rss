@@ -3,8 +3,15 @@ use simple_logger::SimpleLogger;
 use std::{env, net::TcpListener, process::exit};
 use vod2pod_rss::server;
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls ring crypto provider");
+
+    actix_rt::System::new().block_on(async_main())
+}
+
+async fn async_main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if let Some("--version") = args.get(1).cloned().as_deref() {
         let app_version = env!("CARGO_PKG_VERSION");
@@ -61,4 +68,3 @@ async fn flush_redis_on_new_version() -> eyre::Result<()> {
 
     Ok(())
 }
-
