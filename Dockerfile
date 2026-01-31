@@ -1,12 +1,23 @@
-# by using --platform=$BUILDPLATFORM we force the build step 
+# by using --platform=$BUILDPLATFORM we force the build step
 # to always run on the native architecture of the build machine
 # making the build time shorter
-FROM --platform=$BUILDPLATFORM rust:1.88 as builder
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-1.88 AS chef
+WORKDIR /app
+
+# ----------
+# Planner stage: generate the recipe.json for dependency caching
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ----------
+# Builder stage: compile the application
+FROM chef AS builder
 
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 
-#find the right build target for rust
+# Find the right build target for rust
 RUN if [ "$TARGETPLATFORM" = "linux/arm/v7" ]; then \
         export RUST_TARGET_PLATFORM=armv7-unknown-linux-gnueabihf; \
     elif [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -23,44 +34,40 @@ RUN echo "I am running on $BUILDPLATFORM, building for $TARGETPLATFORM, rust tar
 
 RUN if echo $TARGETPLATFORM | grep -q 'arm'; then \
         echo 'Installing packages for ARM platforms...'; \
-        apt-get update && apt-get install  build-essential gcc gcc-arm* gcc-aarch* -y && apt-get clean; \
+        apt-get update && apt-get install build-essential gcc gcc-arm* gcc-aarch* -y && apt-get clean; \
         echo 'gcc-arm* packages installed and cache cleaned.'; \
     fi
 
-RUN rustup target add $(cat /rust_platform.txt) 
+RUN rustup target add $(cat /rust_platform.txt)
 
-RUN cd /tmp && USER=root cargo new --bin vod2pod
+# Copy the recipe.json and build dependencies (cached layer)
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --target "$(cat /rust_platform.txt)" --recipe-path recipe.json
 
-WORKDIR /tmp/vod2pod
+# Copy source code
+COPY . .
 
-COPY Cargo.toml ./
-#trick to use github action cache, check the action folder for more info
-RUN sed '/\[dev-dependencies\]/,/^$/d' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
-
-RUN cargo fetch
-
-COPY .cargo/ ./.cargo/
-COPY src ./src
-COPY set_version.sh version.txt* ./
-COPY templates/ ./templates/
-
-RUN sh set_version.sh
+# Inject version into the HTML template
+ARG APP_VERSION
+RUN if [ -n "$APP_VERSION" ]; then \
+        sed -i "s|<!-- ###VERSION### -->|<small class=\"text-muted\"><br>v${APP_VERSION}</small>|" templates/index.html; \
+    fi
 
 RUN cargo build --release --target "$(cat /rust_platform.txt)"
 
-RUN echo "final size of vod2pod:\n $(ls -lah /tmp/vod2pod/target/*/release/app)"
+RUN echo "final size of vod2pod:\n $(ls -lah /app/target/*/release/app)"
 
-#----------
-#this step will always run on the target architecture,
-#so the build driver will need to be able to support runtime commands on it (es: using QEMU)  
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim as app
+# ----------
+# Runtime stage: this step will always run on the target architecture,
+# so the build driver will need to be able to support runtime commands on it (es: using QEMU)
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS app
 
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 
 RUN echo "I am running on $BUILDPLATFORM, building for $TARGETPLATFORM"
 COPY requirements.txt ./
-#install ffmpeg and yt-dlp
+# Install ffmpeg and yt-dlp
 RUN apt-get update && \
     apt-get install -y --no-install-recommends unzip python3 curl ca-certificates ffmpeg && \
     export YT_DLP_VERSION=$(cat requirements.txt | grep yt-dlp | cut -d "=" -f3 | awk -F. '{printf "%d.%02d.%02d\n", $1, $2, $3}') && \
@@ -75,7 +82,7 @@ RUN apt-get update && \
     apt-get -y clean && \
     rm -rf /var/lib/apt/lists/*
 
-# try to install deno with install script, do not fail if it does not work
+# Try to install deno with install script, do not fail if it does not work
 RUN apt-get update && apt-get install -y unzip curl ca-certificates && \
     curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh || true && \
     apt-get -y purge curl && \
@@ -84,8 +91,8 @@ RUN apt-get update && apt-get install -y unzip curl ca-certificates && \
     apt-get -y clean && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /tmp/vod2pod/target/*/release/app /usr/local/bin/vod2pod
-COPY --from=builder /tmp/vod2pod/templates/ ./templates
+COPY --from=builder /app/target/*/release/app /usr/local/bin/vod2pod
+COPY --from=builder /app/templates/ ./templates
 
 RUN if deno --version; then \
         echo "deno runs correctly"; \
