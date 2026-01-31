@@ -9,7 +9,7 @@ async fn health_works() {
 
     // Act
     let response = client
-        .get(&format!("{}/health", &address))
+        .get(format!("{}/health", &address))
         .send()
         .await
         .expect("Failed to execute request.");
@@ -25,7 +25,7 @@ async fn fetch_yt_feed_by_channel_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(&format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", &address))
         .query(&[("url", "https://www.youtube.com/@madiele92")])
         .send()
         .await
@@ -50,7 +50,7 @@ async fn fetch_yt_feed_by_channel_id_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(&format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", &address))
         .query(&[(
             "url",
             "https://www.youtube.com/channel/UCXssEBQ8JWH1NacVIyQXe8g",
@@ -78,7 +78,7 @@ async fn fetch_yt_feed_by_playlist_url_ok() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(&format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", &address))
         .query(&[(
             "url",
             "https://www.youtube.com/playlist?list=PL589F357911E267F7",
@@ -112,7 +112,7 @@ async fn fetch_twitch_feed_by_channel_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(&format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", &address))
         .query(&[("url", "https://www.twitch.tv/twitch")])
         .send()
         .await
@@ -146,6 +146,8 @@ fn check_youtube_feed(feed: Channel) {
     assert_eq!(".", feed.description());
     assert!(feed.image().is_some());
     assert!(!feed.items.is_empty());
+    let url_format =
+        regex::Regex::new(r"^https://i\.ytimg\.com/vi/[a-zA-Z0-9_-]*/.*\.jpg$").unwrap();
     let mut found = 0;
     for item in feed.items() {
         match item.title() {
@@ -153,18 +155,12 @@ fn check_youtube_feed(feed: Channel) {
                 let itunes = item.itunes_ext().unwrap();
                 assert_eq!(itunes.duration(), Some("00:02:37"));
                 let image_url = itunes.image().unwrap();
-                let url_format =
-                    regex::Regex::new(r"^https://i\.ytimg\.com/vi/[a-zA-Z0-9_-]*/.*\.jpg$")
-                        .unwrap();
                 assert!(url_format.is_match(image_url));
                 found += 1;
             }
             Some("effetto disegno con gimp") => {
                 let itunes = item.itunes_ext().unwrap();
                 let image_url = itunes.image().unwrap();
-                let url_format =
-                    regex::Regex::new(r"^https://i\.ytimg\.com/vi/[a-zA-Z0-9_-]*/.*\.jpg$")
-                        .unwrap();
                 assert!(url_format.is_match(image_url));
                 assert_eq!(itunes.duration(), Some("00:09:03"));
                 found += 1;
@@ -172,9 +168,6 @@ fn check_youtube_feed(feed: Channel) {
             Some("il terremoto del 7/04 alle 19:43 ripreso in diretta") => {
                 let itunes = item.itunes_ext().unwrap();
                 let image_url = itunes.image().unwrap();
-                let url_format =
-                    regex::Regex::new(r"^https://i\.ytimg\.com/vi/[a-zA-Z0-9_-]*/.*\.jpg$")
-                        .unwrap();
                 assert!(url_format.is_match(image_url));
                 assert_eq!(itunes.duration(), Some("00:02:07"));
                 found += 1;
@@ -182,9 +175,6 @@ fn check_youtube_feed(feed: Channel) {
             Some("tutorial Burning words with gimp / scritte di fuoco con gimp") => {
                 let itunes = item.itunes_ext().unwrap();
                 let image_url = itunes.image().unwrap();
-                let url_format =
-                    regex::Regex::new(r"^https://i\.ytimg\.com/vi/[a-zA-Z0-9_-]*/.*\.jpg$")
-                        .unwrap();
                 assert!(url_format.is_match(image_url));
                 assert_eq!(itunes.duration(), Some("00:04:14"));
                 found += 1;

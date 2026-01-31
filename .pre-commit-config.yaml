@@ -5,7 +5,7 @@ repos:
       - id: cargo-fmt
       - id: cargo-update
       - id: cargo-clippy
-        args: ["--all-targets", "--all-features"]
+        args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
       - id: cargo-check
         args: ["--all-targets", "--all-features"]
       - id: cargo-test
