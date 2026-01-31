@@ -3,11 +3,11 @@ use cached::proc_macro::io_cached;
 #[allow(unused_imports)]
 use cached::AsyncRedisCache;
 use feed_rs::model::Feed;
+use google_apis_common::NoToken;
 use google_youtube3::{
     api::{self, PlaylistItem},
     hyper_rustls, YouTube,
 };
-use google_apis_common::NoToken;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::{collections::HashMap, str::FromStr, time::Duration};
@@ -357,7 +357,10 @@ fn build_channel_items_from_playlist(
 
             // Filter out shorts if enabled (videos <= 3 minutes/180 seconds)
             if filter_shorts && duration_seconds <= SHORTS_THRESHOLD_SECONDS {
-                debug!("filtering out short video: {} ({} seconds)", video_id, duration_seconds);
+                debug!(
+                    "filtering out short video: {} ({} seconds)",
+                    video_id, duration_seconds
+                );
                 return None;
             }
 
@@ -487,7 +490,8 @@ async fn fetch_playlist(id: String, api_key: &String) -> Result<api::Playlist, e
     Ok(playlist)
 }
 
-fn get_youtube_hub() -> YouTube<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>> {
+fn get_youtube_hub(
+) -> YouTube<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>> {
     let auth = NoToken;
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -495,8 +499,7 @@ fn get_youtube_hub() -> YouTube<hyper_rustls::HttpsConnector<hyper_util::client:
         .https_only()
         .enable_http1()
         .build();
-    let client = Client::builder(TokioExecutor::new())
-        .build(connector);
+    let client = Client::builder(TokioExecutor::new()).build(connector);
 
     YouTube::new(client, auth)
 }
@@ -663,8 +666,11 @@ fn convert_atom_to_rss(
             if filter_shorts {
                 if let Some(seconds) = duration_seconds {
                     if seconds <= SHORTS_THRESHOLD_SECONDS {
-                        debug!("filtering out short video from atom feed: {} ({} seconds)",
-                            link.clone().unwrap_or_default(), seconds);
+                        debug!(
+                            "filtering out short video from atom feed: {} ({} seconds)",
+                            link.clone().unwrap_or_default(),
+                            seconds
+                        );
                         return None;
                     }
                 }

@@ -262,9 +262,8 @@ impl OAuthCredentials {
 impl FromRedisValue for OAuthCredentials {
     fn from_redis_value(v: redis::Value) -> Result<Self, ParsingError> {
         let raw_json = String::from_redis_value(v)?;
-        let credentials: OAuthCredentials = serde_json::from_str(&raw_json).map_err(|_e| {
-            ParsingError::from("redis twitch credential corrupted")
-        })?;
+        let credentials: OAuthCredentials = serde_json::from_str(&raw_json)
+            .map_err(|_e| ParsingError::from("redis twitch credential corrupted"))?;
         Ok(credentials)
     }
 }

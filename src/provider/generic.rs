@@ -41,4 +41,3 @@ fn get_generic_whitelist() -> Vec<Regex> {
 
     regexes
 }
-

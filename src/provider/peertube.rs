@@ -80,4 +80,3 @@ fn get_peertube_hosts() -> Vec<String> {
         .collect();
     patterns
 }
-

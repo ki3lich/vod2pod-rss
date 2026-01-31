@@ -92,4 +92,3 @@ pub fn build_default_rss_structure() -> rss::ChannelBuilder {
 mod tests {
     //use super::*;
 }
-

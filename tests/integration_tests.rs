@@ -209,4 +209,3 @@ fn spawn_app() -> String {
 
     format!("http://127.0.0.1:{}", port)
 }
-
