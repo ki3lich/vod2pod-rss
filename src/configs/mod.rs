@@ -127,8 +127,9 @@ impl Conf for EnvConf {
     }
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, Default)]
 pub enum AudioCodec {
+    #[default]
     MP3,
     Opus,
     OGGVorbis,
@@ -174,11 +175,5 @@ impl From<String> for AudioCodec {
             "OGG_VORBIS" => AudioCodec::OGGVorbis,
             _ => AudioCodec::MP3,
         }
-    }
-}
-
-impl Default for AudioCodec {
-    fn default() -> Self {
-        Self::MP3
     }
 }

@@ -1,9 +1,33 @@
 use std::error::Error;
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::process::Command;
 use std::process::Stdio;
 use std::thread::sleep;
 use std::time::Duration;
+
+/// Guard to ensure child process is waited on when dropped
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.wait();
+    }
+}
+
+impl Deref for ChildGuard {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 use actix_web::web::Bytes;
 use futures::Future;
@@ -119,11 +143,13 @@ impl Transcoder {
             expected_bytes_count: usize,
             co: Co<Result<Bytes, std::io::Error>>,
         ) {
-            let mut child = command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("failed to run commnad");
+            let mut child = ChildGuard(
+                command
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("failed to run commnad"),
+            );
 
             let mut err = child.stderr.take().expect("failed to open stderr");
             let mut out = child.stdout.take().expect("failed to open stdout");
@@ -146,15 +172,11 @@ impl Transcoder {
                     }
                     Ok(_) => {
                         error!("{}", buf);
-                        let _ = tx_stderr.blocking_send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            buf,
-                        )));
+                        let _ = tx_stderr.blocking_send(Err(std::io::Error::other(buf)));
                     }
                     Err(e) => {
                         error!("failed to read from stderr: {}", e);
-                        let _ = tx_stderr
-                            .blocking_send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                        let _ = tx_stderr.blocking_send(Err(std::io::Error::other(e)));
                         break;
                     }
                 }

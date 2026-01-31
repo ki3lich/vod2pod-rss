@@ -62,7 +62,7 @@ async fn index(req: HttpRequest) -> HttpResponse {
         info!(
             "serving homepage - User-Agent: {}, Remote Address: {}, Referer: {}",
             user_agent.to_str().unwrap(),
-            remote_addr.to_string(),
+            remote_addr,
             referer.to_str().unwrap()
         );
     }
@@ -120,7 +120,7 @@ async fn transcodize_rss(
     };
 
     let cached_rss: Option<String> = redis::cmd("GET")
-        .arg(&parsed_url.to_string())
+        .arg(parsed_url.to_string())
         .query_async(&mut redis)
         .await
         .unwrap_or_default();
@@ -162,7 +162,7 @@ async fn transcodize_rss(
         Err(_) => 600,
     };
     let _: () = redis::cmd("SET")
-        .arg(&parsed_url.to_string())
+        .arg(parsed_url.to_string())
         .arg(&body)
         .arg("EX")
         .arg(cache_ttl)
@@ -288,7 +288,7 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
         bitrate_kbit: bitrate,
         max_rate_kbit: bitrate * 30,
         expected_bytes_count: expected_bytes,
-        timeout_in_seconds: timeout_in_seconds,
+        timeout_in_seconds,
     };
     debug!("seconds: {duration_secs}, bitrate: {bitrate}");
 
