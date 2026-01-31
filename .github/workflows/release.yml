@@ -29,40 +29,26 @@ jobs:
 
       - name: Semantic Release
         id: semantic-release
-        uses: cycjimmy/semantic-release-action@61680d0e9b02ff86f856e7f473f8051a6a9a5ee0 # v4
+        uses: cycjimmy/semantic-release-action@v6
         with:
           semantic_version: 24
-          extra_plugins: |
-            @semantic-release/exec@6
-            @semantic-release/git@10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   docker:
     name: Build and Push Docker Image
     needs: release
-    # Only run if a new release was published, or on manual trigger
-    if: ${{ needs.release.outputs.new-release-published == 'true' || github.event_name == 'workflow_dispatch' }}
+    # Only run if a new release was published
+    if: ${{ needs.release.outputs.new-release-published == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Get version
-        id: get_version
-        run: |
-          if [ "${{ needs.release.outputs.new-release-version }}" != "" ]; then
-            VERSION=${{ needs.release.outputs.new-release-version }}
-          else
-            # Fallback for manual dispatch - get version from Cargo.toml
-            VERSION=$(grep -oP '^version = "\K[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml)
-          fi
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Building version: ${VERSION}"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ format('v{0}', needs.release.outputs.new-release-version) }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f7ce87c1d6cdb73e3ad7ee90a85f84d158c3b1c8 # v3
@@ -81,9 +67,9 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ env.VERSION }}
+            ghcr.io/${{ github.repository }}:${{ needs.release.outputs.new-release-version }}
             ghcr.io/${{ github.repository }}:latest
           build-args: |
-            APP_VERSION=${{ env.VERSION }}
+            APP_VERSION=${{ needs.release.outputs.new-release-version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
