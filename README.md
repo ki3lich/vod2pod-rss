@@ -90,6 +90,10 @@ To switch open the compose docker-compose.yml and edit the vod2pod image section
 Note: These can also be set using Docker [.env files](https://docs.docker.com/compose/environment-variables/env-file/) 
 
 ### Advanced YouTube Configuration
+- `YOUTUBE_FILTER_SHORTS`: Set to "true" to filter out YouTube Shorts (videos ≤3 minutes) from RSS feeds (default: "false")
+  - Useful if you only want regular videos in your podcast feed
+  - When enabled, videos with a duration of 3 minutes (180 seconds) or less will be excluded
+  - Example: `YOUTUBE_FILTER_SHORTS=true`
 - `YOUTUBE_YT_DLP_GET_URL_EXTRA_ARGS`: Additional arguments to pass to yt-dlp when extracting YouTube audio URLs
   - This variable allows you to pass custom arguments to yt-dlp for advanced configurations
   - Format: JSON array of strings, e.g. `["--arg1", "value1", "--arg2", "value2"]`

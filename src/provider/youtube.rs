@@ -32,6 +32,9 @@ use super::MediaProvider;
 
 pub struct YoutubeProvider;
 
+/// Duration threshold for YouTube Shorts (180 seconds = 3 minutes)
+const SHORTS_THRESHOLD_SECONDS: u64 = 180;
+
 enum IdType {
     Playlist(String),
     Channel(String),
@@ -73,7 +76,12 @@ impl MediaProvider for YoutubeProvider {
                     _ => return Err(eyre!("unsupported youtube url")),
                 };
 
-                let mut video_items = fetch_from_api(id, api_key).await?;
+                let filter_shorts = conf()
+                    .get(ConfName::YoutubeFilterShorts)
+                    .unwrap_or_else(|_| "false".to_string())
+                    .eq_ignore_ascii_case("true");
+
+                let mut video_items = fetch_from_api(id, api_key, filter_shorts).await?;
 
                 feed_builder.description(video_items.0.description);
                 feed_builder.title(video_items.0.title);
@@ -124,7 +132,11 @@ impl MediaProvider for YoutubeProvider {
                         get_youtube_video_duration_with_ytdlp(&link.href.parse::<Url>()?).await?,
                     );
                 }
-                return Ok(convert_atom_to_rss(feed, duration_map));
+                let filter_shorts = conf()
+                    .get(ConfName::YoutubeFilterShorts)
+                    .unwrap_or_else(|_| "false".to_string())
+                    .eq_ignore_ascii_case("true");
+                return Ok(convert_atom_to_rss(feed, duration_map, filter_shorts));
             }
         }
     }
@@ -153,7 +165,11 @@ impl MediaProvider for YoutubeProvider {
     }
 }
 
-async fn fetch_from_api(id: IdType, api_key: String) -> eyre::Result<(Channel, Vec<Item>)> {
+async fn fetch_from_api(
+    id: IdType,
+    api_key: String,
+    filter_shorts: bool,
+) -> eyre::Result<(Channel, Vec<Item>)> {
     match id {
         IdType::Playlist(id) => {
             info!("fetching playlist {}", id);
@@ -169,7 +185,7 @@ async fn fetch_from_api(id: IdType, api_key: String) -> eyre::Result<(Channel, V
 
             let duration_map = create_duration_url_map(&items, &api_key).await?;
 
-            let rss_items = build_channel_items_from_playlist(items, duration_map);
+            let rss_items = build_channel_items_from_playlist(items, duration_map, filter_shorts);
 
             Ok((rss_channel, rss_items))
         }
@@ -194,7 +210,7 @@ async fn fetch_from_api(id: IdType, api_key: String) -> eyre::Result<(Channel, V
 
             let duration_map = create_duration_url_map(&items, &api_key).await?;
 
-            let rss_items = build_channel_items_from_playlist(items, duration_map);
+            let rss_items = build_channel_items_from_playlist(items, duration_map, filter_shorts);
 
             Ok((rss_channel, rss_items))
         }
@@ -318,6 +334,7 @@ async fn create_duration_url_map(
 fn build_channel_items_from_playlist(
     items: Vec<PlaylistItem>,
     videos_infos: HashMap<String, VideoExtraInfo>,
+    filter_shorts: bool,
 ) -> Vec<Item> {
     let rss_item: Vec<Item> = items
         .into_iter()
@@ -327,6 +344,23 @@ fn build_channel_items_from_playlist(
             let description = snippet.description.take().unwrap_or("".to_owned());
             let video_id = snippet.resource_id.take()?.video_id?;
             let url = Url::parse(&format!("https://www.youtube.com/watch?v={}", &video_id)).ok()?;
+
+            let video_infos = videos_infos.get(&video_id).or_else(|| {
+                warn!("no duration found for {:?}", &video_id);
+                None
+            })?;
+
+            // Calculate duration in seconds for filtering (fields are f32)
+            let duration_seconds = (video_infos.duration.hour * 3600.0
+                + video_infos.duration.minute * 60.0
+                + video_infos.duration.second) as u64;
+
+            // Filter out shorts if enabled (videos <= 3 minutes/180 seconds)
+            if filter_shorts && duration_seconds <= SHORTS_THRESHOLD_SECONDS {
+                debug!("filtering out short video: {} ({} seconds)", video_id, duration_seconds);
+                return None;
+            }
+
             let mut item_builder = ItemBuilder::default();
             item_builder.title(Some(title));
             item_builder.description(Some(description.clone()));
@@ -338,10 +372,7 @@ fn build_channel_items_from_playlist(
                     .map(|pub_date| pub_date.to_rfc2822().to_string()),
             );
             item_builder.author(snippet.channel_title.take());
-            let video_infos = videos_infos.get(&video_id).or_else(|| {
-                warn!("no duration found for {:?}", &video_id);
-                None
-            })?;
+
             let itunes_item_extension = ITunesItemExtensionBuilder::default()
                 .summary(Some(description))
                 .duration(Some({
@@ -593,7 +624,11 @@ async fn find_yt_channel_url_with_c_id(url: &Url) -> eyre::Result<Url> {
     Ok(Url::parse(feed_url)?)
 }
 
-fn convert_atom_to_rss(feed: Feed, duration_map: HashMap<String, Option<usize>>) -> String {
+fn convert_atom_to_rss(
+    feed: Feed,
+    duration_map: HashMap<String, Option<usize>>,
+    filter_shorts: bool,
+) -> String {
     let mut feed_builder = provider::build_default_rss_structure();
     feed_builder.description(feed.description.map(|d| d.content).unwrap_or_default());
     feed_builder.title(feed.title.map(|d| d.content).unwrap_or_default());
@@ -614,7 +649,27 @@ fn convert_atom_to_rss(feed: Feed, duration_map: HashMap<String, Option<usize>>)
     let items = feed
         .entries
         .into_iter()
-        .map(|entry| {
+        .filter_map(|entry| {
+            let link = entry.links.first().map(|d| d.clone().href);
+
+            // Get duration for filtering
+            let duration_seconds = (|| -> Option<u64> {
+                duration_map
+                    .get(&link.clone()?)
+                    .and_then(|s| s.map(|a| a as u64))
+            })();
+
+            // Filter out shorts if enabled (videos <= 3 minutes/180 seconds)
+            if filter_shorts {
+                if let Some(seconds) = duration_seconds {
+                    if seconds <= SHORTS_THRESHOLD_SECONDS {
+                        debug!("filtering out short video from atom feed: {} ({} seconds)",
+                            link.clone().unwrap_or_default(), seconds);
+                        return None;
+                    }
+                }
+            }
+
             let mut item_builder = ItemBuilder::default();
             item_builder.title(entry.title.map(|d| d.content));
             item_builder.description(
@@ -623,7 +678,6 @@ fn convert_atom_to_rss(feed: Feed, duration_map: HashMap<String, Option<usize>>)
                     .first()
                     .and_then(|d| Some(d.clone().description?.content)),
             );
-            let link = entry.links.first().map(|d| d.clone().href);
             item_builder.link(link.clone());
             let mut itunes_item_builder = ITunesItemExtensionBuilder::default();
             let media = entry.media.first();
@@ -632,16 +686,12 @@ fn convert_atom_to_rss(feed: Feed, duration_map: HashMap<String, Option<usize>>)
                     .and_then(|m| m.thumbnails.first())
                     .map(|t| t.clone().image.uri),
             );
-            let duration = (|| -> Option<_> {
-                duration_map
-                    .get(&link?)
-                    .map(|s| s.map(|a| format!("{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60)))
-            })()
-            .flatten();
+            let duration = duration_seconds
+                .map(|a| format!("{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60));
             itunes_item_builder.duration(duration);
             item_builder.itunes_ext(Some(itunes_item_builder.build()));
             item_builder.guid(Some(GuidBuilder::default().value(entry.id).build()));
-            item_builder.build()
+            Some(item_builder.build())
         })
         .collect::<Vec<Item>>();
     feed_builder.items(items);
