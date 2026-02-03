@@ -22,7 +22,7 @@ jobs:
       new-release-version: ${{ steps.semantic-release.outputs.new_release_version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -46,7 +46,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout repo
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ format('v{0}', needs.release.outputs.new-release-version) }}
 
