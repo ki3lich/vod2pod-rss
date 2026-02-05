@@ -15,7 +15,7 @@ path = "src/main.rs"
 actix-rt = "=2.11.0"
 google-youtube3 = "=7.0.0"
 google-apis-common = "=8.0.0"
-hyper-util = { version = "=0.1.19", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-util = { version = "=0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 actix-web = "=4.12.1"
 async-trait = "=0.1.89"
 url = { version="=2.5.8", features = ["serde"]}
