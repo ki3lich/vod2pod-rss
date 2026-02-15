@@ -12,11 +12,11 @@
       ignoreTests: false,
     },
     {
-      description: "Auto-merge Cargo Patch Upgrades",
+      description: "Auto-merge Cargo Minor Upgrades",
       matchManagers: ["cargo"],
       automerge: true,
       automergeType: "pr",
-      matchUpdateTypes: ["patch", "digest"],
+      matchUpdateTypes: ["minior", "patch", "digest"],
       minimumReleaseAge: "3 days",
       ignoreTests: false,
     },
