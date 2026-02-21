@@ -16,7 +16,7 @@
       matchManagers: ["cargo"],
       automerge: true,
       automergeType: "pr",
-      matchUpdateTypes: ["minior", "patch", "digest"],
+      matchUpdateTypes: ["minor", "patch", "digest"],
       minimumReleaseAge: "3 days",
       ignoreTests: false,
     },
