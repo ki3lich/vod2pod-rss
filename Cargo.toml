@@ -31,7 +31,7 @@ genawaiter = {version = "=0.99", features = ["futures03"] }
 openssl = { version = "*", features = ["vendored"] } #this is here just to make cross-compiling work during github actions
 rss = { version = "=2.0", features = ["serde"] }
 eyre = "=0.6"
-simple_logger = "=5.1"
+simple_logger = "=5.2.0"
 redis = { version = "=1.0", features = ["tokio-comp"] }
 mime = "=0.3.17"
 cached = { version = "=0.56.0", features = ["redis_tokio"] }
