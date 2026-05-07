@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::TcpListener, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    net::TcpListener,
+    time::{Duration, Instant},
+};
 
 use actix_web::{
     dev::Server, guard, http, middleware, web, App, HttpRequest, HttpResponse, HttpServer,

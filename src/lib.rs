@@ -7,7 +7,7 @@ pub mod server;
 pub mod transcoder;
 
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init_crypto_provider() {
     rustls::crypto::ring::default_provider()
         .install_default()
