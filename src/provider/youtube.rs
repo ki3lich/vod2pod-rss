@@ -17,6 +17,7 @@ use eyre::eyre;
 use log::{debug, info, warn};
 use regex::Regex;
 use reqwest::Url;
+use futures::stream::{self, StreamExt};
 use rss::{
     extension::itunes::{ITunesChannelExtensionBuilder, ITunesItemExtensionBuilder},
     Channel, ChannelBuilder, GuidBuilder, ImageBuilder, Item, ItemBuilder,
@@ -126,11 +127,25 @@ impl MediaProvider for YoutubeProvider {
                 let raw_atom_feed = reqwest::get(feed).await?.text().await?;
                 let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..]).unwrap();
                 let mut duration_map: HashMap<String, Option<usize>> = HashMap::default();
-                for link in feed.clone().entries.iter().filter_map(|e| e.links.first()) {
-                    duration_map.insert(
-                        link.clone().href,
-                        get_youtube_video_duration_with_ytdlp(&link.href.parse::<Url>()?).await?,
-                    );
+                let urls: Vec<String> = feed.entries.iter()
+                    .filter_map(|e| e.links.first())
+                    .map(|link| link.href.clone())
+                    .collect();
+
+                let futures = urls.into_iter().map(|href| async move {
+                    let url = href.parse::<Url>()?;
+                    let duration = get_youtube_video_duration_with_ytdlp(&url).await?;
+                    Ok::<_, eyre::Error>((href, duration))
+                });
+
+                let results: Vec<_> = stream::iter(futures)
+                    .buffer_unordered(4)
+                    .collect()
+                    .await;
+
+                for result in results {
+                    let (href, duration) = result?;
+                    duration_map.insert(href, duration);
                 }
                 let filter_shorts = conf()
                     .get(ConfName::YoutubeFilterShorts)
