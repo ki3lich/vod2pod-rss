@@ -14,10 +14,10 @@ use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use eyre::eyre;
+use futures::stream::{self, StreamExt};
 use log::{debug, info, warn};
 use regex::Regex;
 use reqwest::Url;
-use futures::stream::{self, StreamExt};
 use rss::{
     extension::itunes::{ITunesChannelExtensionBuilder, ITunesItemExtensionBuilder},
     Channel, ChannelBuilder, GuidBuilder, ImageBuilder, Item, ItemBuilder,
@@ -127,7 +127,9 @@ impl MediaProvider for YoutubeProvider {
                 let raw_atom_feed = reqwest::get(feed).await?.text().await?;
                 let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..]).unwrap();
                 let mut duration_map: HashMap<String, Option<usize>> = HashMap::default();
-                let urls: Vec<String> = feed.entries.iter()
+                let urls: Vec<String> = feed
+                    .entries
+                    .iter()
                     .filter_map(|e| e.links.first())
                     .map(|link| link.href.clone())
                     .collect();
@@ -138,10 +140,7 @@ impl MediaProvider for YoutubeProvider {
                     Ok::<_, eyre::Error>((href, duration))
                 });
 
-                let results: Vec<_> = stream::iter(futures)
-                    .buffer_unordered(4)
-                    .collect()
-                    .await;
+                let results: Vec<_> = stream::iter(futures).buffer_unordered(4).collect().await;
 
                 for result in results {
                     let (href, duration) = result?;
