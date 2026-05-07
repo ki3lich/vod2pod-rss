@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::TcpListener, time::Instant};
+use std::{collections::HashMap, net::TcpListener, time::{Duration, Instant}};
 
 use actix_web::{
     dev::Server, guard, http, middleware, web, App, HttpRequest, HttpResponse, HttpServer,
@@ -303,8 +303,13 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
             .finish();
     }
 
-    match Transcoder::new(&ffmpeg_paramenters).await {
-        Ok(transcoder) => {
+    match tokio::time::timeout(
+        Duration::from_secs(timeout_in_seconds.try_into().unwrap_or(300)),
+        Transcoder::new(&ffmpeg_paramenters),
+    )
+    .await
+    {
+        Ok(Ok(transcoder)) => {
             let stream = transcoder.get_transcode_stream();
 
             let mut response_builder = if ffmpeg_paramenters.seek_time <= 0.1 {
@@ -323,7 +328,8 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
                 .no_chunking((expected_bytes).try_into().unwrap())
                 .streaming(stream)
         }
-        Err(e) => HttpResponse::ServiceUnavailable().body(e.to_string()),
+        Ok(Err(e)) => HttpResponse::ServiceUnavailable().body(e.to_string()),
+        Err(_) => HttpResponse::ServiceUnavailable().body("transcoder initialization timed out"),
     }
 }
 

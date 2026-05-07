@@ -12,7 +12,7 @@ use rss::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
     configs::{conf, Conf, ConfName},
@@ -219,16 +219,18 @@ struct VodsData {
 
 async fn get_twitch_stream_url(url: &Url) -> eyre::Result<Url> {
     debug!("getting stream_url for twitch video: {}", url);
-    let output = tokio::process::Command::new("yt-dlp")
+    let mut command = tokio::process::Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
         .arg("-f")
         .arg("bestaudio")
         .arg("--get-url")
-        .arg(url.as_str())
-        .output()
-        .await;
+        .arg(url.as_str());
+
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
 
     match output {
-        Ok(x) => {
+        Ok(Ok(x)) => {
             let raw_url = std::str::from_utf8(&x.stdout).unwrap_or_default();
             match Url::from_str(raw_url) {
                 Ok(url) => Ok(url),
@@ -241,7 +243,8 @@ async fn get_twitch_stream_url(url: &Url) -> eyre::Result<Url> {
                 }
             }
         }
-        Err(e) => Err(eyre::eyre!(e)),
+        Ok(Err(e)) => Err(eyre::eyre!(e)),
+        Err(_) => Err(eyre::eyre!("yt-dlp timed out after 120s")),
     }
 }
 

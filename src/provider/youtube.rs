@@ -522,6 +522,7 @@ async fn get_youtube_stream_url(url: &Url) -> eyre::Result<Url> {
         serde_json::from_str(conf().get(ConfName::YoutubeYtDlpExtraArgs)?.as_str()).map_err(|_| eyre!(r#"failed to parse YOUTUBE_YT_DLP_GET_URL_EXTRA_ARGS allowed syntax is ["arg1#", "arg2", "arg3", ...]"#))?;
     let mut command = tokio::process::Command::new("yt-dlp");
     command
+        .kill_on_drop(true)
         .arg("-f")
         .arg("bestaudio")
         .arg("--get-url")
@@ -531,10 +532,10 @@ async fn get_youtube_stream_url(url: &Url) -> eyre::Result<Url> {
         command.arg(arg);
     }
 
-    let output = command.output().await;
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
 
     match output {
-        Ok(x) => {
+        Ok(Ok(x)) => {
             let raw_url = std::str::from_utf8(&x.stdout).unwrap_or_default();
             match Url::from_str(raw_url) {
                 Ok(url) => Ok(url),
@@ -549,7 +550,8 @@ async fn get_youtube_stream_url(url: &Url) -> eyre::Result<Url> {
                 }
             }
         }
-        Err(e) => Err(eyre::eyre!(e)),
+        Ok(Err(e)) => Err(eyre::eyre!(e)),
+        Err(_) => Err(eyre::eyre!("yt-dlp timed out after 120s")),
     }
 }
 
@@ -607,14 +609,17 @@ async fn feed_url_for_yt_channel(url: &Url) -> eyre::Result<Url> {
 )]
 async fn find_yt_channel_url_with_c_id(url: &Url) -> eyre::Result<Url> {
     info!("conversion not in cache, using yt-dlp for conversion...");
-    let output = Command::new("yt-dlp")
+    let mut command = Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
         .arg("--playlist-items")
         .arg("0")
         .arg("-O")
         .arg("playlist:channel_url")
-        .arg(url.to_string())
-        .output()
-        .await?;
+        .arg(url.to_string());
+
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
+    let output = output.map_err(|_| eyre::eyre!("yt-dlp timed out after 120s"))??;
     let conversion = std::str::from_utf8(&output.stdout);
     let feed_url = match conversion {
         Ok(feed_url) => feed_url,
@@ -726,23 +731,33 @@ fn convert_atom_to_rss(
 async fn get_youtube_video_duration_with_ytdlp(url: &Url) -> eyre::Result<Option<usize>> {
     debug!("getting duration for yt video: {}", url);
 
-    let output = Command::new("yt-dlp")
+    let mut command = Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
         .arg("--get-duration")
-        .arg(url.to_string())
-        .output()
-        .await;
-    if let Ok(x) = output {
-        let duration_str = std::str::from_utf8(&x.stdout).unwrap().trim().to_string();
-        Ok(Some(
-            parse_duration(&duration_str)
-                .unwrap_or_default()
-                .as_secs()
-                .try_into()
-                .unwrap(),
-        ))
-    } else {
-        warn!("could not parse youtube video duration");
-        Ok(Some(0))
+        .arg(url.to_string());
+
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
+
+    match output {
+        Ok(Ok(x)) => {
+            let duration_str = std::str::from_utf8(&x.stdout).unwrap().trim().to_string();
+            Ok(Some(
+                parse_duration(&duration_str)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .try_into()
+                    .unwrap(),
+            ))
+        }
+        Err(_) => {
+            warn!("yt-dlp duration fetch timed out after 120s");
+            Ok(None)
+        }
+        Ok(Err(_)) => {
+            warn!("could not parse youtube video duration");
+            Ok(None)
+        }
     }
 }
 
