@@ -103,6 +103,7 @@ impl Transcoder {
                 "-acodec",
                 ffmpeg_paramenters.audio_codec.get_ffmpeg_codec_str(),
             ])
+            .args(["-threads", "0"])
             .args([
                 "-ab",
                 format!("{}k", ffmpeg_paramenters.bitrate_kbit).as_str(),
@@ -154,7 +155,7 @@ impl Transcoder {
             let mut err = child.stderr.take().expect("failed to open stderr");
             let mut out = child.stdout.take().expect("failed to open stdout");
 
-            let channel_size: usize = 10;
+            let channel_size: usize = 100;
             type ChannelBytes = Result<Bytes, std::io::Error>;
             let (tx, mut rx): (Sender<ChannelBytes>, Receiver<ChannelBytes>) =
                 channel(channel_size);
@@ -184,7 +185,7 @@ impl Transcoder {
 
             //stdout thread
             std::thread::spawn(move || {
-                const BUFFER_SIZE: usize = 1024;
+                const BUFFER_SIZE: usize = 16384;
                 let mut buff: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
                 let mut tries = 0;
                 let mut sent_bytes_count: usize = 0;
