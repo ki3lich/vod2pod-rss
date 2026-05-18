@@ -72,6 +72,7 @@ async fn index(req: HttpRequest) -> HttpResponse {
     }
 
     let html = std::fs::read_to_string("./templates/index.html").unwrap();
+
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 async fn transcodize_rss(
