@@ -124,8 +124,17 @@ impl MediaProvider for YoutubeProvider {
                     path if path.starts_with("/@") => feed_url_for_yt_channel(&channel_url).await,
                     _ => Err(eyre!("unsupported youtube url")),
                 }?;
-                let raw_atom_feed = reqwest::get(feed).await?.text().await?;
-                let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..]).unwrap();
+                let response = reqwest::get(feed).await?;
+                if !response.status().is_success() {
+                    return Err(eyre!(
+                        "YouTube feed returned error: {} {}",
+                        response.status().as_u16(),
+                        response.status().canonical_reason().unwrap_or("Unknown")
+                    ));
+                }
+                let raw_atom_feed = response.text().await?;
+                let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..])
+                    .map_err(|e| eyre!("Failed to parse YouTube feed: {}", e))?;
                 let mut duration_map: HashMap<String, Option<usize>> = HashMap::default();
                 let urls: Vec<String> = feed
                     .entries
