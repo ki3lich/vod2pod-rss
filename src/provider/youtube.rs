@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
-use cached::proc_macro::io_cached;
+use cached::macros::concurrent_cached;
 #[allow(unused_imports)]
-use cached::AsyncRedisCache;
+use cached::{AsyncRedisCache, ConcurrentCachedAsync};
 use feed_rs::model::Feed;
 use google_apis_common::NoToken;
 use google_youtube3::{
@@ -527,13 +527,13 @@ fn get_youtube_hub(
     YouTube::new(client, auth)
 }
 
-#[io_cached(
+#[concurrent_cached(
     map_error = r##"|e| eyre::Error::new(e)"##,
     ty = "AsyncRedisCache<Url, Url>",
     create = r##" {
         AsyncRedisCache::new("cached_yt_stream_url=", std::time::Duration::from_secs(18000))
-            .set_refresh(false)
-            .set_connection_string(&conf().get(ConfName::RedisUrl).unwrap())
+            .refresh(false)
+            .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
             .build()
             .await
             .expect("get_youtube_stream_url cache")
@@ -617,13 +617,13 @@ async fn feed_url_for_yt_channel(url: &Url) -> eyre::Result<Url> {
 
 #[cfg_attr(
     not(test),
-    io_cached(
+    concurrent_cached(
         map_error = r##"|e| eyre::Error::new(e)"##,
         ty = "AsyncRedisCache<Url, Url>",
         create = r##" {
         AsyncRedisCache::new("youtube_channel_username_to_id=", std::time::Duration::from_secs(9999999))
-            .set_refresh(false)
-            .set_connection_string(&conf().get(ConfName::RedisUrl).unwrap())
+            .refresh(false)
+            .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
             .build()
             .await
             .expect("youtube_channel_username_to_id cache")
@@ -738,13 +738,13 @@ fn convert_atom_to_rss(
 
 #[cfg_attr(
     not(test),
-    io_cached(
+    concurrent_cached(
         map_error = r##"|e| eyre::Error::new(e)"##,
         ty = "AsyncRedisCache<Url, Option<usize>>",
         create = r##" {
         AsyncRedisCache::new("cached_yt_video_duration=", std::time::Duration::from_secs(86400))
-            .set_refresh(false)
-            .set_connection_string(&conf().get(ConfName::RedisUrl).unwrap())
+            .refresh(false)
+            .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
             .build()
             .await
             .expect("youtube_duration cache")
