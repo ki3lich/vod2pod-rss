@@ -36,7 +36,7 @@ redis = { version = "=1.2.2", features = ["tokio-comp"] }
 mime = "=0.3.17"
 cached = { version = "=1.1.0", features = ["redis_tokio"] }
 iso8601-duration = "=0.2.0"
-chrono = "=0.4.44"
+chrono = "=0.4.45"
 feed-rs = "=2.3.1"
 rustls = { version = "=0.23.40", default-features = false, features = ["ring"] }
 
