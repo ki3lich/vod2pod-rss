@@ -12,7 +12,7 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID:-}
 
   redis:
-    image: "redis:8.8"
+    image: "redis:8.10"
     command: redis-server --save 20 1 --loglevel warning
     ports:
       - '6379:6379'
