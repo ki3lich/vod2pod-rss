@@ -38,7 +38,7 @@ cached = { version = "=2.0.2", features = ["redis_tokio"] }
 iso8601-duration = "=0.2.0"
 chrono = "=0.4.45"
 feed-rs = "=2.4.0"
-rustls = { version = "=0.23.42", default-features = false, features = ["ring"] }
+rustls = { version = "=0.23.43", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 temp-env ={ version = "=0.3.6", features = ["async_closure"] }
