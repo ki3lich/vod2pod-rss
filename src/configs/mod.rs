@@ -27,6 +27,7 @@ pub enum ConfName {
     YoutubeYtDlpExtraArgs,
     CacheTTL,
     FfmpegTimeoutSeconds,
+    PreflightTimeoutSeconds,
     Host,
     Port,
 }
@@ -124,6 +125,14 @@ impl Conf for EnvConf {
             }
             ConfName::FfmpegTimeoutSeconds => {
                 Ok(std::env::var("FFMPEG_TIMEOUT_SECONDS").unwrap_or_else(|_| "300".to_string()))
+            }
+            ConfName::PreflightTimeoutSeconds => {
+                // Max seconds to wait for a TCP handshake to the resolved media
+                // stream URL before declaring the source unreachable. Guards
+                // against CDN edge nodes that resolve but silently drop SYNs
+                // (the kernel ~127s ETIMEDOUT that ffmpeg would otherwise hang
+                // on). Tunable because some ISPs route to flaky edge nodes.
+                Ok(std::env::var("PREFLIGHT_TIMEOUT_SECONDS").unwrap_or_else(|_| "3".to_string()))
             }
             ConfName::Host => {
                 Ok(std::env::var("VOD2POD_RSS_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()))

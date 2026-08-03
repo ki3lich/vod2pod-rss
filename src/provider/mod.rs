@@ -48,6 +48,20 @@ pub trait MediaProvider {
     /// * `media_url` - The original URL found inside the RSS that should be streamed.
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url>;
 
+    /// Drop any cached resolved stream URL for `media_url`.
+    ///
+    /// Providers that cache the resolved stream URL (e.g. YouTube, which caches
+    /// the yt-dlp googlevideo URL in Redis) override this so that when a stream
+    /// URL is discovered to point at an unreachable source it is evicted and the
+    /// next request re-resolves (the upstream CDN edge may have rotated). The
+    /// default is a no-op for providers that do not cache stream URLs.
+    ///
+    /// Should be best-effort: implementations return `Ok(())` even if the cache
+    /// is unavailable, since eviction failure must not mask the original error.
+    async fn evict_stream_url_cache(&self, _media_url: &Url) -> eyre::Result<()> {
+        Ok(())
+    }
+
     /// Returns the regular expressions that will match all urls offered by the provider.
     /// This are the url associated with the provider
     /// es: for youtube you would need to match

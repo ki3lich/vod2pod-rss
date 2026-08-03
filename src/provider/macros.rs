@@ -42,6 +42,10 @@ impl MediaProvider for $name {
         provider_dispatcher!($name, self $(,$provider)* ; get_stream_url(&media_url).await);
     }
 
+    async fn evict_stream_url_cache(&self, media_url: &Url) -> eyre::Result<()> {
+        provider_dispatcher!($name, self $(,$provider)* ; evict_stream_url_cache(media_url).await);
+    }
+
     fn domain_whitelist_regexes(&self) -> Vec<Regex> {
         provider_dispatcher!($name, self $(,$provider)* ; domain_whitelist_regexes());
     }

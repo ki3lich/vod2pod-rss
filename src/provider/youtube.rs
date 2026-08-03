@@ -168,6 +168,10 @@ impl MediaProvider for YoutubeProvider {
         get_youtube_stream_url(media_url).await
     }
 
+    async fn evict_stream_url_cache(&self, media_url: &Url) -> eyre::Result<()> {
+        evict_cached_yt_stream_url(media_url).await
+    }
+
     fn domain_whitelist_regexes(&self) -> Vec<Regex> {
         let youtube_whitelist = vec![
             regex::Regex::new(r"^(https://)?.*\.youtube\.com/").unwrap(),
@@ -527,11 +531,23 @@ fn get_youtube_hub(
     YouTube::new(client, auth)
 }
 
+/// Redis key prefix for the cached resolved youtube stream URL. Shared by the
+/// `#[concurrent_cached]` cache below and by [`stream_url_cache_key`] so the
+/// cache writer and the eviction reader cannot drift apart.
+const YT_STREAM_URL_CACHE_PREFIX: &str = "cached_yt_stream_url=";
+
+/// The `cached` crate's default Redis key namespace. The eviction key is built
+/// as `{namespace}:{prefix}:{key}` to mirror `cached::stores::redis::generate_redis_key`;
+/// if a future `cached` version changes this default, eviction must be updated
+/// to match (or, preferably, replaced with the crate's own `cache_remove` once
+/// the `#[concurrent_cached]` macro exposes the cache handle).
+const CACHED_REDIS_STORE_NAMESPACE: &str = "cached-redis-store";
+
 #[concurrent_cached(
     map_error = r##"|e| eyre::Error::new(e)"##,
     ty = "AsyncRedisCache<Url, Url>",
     create = r##" {
-        AsyncRedisCache::new("cached_yt_stream_url=", std::time::Duration::from_secs(18000))
+        AsyncRedisCache::new(YT_STREAM_URL_CACHE_PREFIX, std::time::Duration::from_secs(900))
             .refresh(false)
             .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
             .build()
@@ -576,6 +592,59 @@ async fn get_youtube_stream_url(url: &Url) -> eyre::Result<Url> {
         Ok(Err(e)) => Err(eyre::eyre!(e)),
         Err(_) => Err(eyre::eyre!("yt-dlp timed out after 120s")),
     }
+}
+
+/// Build the Redis key under which [`get_youtube_stream_url`] caches the
+/// resolved googlevideo URL for `watch_url`.
+///
+/// This mirrors the key format produced by the `cached` crate's
+/// `AsyncRedisCache` (see `cached::stores::redis::generate_redis_key`):
+/// `{namespace}:{prefix}:{key}`, where namespace is the crate default
+/// `cached-redis-store`, prefix is `"cached_yt_stream_url="` (passed to
+/// `AsyncRedisCache::new` above), and key is the `Url`'s `Display` form.
+///
+/// If the `cached` crate ever changes its key layout this must be updated to
+/// match, or — preferably — replaced with the crate's own
+/// `AsyncRedisCache::cache_remove` once the `#[concurrent_cached]` macro
+/// exposes the cache handle in a stable way.
+fn stream_url_cache_key(watch_url: &Url) -> String {
+    // Mirrors `cached::stores::redis::generate_redis_key`: colon-joined
+    // `{namespace}:{prefix}:{key}` (namespace trailing colon trimmed). The
+    // prefix ends in `=`, so the second colon is the prefix→key separator.
+    format!("{CACHED_REDIS_STORE_NAMESPACE}:{YT_STREAM_URL_CACHE_PREFIX}:{watch_url}")
+}
+
+/// Best-effort eviction of the cached googlevideo stream URL for `watch_url`.
+///
+/// Called when a stream URL is found to be unreachable so the next request
+/// re-resolves via yt-dlp (the upstream CDN edge may have rotated to a working
+/// node). Always returns `Ok(())`: a Redis failure must not mask the original
+/// transcode error.
+async fn evict_cached_yt_stream_url(watch_url: &Url) -> eyre::Result<()> {
+    let key = stream_url_cache_key(watch_url);
+    match crate::get_redis_client().await {
+        Ok(mut redis) => {
+            match redis::cmd("DEL")
+                .arg(&key)
+                .query_async::<i64>(&mut redis)
+                .await
+            {
+                Ok(removed) => {
+                    info!(
+                        "evicted cached youtube stream url for {watch_url} \
+                         (key {key}, removed {removed} entry/entries)"
+                    );
+                }
+                Err(e) => {
+                    warn!("failed to evict cached youtube stream url (key {key}): {e}");
+                }
+            }
+        }
+        Err(e) => {
+            warn!("redis unavailable, could not evict cached youtube stream url: {e}");
+        }
+    }
+    Ok(())
 }
 
 async fn feed_url_for_yt_playlist(url: &Url) -> eyre::Result<Url> {
@@ -926,5 +995,17 @@ mod tests {
             assert!(item.title.is_some());
             assert!(item.description.is_some());
         }
+    }
+
+    // Guards the eviction key format. `evict_cached_yt_stream_url` DELs this
+    // exact string from Redis; if it drifts from the `cached` crate's
+    // `{namespace}:{prefix}:{key}` layout, eviction silently stops working.
+    #[test]
+    fn stream_url_cache_key_matches_cached_crate_format() {
+        let url = Url::parse("https://www.youtube.com/watch?v=2nXNCuDjgs0").unwrap();
+        assert_eq!(
+            stream_url_cache_key(&url),
+            "cached-redis-store:cached_yt_stream_url=:https://www.youtube.com/watch?v=2nXNCuDjgs0"
+        );
     }
 }
