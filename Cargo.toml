@@ -34,7 +34,7 @@ eyre = "=0.6"
 simple_logger = "=5.2.0"
 redis = { version = "=1.6.0", features = ["tokio-comp"] }
 mime = "=0.3.17"
-cached = { version = "=2.0.2", features = ["redis_tokio"] }
+cached = { version = "=4.0.0", features = ["redis_tokio"] }
 iso8601-duration = "=0.2.0"
 chrono = "=0.4.45"
 feed-rs = "=2.4.0"
