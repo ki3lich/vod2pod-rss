@@ -142,7 +142,7 @@ impl Transcoder {
             // — it is bound to the real provider selected by `provider::from`
             // (which dispatches by URL) and to a live Redis — so it is exercised
             // only end-to-end. The pure verdict logic above (`interpret_preflight_connect`)
-            // and the cache-key format (`stream_url_cache_key`) are unit-tested.
+            // is unit-tested.
             let _ = provider
                 .evict_stream_url_cache(&ffmpeg_paramenters.url)
                 .await;
