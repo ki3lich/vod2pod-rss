@@ -1,7 +1,11 @@
 # by using --platform=$BUILDPLATFORM we force the build step
 # to always run on the native architecture of the build machine
 # making the build time shorter
-FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-1.92 AS chef
+# NOTE: DEBIAN_CODENAME is shared by the builder (cargo-chef) and runtime
+# (debian) base tags: the binary must be compiled against the same glibc as the
+# runtime image's, or it will not start ("GLIBC_x.y not found")
+ARG DEBIAN_CODENAME=bookworm
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-1.92-${DEBIAN_CODENAME} AS chef
 WORKDIR /app
 
 # ----------
@@ -60,7 +64,7 @@ RUN echo "final size of vod2pod:\n $(ls -lah /app/target/*/release/app)"
 # ----------
 # Runtime stage: this step will always run on the target architecture,
 # so the build driver will need to be able to support runtime commands on it (es: using QEMU)
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS app
+FROM --platform=$TARGETPLATFORM debian:${DEBIAN_CODENAME}-slim AS app
 
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
