@@ -4,10 +4,8 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 
 ## Conventions
 
-**Fork boundary (hard rule)**: never write to `madiele/vod2pod-rss` (upstream) —
-no issues, PRs, comments, labels, or pushes. Every `gh` write must pass
-`-R ki3lich/vod2pod-rss` explicitly, because `gh` defaults to the git remote,
-which points upstream. Reading upstream is fine.
+**Fork boundary**: every `gh` write passes `-R ki3lich/vod2pod-rss` — the
+authoritative rule lives in `CLAUDE.md` ("Fork boundary").
 
 - **Create an issue**: `gh issue create -R ki3lich/vod2pod-rss --title "..." --body "..."`. Use a heredoc for multi-line bodies.
 - **Read an issue**: `gh issue view <number> -R ki3lich/vod2pod-rss --comments`, filtering comments by `jq` and also fetching labels.
@@ -15,9 +13,6 @@ which points upstream. Reading upstream is fine.
 - **Comment on an issue**: `gh issue comment <number> -R ki3lich/vod2pod-rss --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> -R ki3lich/vod2pod-rss --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> -R ki3lich/vod2pod-rss --comment "..."`
-
-Writes default to the git remote (upstream) if `-R` is omitted — that is exactly
-what must never happen; read-only calls may omit `-R` to inspect upstream.
 
 ## Pull requests as a triage surface
 

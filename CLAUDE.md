@@ -1,14 +1,15 @@
 ## Agent skills
 
+### Fork boundary (hard rule — every GitHub write)
+
+Every `gh` write — issues, PRs, comments, labels, edits, closes — targets
+`ki3lich/vod2pod-rss` and passes `-R ki3lich/vod2pod-rss` explicitly, since
+`gh` defaults to the git remote, which points upstream. Nothing is ever
+written to `madiele/vod2pod-rss` (upstream); reading upstream is fine.
+
 ### Issue tracker
 
 Issues live in this repo's GitHub Issues (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
-
-**Fork boundary (hard rule)**: never create issues or PRs, comment, label, push,
-or perform any other write on `madiele/vod2pod-rss` (upstream). All GitHub
-writes go exclusively to `ki3lich/vod2pod-rss` — pass `-R ki3lich/vod2pod-rss`
-explicitly on every `gh` call, since `gh` defaults to the git remote, which
-points upstream. Reading upstream is fine.
 
 ### Triage labels
 
