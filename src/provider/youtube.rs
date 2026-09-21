@@ -29,7 +29,7 @@ use crate::{
     provider,
 };
 
-use super::MediaProvider;
+use super::{GeneratedFeed, MediaProvider};
 
 pub struct YoutubeProvider;
 
@@ -43,7 +43,7 @@ enum IdType {
 
 #[async_trait]
 impl MediaProvider for YoutubeProvider {
-    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<String> {
+    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<GeneratedFeed> {
         let youtube_api_key = conf().get(ConfName::YoutubeApiKey).ok();
 
         match youtube_api_key {
@@ -82,86 +82,80 @@ impl MediaProvider for YoutubeProvider {
                     .unwrap_or_else(|_| "false".to_string())
                     .eq_ignore_ascii_case("true");
 
-                let mut video_items = fetch_from_api(id, api_key, filter_shorts).await?;
+                let mut fetched = fetch_from_api(id, api_key, filter_shorts).await?;
 
-                feed_builder.description(video_items.0.description);
-                feed_builder.title(video_items.0.title);
-                feed_builder.language(video_items.0.language.take());
+                feed_builder.description(fetched.channel.description);
+                feed_builder.title(fetched.channel.title);
+                feed_builder.language(fetched.channel.language.take());
                 let mut image_builder = ImageBuilder::default();
                 image_builder.url(
-                    video_items
-                        .0
+                    fetched
+                        .channel
                         .itunes_ext
                         .clone()
                         .and_then(|it| it.image)
                         .unwrap_or_default(),
                 );
                 feed_builder.image(Some(image_builder.build()));
-                feed_builder.itunes_ext(video_items.0.itunes_ext.take());
-                feed_builder.link(video_items.0.link);
+                feed_builder.itunes_ext(fetched.channel.itunes_ext.take());
+                feed_builder.link(fetched.channel.link);
 
-                feed_builder.items(video_items.1);
+                feed_builder.items(fetched.items);
 
-                return Ok(feed_builder.build().to_string());
+                Ok(GeneratedFeed {
+                    body: feed_builder.build().to_string(),
+                    probe_state: Some(fetched.probe_state),
+                    quota_units: Some(fetched.api_requests as u64),
+                })
             }
             None => {
                 info!(
                     "starting youtube feed generation for {} using atom feed",
                     channel_url
                 );
-                let feed = match channel_url.path() {
-                    path if path.starts_with("/playlist") => {
-                        feed_url_for_yt_playlist(&channel_url).await
-                    }
-                    path if path.starts_with("/feeds/") => feed_url_for_yt_atom(&channel_url).await,
-                    path if path.starts_with("/channel/") => {
-                        feed_url_for_yt_channel(&channel_url).await
-                    }
-                    path if path.starts_with("/user/") => {
-                        feed_url_for_yt_channel(&channel_url).await
-                    }
-                    path if path.starts_with("/c/") => feed_url_for_yt_channel(&channel_url).await,
-                    path if path.starts_with("/@") => feed_url_for_yt_channel(&channel_url).await,
-                    _ => Err(eyre!("unsupported youtube url")),
-                }?;
-                let response = reqwest::get(feed).await?;
-                if !response.status().is_success() {
-                    return Err(eyre!(
-                        "YouTube feed returned error: {} {}",
-                        response.status().as_u16(),
-                        response.status().canonical_reason().unwrap_or("Unknown")
-                    ));
-                }
-                let raw_atom_feed = response.text().await?;
-                let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..])
-                    .map_err(|e| eyre!("Failed to parse YouTube feed: {}", e))?;
-                let mut duration_map: HashMap<String, Option<usize>> = HashMap::default();
-                let urls: Vec<String> = feed
-                    .entries
-                    .iter()
-                    .filter_map(|e| e.links.first())
-                    .map(|link| link.href.clone())
-                    .collect();
-
-                let futures = urls.into_iter().map(|href| async move {
-                    let url = href.parse::<Url>()?;
-                    let duration = get_youtube_video_duration_with_ytdlp(&url).await?;
-                    Ok::<_, eyre::Error>((href, duration))
-                });
-
-                let results: Vec<_> = stream::iter(futures).buffer_unordered(4).collect().await;
-
-                for result in results {
-                    let (href, duration) = result?;
-                    duration_map.insert(href, duration);
-                }
-                let filter_shorts = conf()
-                    .get(ConfName::YoutubeFilterShorts)
-                    .unwrap_or_else(|_| "false".to_string())
-                    .eq_ignore_ascii_case("true");
-                return Ok(convert_atom_to_rss(feed, duration_map, filter_shorts));
+                let body = generate_rss_feed_via_atom(channel_url).await?;
+                Ok(GeneratedFeed {
+                    body,
+                    probe_state: None,
+                    quota_units: None,
+                })
             }
         }
+    }
+
+    async fn canonical_feed_id(&self, channel_url: &Url) -> Option<String> {
+        canonical_yt_feed_id(channel_url).await
+    }
+
+    async fn probe_feed_freshness(
+        &self,
+        _channel_url: &Url,
+        state: &provider::FeedProbeState,
+    ) -> eyre::Result<bool> {
+        let api_key = conf().get(ConfName::YoutubeApiKey)?;
+        let probe_target = state
+            .probe_target
+            .as_deref()
+            .ok_or_else(|| eyre!("probe state has no probe target"))?;
+
+        let page = fetch_probe_page(probe_target, &api_key).await?;
+        info!(
+            "quota: ~1 unit consumed probing freshness of playlist {probe_target}"
+        );
+        Ok(probe_state_unchanged(
+            state,
+            page.total_results,
+            &page.first_page_ids,
+            page.newest_published_at,
+        ))
+    }
+
+    async fn generate_rss_feed_quota_free(&self, channel_url: Url) -> eyre::Result<String> {
+        generate_rss_feed_via_atom(channel_url).await
+    }
+
+    fn quota_breaker_key(&self) -> Option<String> {
+        Some(crate::feed_cache::YT_QUOTA_BREAKER_KEY.to_string())
     }
 
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {
@@ -192,12 +186,205 @@ impl MediaProvider for YoutubeProvider {
     }
 }
 
+/// Video ids (in playlist position order) and the newest publication
+/// timestamp (unix seconds) of one playlistItems page. Pure function so tests
+/// can exercise it; the probe and the full conversion must derive identical
+/// state from the same page.
+fn first_page_snapshot(items: &[PlaylistItem]) -> (Vec<String>, Option<i64>) {
+    let ids = items
+        .iter()
+        .filter_map(|i| {
+            i.snippet
+                .as_ref()?
+                .resource_id
+                .as_ref()?
+                .video_id
+                .clone()
+        })
+        .collect();
+    let newest = items
+        .iter()
+        .filter_map(|i| i.snippet.as_ref().and_then(|s| s.published_at))
+        .max()
+        .map(|published_at| published_at.timestamp());
+    (ids, newest)
+}
+
+/// Fingerprint of a playlist's source state: total item count plus the ordered
+/// ids of the first page. Pure function so tests can exercise it.
+fn build_source_fingerprint(total_results: Option<i32>, first_page_ids: &[String]) -> String {
+    format!(
+        "{}|{}",
+        total_results.unwrap_or(-1),
+        first_page_ids.join(",")
+    )
+}
+
+/// Whether upstream still matches the state captured at Feed Conversion time.
+/// Pure function so tests can exercise it.
+fn probe_state_unchanged(
+    state: &provider::FeedProbeState,
+    total_results: Option<i32>,
+    first_page_ids: &[String],
+    newest_published_at: Option<i64>,
+) -> bool {
+    let fingerprint = build_source_fingerprint(total_results, first_page_ids);
+    state.source_fingerprint.as_deref() == Some(fingerprint.as_str())
+        && state.newest_published_at == newest_published_at
+}
+
+/// Page size a probe must fetch so its fingerprint is derived from the same
+/// page shape a full conversion captures first. Pure function so tests can
+/// exercise it.
+fn probe_page_size(max_fetched_items: usize) -> u64 {
+    max_fetched_items.clamp(1, 50) as u64
+}
+
+/// The state a Freshness Probe observes with a single playlistItems.list call.
+struct ProbePage {
+    total_results: Option<i32>,
+    first_page_ids: Vec<String>,
+    newest_published_at: Option<i64>,
+}
+
+/// One ~1 quota unit call: first page of the playlist in position order plus
+/// the playlist's total item count. Everything a probe needs to compare
+/// against the state captured at Feed Conversion time.
+///
+/// The page size matches the one a full conversion would fetch first
+/// (min(YOUTUBE_MAX_RESULTS, 50)), so the fingerprint and the newest
+/// publication timestamp are derived from the same page shape the conversion
+/// captured; a mismatch here would make every probe report "changed".
+async fn fetch_probe_page(playlist_id: &str, api_key: &str) -> eyre::Result<ProbePage> {
+    let max_fetched_items: usize = conf()
+        .get(ConfName::YoutubeMaxResults)
+        .unwrap_or_else(|_| "300".to_string())
+        .parse()
+        .unwrap_or(300);
+    let page_size = probe_page_size(max_fetched_items);
+    let hub = get_youtube_hub();
+    let response = hub
+        .playlist_items()
+        .list(&vec!["snippet".into()])
+        .playlist_id(playlist_id)
+        .param("key", api_key)
+        .max_results(page_size.try_into()?)
+        .doit()
+        .await?;
+
+    let items = response.1.items.unwrap_or_default();
+    let (first_page_ids, newest_published_at) = first_page_snapshot(&items);
+
+    Ok(ProbePage {
+        total_results: response.1.page_info.and_then(|p| p.total_results),
+        first_page_ids,
+        newest_published_at,
+    })
+}
+
+/// Canonical Feed Key identity for a youtube source url. Playlist and channel
+/// urls are read straight from the url; handle and legacy urls are resolved to
+/// their channel id through the same (redis-cached) yt-dlp resolution the feed
+/// conversion uses, so no extra work is done on the happy path. Returns `None`
+/// for urls this provider cannot canonically identify.
+async fn canonical_yt_feed_id(url: &Url) -> Option<String> {
+    let path = url.path();
+    if path.starts_with("/playlist") {
+        let list = url
+            .query_pairs()
+            .find(|(key, _)| key == "list")
+            .map(|(_, value)| value.to_string())?;
+        if list.is_empty() {
+            return None;
+        }
+        return Some(format!("yt:playlist:{list}"));
+    }
+    if let Some(rest) = path.strip_prefix("/channel/") {
+        let id = rest.trim_end_matches('/');
+        if id.is_empty() {
+            return None;
+        }
+        return Some(format!("yt:channel:{id}"));
+    }
+    if path.starts_with("/@") || path.starts_with("/user/") || path.starts_with("/c/") {
+        let resolved = find_yt_channel_url_with_c_id(url).await.ok()?;
+        let id = resolved.path_segments()?.next_back()?;
+        if id.is_empty() {
+            return None;
+        }
+        return Some(format!("yt:channel:{id}"));
+    }
+    None
+}
+
+/// Feed generation that never touches the metered YouTube Data API: the
+/// provider's own public atom feed (limited to the latest items) with
+/// durations resolved through yt-dlp. Used both when no API key is configured
+/// and as the quota-free rung of the Degradation Ladder.
+async fn generate_rss_feed_via_atom(channel_url: Url) -> eyre::Result<String> {
+    let feed = match channel_url.path() {
+        path if path.starts_with("/playlist") => feed_url_for_yt_playlist(&channel_url).await,
+        path if path.starts_with("/feeds/") => feed_url_for_yt_atom(&channel_url).await,
+        path if path.starts_with("/channel/") => feed_url_for_yt_channel(&channel_url).await,
+        path if path.starts_with("/user/") => feed_url_for_yt_channel(&channel_url).await,
+        path if path.starts_with("/c/") => feed_url_for_yt_channel(&channel_url).await,
+        path if path.starts_with("/@") => feed_url_for_yt_channel(&channel_url).await,
+        _ => Err(eyre!("unsupported youtube url")),
+    }?;
+    let response = reqwest::get(feed).await?;
+    if !response.status().is_success() {
+        return Err(eyre!(
+            "YouTube feed returned error: {} {}",
+            response.status().as_u16(),
+            response.status().canonical_reason().unwrap_or("Unknown")
+        ));
+    }
+    let raw_atom_feed = response.text().await?;
+    let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..])
+        .map_err(|e| eyre!("Failed to parse YouTube feed: {}", e))?;
+    let mut duration_map: HashMap<String, Option<usize>> = HashMap::default();
+    let urls: Vec<String> = feed
+        .entries
+        .iter()
+        .filter_map(|e| e.links.first())
+        .map(|link| link.href.clone())
+        .collect();
+
+    let futures = urls.into_iter().map(|href| async move {
+        let url = href.parse::<Url>()?;
+        let duration = get_youtube_video_duration_with_ytdlp(&url).await?;
+        Ok::<_, eyre::Error>((href, duration))
+    });
+
+    let results: Vec<_> = stream::iter(futures).buffer_unordered(4).collect().await;
+
+    for result in results {
+        let (href, duration) = result?;
+        duration_map.insert(href, duration);
+    }
+    let filter_shorts = conf()
+        .get(ConfName::YoutubeFilterShorts)
+        .unwrap_or_else(|_| "false".to_string())
+        .eq_ignore_ascii_case("true");
+    Ok(convert_atom_to_rss(feed, duration_map, filter_shorts))
+}
+
+/// Everything a full YouTube API Feed Conversion produces: the rss channel +
+/// items, the Freshness Probe state captured while fetching, and the number of
+/// API requests spent (each costs ~1 quota unit).
+struct ApiFetch {
+    channel: Channel,
+    items: Vec<Item>,
+    probe_state: provider::FeedProbeState,
+    api_requests: usize,
+}
+
 async fn fetch_from_api(
     id: IdType,
     api_key: String,
     filter_shorts: bool,
-) -> eyre::Result<(Channel, Vec<Item>)> {
-    match id {
+) -> eyre::Result<ApiFetch> {
+    let (rss_channel, probe_target, upload_playlist) = match id {
         IdType::Playlist(id) => {
             info!("fetching playlist {}", id);
             let mut playlist = fetch_playlist(id, &api_key).await?;
@@ -205,16 +392,7 @@ async fn fetch_from_api(
             let playlist_id = playlist.id.take().ok_or(eyre!("playlist has no id"))?;
 
             let rss_channel = build_channel_from_playlist(playlist);
-
-            let max_fetched_items: usize =
-                conf().get(ConfName::YoutubeMaxResults).unwrap().parse()?;
-            let items = fetch_playlist_items(&playlist_id, &api_key, max_fetched_items).await?;
-
-            let duration_map = create_duration_url_map(&items, &api_key).await?;
-
-            let rss_items = build_channel_items_from_playlist(items, duration_map, filter_shorts);
-
-            Ok((rss_channel, rss_items))
+            (rss_channel, playlist_id.clone(), playlist_id)
         }
         IdType::Channel(id) => {
             info!("fetching channel {}", id);
@@ -230,18 +408,41 @@ async fn fetch_from_api(
                 .ok_or(eyre!("uploads is None"))?;
 
             let rss_channel = build_channel_from_yt_channel(channel);
-
-            let max_fetched_items: usize =
-                conf().get(ConfName::YoutubeMaxResults).unwrap().parse()?;
-            let items = fetch_playlist_items(&upload_playlist, &api_key, max_fetched_items).await?;
-
-            let duration_map = create_duration_url_map(&items, &api_key).await?;
-
-            let rss_items = build_channel_items_from_playlist(items, duration_map, filter_shorts);
-
-            Ok((rss_channel, rss_items))
+            (rss_channel, upload_playlist.clone(), upload_playlist)
         }
-    }
+    };
+
+    let max_fetched_items: usize = conf().get(ConfName::YoutubeMaxResults).unwrap().parse()?;
+    let fetched = fetch_playlist_items(&upload_playlist, &api_key, max_fetched_items).await?;
+
+    let (duration_map, video_batches) =
+        create_duration_url_map(&fetched.items, &api_key).await?;
+
+    let rss_items = build_channel_items_from_playlist(fetched.items, duration_map, filter_shorts);
+
+    // the api requests spent: 1 for the playlist/channel detail call, plus the
+    // playlist-items pages, plus the video-info batches
+    let api_requests = 1 + fetched.api_requests + video_batches;
+    info!(
+        "quota: ~{} units consumed for full feed conversion of playlist {}",
+        api_requests, probe_target
+    );
+
+    let probe_state = provider::FeedProbeState {
+        newest_published_at: fetched.newest_published_at,
+        source_fingerprint: Some(build_source_fingerprint(
+            fetched.total_results,
+            &fetched.first_page_ids,
+        )),
+        probe_target: Some(probe_target),
+    };
+
+    Ok(ApiFetch {
+        channel: rss_channel,
+        items: rss_items,
+        probe_state,
+        api_requests,
+    })
 }
 
 macro_rules! get_thumb {
@@ -306,7 +507,7 @@ struct VideoExtraInfo {
 async fn create_duration_url_map(
     items: &[PlaylistItem],
     api_key: &str,
-) -> Result<HashMap<String, VideoExtraInfo>, eyre::Error> {
+) -> Result<(HashMap<String, VideoExtraInfo>, usize), eyre::Error> {
     let ids_batches = items.chunks(50).map(|c| {
         c.iter()
             .filter_map(|i| i.snippet.clone()?.resource_id?.video_id)
@@ -355,7 +556,9 @@ async fn create_duration_url_map(
         })
         .collect::<HashMap<_, _>>();
 
-    Ok(video_infos)
+    // every videos.list batch costs ~1 quota unit
+    let batches = items.len().div_ceil(50);
+    Ok((video_infos, batches))
 }
 
 fn build_channel_items_from_playlist(
@@ -420,16 +623,39 @@ fn build_channel_items_from_playlist(
     rss_item
 }
 
+/// Result of fetching a playlist's items: the items sorted by publication
+/// date, plus the raw source state needed to build a Freshness Probe state.
+///
+/// `total_results`, `first_page_ids` and `newest_published_at` are all derived
+/// from the first page *in playlist position order* (before any sorting or
+/// short filtering) so that a probe can re-derive them the exact same way and
+/// compare like with like.
+struct PlaylistFetch {
+    items: Vec<PlaylistItem>,
+    /// pageInfo.totalResults of the first page: total items in the playlist
+    /// as reported by the API.
+    total_results: Option<i32>,
+    /// Video ids of the first page, in playlist position order (up to 50).
+    first_page_ids: Vec<String>,
+    /// Newest publication timestamp (unix seconds) within the first page.
+    newest_published_at: Option<i64>,
+    /// How many playlistItems.list requests this fetch made (~1 quota unit each).
+    api_requests: usize,
+}
+
 async fn fetch_playlist_items(
     playlist_id: &String,
     api_key: &str,
     max_fetched_items: usize,
-) -> eyre::Result<Vec<PlaylistItem>> {
+) -> eyre::Result<PlaylistFetch> {
     let hub = get_youtube_hub();
     let max_consecutive_requests = (max_fetched_items / 50) + 1;
     let mut fetched_playlist_items: Vec<PlaylistItem> = Vec::with_capacity(max_fetched_items);
     let mut request_count = 0;
     let mut next_page_token: Option<String> = None;
+    let mut total_results: Option<i32> = None;
+    let mut first_page_ids: Vec<String> = Vec::new();
+    let mut newest_published_at: Option<i64> = None;
     debug!("fetching items from playlist {}", playlist_id);
     loop {
         let remaining_items = max_fetched_items - fetched_playlist_items.len();
@@ -452,12 +678,17 @@ async fn fetch_playlist_items(
 
         let response = playlist_items_request.doit().await?;
 
-        fetched_playlist_items.extend(
-            response
-                .1
-                .items
-                .ok_or(eyre!("playlist object has no items field"))?,
-        );
+        let page_items = response
+            .1
+            .items
+            .ok_or(eyre!("playlist object has no items field"))?;
+
+        if request_count == 0 {
+            total_results = response.1.page_info.and_then(|p| p.total_results);
+            (first_page_ids, newest_published_at) = first_page_snapshot(&page_items);
+        }
+
+        fetched_playlist_items.extend(page_items);
         next_page_token = response.1.next_page_token;
 
         if next_page_token.is_none() || request_count == max_consecutive_requests {
@@ -472,10 +703,17 @@ async fn fetch_playlist_items(
     info!(
         "fetched {} items, in {} requests",
         fetched_playlist_items.len(),
-        request_count
+        request_count + 1
     );
     fetched_playlist_items.sort_by_key(|i| i.snippet.as_ref().and_then(|s| s.published_at));
-    Ok(fetched_playlist_items)
+    Ok(PlaylistFetch {
+        items: fetched_playlist_items,
+        total_results,
+        first_page_ids,
+        newest_published_at,
+        // +1 because request_count counts the pagination steps after the first call
+        api_requests: request_count + 1,
+    })
 }
 
 fn build_channel_from_playlist(playlist: api::Playlist) -> Channel {
@@ -855,12 +1093,12 @@ mod tests {
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
         println!("{:?}", &playlist.clone().id.unwrap().clone());
-        let items = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 300)
+        let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 300)
             .await
             .unwrap();
 
-        println!("{:?}", items);
-        assert!(!items.is_empty())
+        println!("{:?}", fetched.items);
+        assert!(!fetched.items.is_empty())
     }
 
     #[tokio::test]
@@ -871,13 +1109,13 @@ mod tests {
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
         println!("{:?}", &playlist.clone().id.unwrap().clone());
-        let items = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 13)
+        let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 13)
             .await
             .unwrap();
 
-        println!("{:?}", items);
-        assert!(!items.is_empty());
-        assert_eq!(items.len(), 13)
+        println!("{:?}", fetched.items);
+        assert!(!fetched.items.is_empty());
+        assert_eq!(fetched.items.len(), 13)
     }
 
     #[tokio::test]
@@ -888,13 +1126,13 @@ mod tests {
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
         println!("{:?}", &playlist.clone().id.unwrap().clone());
-        let items = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 50)
+        let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 50)
             .await
             .unwrap();
 
-        println!("{:?}", items);
-        assert!(!items.is_empty());
-        assert_eq!(items.len(), 50)
+        println!("{:?}", fetched.items);
+        assert!(!fetched.items.is_empty());
+        assert_eq!(fetched.items.len(), 50)
     }
 
     #[tokio::test]
@@ -905,13 +1143,13 @@ mod tests {
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
         println!("{:?}", &playlist.clone().id.unwrap().clone());
-        let items = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 600)
+        let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 600)
             .await
             .unwrap();
 
-        println!("{:?}", items);
-        assert!(!items.is_empty());
-        assert_eq!(items.len(), 600)
+        println!("{:?}", fetched.items);
+        assert!(!fetched.items.is_empty());
+        assert_eq!(fetched.items.len(), 600)
     }
 
     #[test(tokio::test)]
@@ -957,11 +1195,174 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let channel = rss::Channel::read_from(result.unwrap().as_bytes()).unwrap();
+        let feed = result.unwrap();
+        let channel = rss::Channel::read_from(feed.body.as_bytes()).unwrap();
         assert!(channel.items.len() > 50);
         for item in &channel.items {
             assert!(item.title.is_some());
             assert!(item.description.is_some());
         }
+    }
+
+    #[test]
+    fn test_probe_state_unchanged_when_source_matches() {
+        let state = provider::FeedProbeState {
+            newest_published_at: Some(1_700_000_000),
+            source_fingerprint: Some(build_source_fingerprint(
+                Some(120),
+                &["vid1".to_string(), "vid2".to_string()],
+            )),
+            probe_target: Some("PLxyz".to_string()),
+        };
+
+        assert!(probe_state_unchanged(
+            &state,
+            Some(120),
+            &["vid1".to_string(), "vid2".to_string()],
+            Some(1_700_000_000)
+        ));
+    }
+
+    #[test]
+    fn test_probe_state_changed_when_source_changes() {
+        let state = provider::FeedProbeState {
+            newest_published_at: Some(1_700_000_000),
+            source_fingerprint: Some(build_source_fingerprint(
+                Some(120),
+                &["vid1".to_string(), "vid2".to_string()],
+            )),
+            probe_target: Some("PLxyz".to_string()),
+        };
+
+        // a new video appended at the end of the playlist
+        assert!(!probe_state_unchanged(
+            &state,
+            Some(121),
+            &["vid1".to_string(), "vid2".to_string()],
+            Some(1_700_000_000)
+        ));
+        // an item swapped inside the first page
+        assert!(!probe_state_unchanged(
+            &state,
+            Some(120),
+            &["vid1".to_string(), "vid3".to_string()],
+            Some(1_700_000_000)
+        ));
+        // a newer publication inside the first page
+        assert!(!probe_state_unchanged(
+            &state,
+            Some(120),
+            &["vid1".to_string(), "vid2".to_string()],
+            Some(1_800_000_000)
+        ));
+        // state was never captured
+        let empty_state = provider::FeedProbeState::default();
+        assert!(!probe_state_unchanged(
+            &empty_state,
+            Some(120),
+            &["vid1".to_string()],
+            Some(1_700_000_000)
+        ));
+    }
+
+    #[test]
+    fn test_build_source_fingerprint_is_order_sensitive() {
+        let a = build_source_fingerprint(
+            Some(2),
+            &["vid1".to_string(), "vid2".to_string()],
+        );
+        let b = build_source_fingerprint(
+            Some(2),
+            &["vid2".to_string(), "vid1".to_string()],
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_probe_page_size_matches_conversion_first_page() {
+        // default config: full page
+        assert_eq!(probe_page_size(300), 50);
+        // small YOUTUBE_MAX_RESULTS: the probe must fetch exactly what a
+        // conversion would, or every probe would report "changed"
+        assert_eq!(probe_page_size(13), 13);
+        assert_eq!(probe_page_size(1), 1);
+        assert_eq!(probe_page_size(49), 49);
+        assert_eq!(probe_page_size(50), 50);
+        // degenerate config values still produce a valid page size
+        assert_eq!(probe_page_size(0), 1);
+    }
+
+    #[test]
+    fn test_first_page_snapshot_extracts_ids_and_newest() {
+        let items: Vec<PlaylistItem> = vec![
+            PlaylistItem {
+                snippet: Some(api::PlaylistItemSnippet {
+                    published_at: Some(
+                        chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                            .unwrap()
+                            .into(),
+                    ),
+                    resource_id: Some(api::ResourceId {
+                        video_id: Some("vid1".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            PlaylistItem {
+                snippet: Some(api::PlaylistItemSnippet {
+                    published_at: Some(
+                        chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                            .unwrap()
+                            .into(),
+                    ),
+                    resource_id: Some(api::ResourceId {
+                        video_id: Some("vid2".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            // an item without a video id is skipped
+            PlaylistItem::default(),
+        ];
+
+        let (ids, newest) = first_page_snapshot(&items);
+        assert_eq!(ids, vec!["vid1".to_string(), "vid2".to_string()]);
+        assert_eq!(newest, Some(1_717_200_000));
+    }
+
+    #[tokio::test]
+    async fn test_canonical_feed_id_for_playlist_url() {
+        let url = Url::parse("https://www.youtube.com/playlist?list=PL589F357911E267F7").unwrap();
+        assert_eq!(
+            canonical_yt_feed_id(&url).await,
+            Some("yt:playlist:PL589F357911E267F7".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canonical_feed_id_for_channel_url() {
+        let url =
+            Url::parse("https://www.youtube.com/channel/UCXssEBQ8JWH1NacVIyQXe8g").unwrap();
+        assert_eq!(
+            canonical_yt_feed_id(&url).await,
+            Some("yt:channel:UCXssEBQ8JWH1NacVIyQXe8g".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canonical_feed_id_unsupported_urls_return_none() {
+        // no list param
+        let url = Url::parse("https://www.youtube.com/playlist").unwrap();
+        assert_eq!(canonical_yt_feed_id(&url).await, None);
+        // atom feed urls have no canonical id
+        let url = Url::parse(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCXssEBQ8JWH1NacVIyQXe8g",
+        )
+        .unwrap();
+        assert_eq!(canonical_yt_feed_id(&url).await, None);
     }
 }

@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::configs::{conf, Conf, ConfName};
 
-use super::MediaProvider;
+use super::{GeneratedFeed, MediaProvider};
 
 #[allow(non_snake_case)]
 #[derive(Deserialize, Debug)]
@@ -23,8 +23,12 @@ pub struct PeerTubeProvider;
 
 #[async_trait]
 impl MediaProvider for PeerTubeProvider {
-    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<String> {
-        Ok(reqwest::get(channel_url).await?.text().await?)
+    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<GeneratedFeed> {
+        Ok(GeneratedFeed {
+            body: reqwest::get(channel_url).await?.text().await?,
+            probe_state: None,
+            quota_units: None,
+        })
     }
 
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {

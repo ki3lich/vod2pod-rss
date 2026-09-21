@@ -110,8 +110,34 @@ Note: These can also be set using Docker [.env files](https://docs.docker.com/co
 - `MP3_BITRATE`: Set the bitrate of the trascoded stream to your client (default: "192")
 - `SUBFOLDER`: Set the the root path of the app, useful for reverse proxies (default: "/")
 - `VALID_URL_DOMAINS`: (optional) Set a comma separated list of domain urls that are allowed to be converted into RSS  (defaults to YouTube and Twitch urls)
-- `CACHE_TTL`: (optional) Set the time to live of the cache in seconds, default is 600 seconds (10 minutes)
+- `CACHE_TTL`: (optional) Set the time to live of the cache in seconds, default is 3600 seconds (1 hour)
+- `STALE_MAX_AGE`: (optional) The Stale Window: how long a cached feed keeps being served when the provider cannot be reached (e.g. YouTube quota exhausted), in seconds. Default is 604800 (7 days)
+- `MAX_FRESH_PERIOD`: (optional) Upper bound on how long freshness probes may keep a cached feed "fresh" without a full regeneration, in seconds. Default is 86400 (24 hours)
 - `YOUTUBE_YT_DLP_GET_URL_EXTRA_ARGS`
+
+### Quota behavior
+
+YouTube's Data API has a daily quota (10,000 units on the free tier, resetting
+at midnight Pacific time). vod2pod-rss minimizes and degrades around it:
+
+- Each cached feed is refreshed with a cheap **freshness probe** (~1 unit)
+  instead of a full conversion (~13 units); a full conversion only happens
+  when the feed actually changed, at most once per `MAX_FRESH_PERIOD`.
+- Feeds expired from the cache are **served stale** (within `STALE_MAX_AGE`)
+  while they are revalidated in the background, so poll bursts cost nothing.
+- Feeds support conditional GET (`ETag` / `If-Modified-Since`): well-behaved
+  podcatchers like Apple Podcasts re-poll for free and get `304` responses.
+- When quota is exhausted a **quota breaker** stops all metered API calls
+  until the next reset (midnight Pacific). Affected feeds are served from the
+  cache while it lasts, and feeds without any usable cached copy degrade to
+  YouTube's public atom feed (limited to the latest items) — this also happens
+  for other conversion failures.
+- The logs estimate quota consumption: `quota: ~N units consumed today
+  (estimate)`.
+
+If you serve many feeds, the `YOUTUBE_MAX_RESULTS` setting (default 300) is
+the main per-conversion cost driver: lowering it reduces the units spent per
+full conversion at the cost of shorter feeds.
 
 # Honorable Mentions
 

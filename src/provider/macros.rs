@@ -34,8 +34,28 @@ macro_rules! generate_static_dispatcher {
 
 #[async_trait]
 impl MediaProvider for $name {
-    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<String> {
+    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<GeneratedFeed> {
         provider_dispatcher!($name, self $(,$provider)* ; generate_rss_feed(channel_url).await);
+    }
+
+    async fn canonical_feed_id(&self, channel_url: &Url) -> Option<String> {
+        provider_dispatcher!($name, self $(,$provider)* ; canonical_feed_id(&channel_url).await);
+    }
+
+    async fn probe_feed_freshness(
+        &self,
+        channel_url: &Url,
+        state: &FeedProbeState,
+    ) -> eyre::Result<bool> {
+        provider_dispatcher!($name, self $(,$provider)* ; probe_feed_freshness(&channel_url, state).await);
+    }
+
+    async fn generate_rss_feed_quota_free(&self, channel_url: Url) -> eyre::Result<String> {
+        provider_dispatcher!($name, self $(,$provider)* ; generate_rss_feed_quota_free(channel_url).await);
+    }
+
+    fn quota_breaker_key(&self) -> Option<String> {
+        provider_dispatcher!($name, self $(,$provider)* ; quota_breaker_key());
     }
 
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {

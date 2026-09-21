@@ -9,6 +9,13 @@ pub trait Conf {
     fn get(&self, key: ConfName) -> eyre::Result<String>;
 }
 
+/// Default Fresh TTL of the feed cache, seconds (1 hour).
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
+/// Default Stale Window, seconds (7 days).
+pub const DEFAULT_STALE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+/// Default Fresh Period bound, seconds (24 hours).
+pub const DEFAULT_MAX_FRESH_PERIOD_SECS: u64 = 24 * 3600;
+
 pub enum ConfName {
     RedisAddress,
     RedisPort,
@@ -26,6 +33,8 @@ pub enum ConfName {
     PeerTubeValidHosts,
     YoutubeYtDlpExtraArgs,
     CacheTTL,
+    StaleMaxAge,
+    MaxFreshPeriod,
     FfmpegTimeoutSeconds,
     PreflightTimeoutSeconds,
     Host,
@@ -121,7 +130,25 @@ impl Conf for EnvConf {
                     .unwrap_or_else(|_| "[]".to_string()))
             }
             ConfName::CacheTTL => {
-                Ok(std::env::var("CACHE_TTL").unwrap_or_else(|_| "600".to_string()))
+                // one hour: podcatchers poll on their own schedule and a fresh
+                // copy is checked with a 1-unit freshness probe after expiry,
+                // so a long TTL costs almost no quota (see docs/adr/0001)
+                Ok(std::env::var("CACHE_TTL")
+                    .unwrap_or_else(|_| DEFAULT_CACHE_TTL_SECS.to_string()))
+            }
+            ConfName::StaleMaxAge => {
+                // Stale Window: how long a cached feed may keep being served
+                // when upstream cannot be reached (quota exhausted, provider
+                // down, ...). A stale feed is always better than an error.
+                Ok(std::env::var("STALE_MAX_AGE")
+                    .unwrap_or_else(|_| DEFAULT_STALE_MAX_AGE_SECS.to_string()))
+            }
+            ConfName::MaxFreshPeriod => {
+                // upper bound on how long freshness probes may keep a feed
+                // "fresh" without a full regeneration: bounds how long a
+                // change the probe cannot see stays invisible
+                Ok(std::env::var("MAX_FRESH_PERIOD")
+                    .unwrap_or_else(|_| DEFAULT_MAX_FRESH_PERIOD_SECS.to_string()))
             }
             ConfName::FfmpegTimeoutSeconds => {
                 Ok(std::env::var("FFMPEG_TIMEOUT_SECONDS").unwrap_or_else(|_| "300".to_string()))
@@ -142,6 +169,15 @@ impl Conf for EnvConf {
             }
         }
     }
+}
+
+/// Read a numeric config, falling back to `default` when unset or unparsable.
+pub fn conf_u64(key: ConfName, default: u64) -> u64 {
+    conf()
+        .get(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Serialize, Clone, Copy, Default)]

@@ -19,13 +19,13 @@ use crate::{
     provider,
 };
 
-use super::MediaProvider;
+use super::{GeneratedFeed, MediaProvider};
 
 pub struct TwitchProvider;
 
 #[async_trait]
 impl MediaProvider for TwitchProvider {
-    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<String> {
+    async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<GeneratedFeed> {
         info!("trying to convert twitch channel url {}", channel_url);
         let username = channel_url
             .path_segments()
@@ -108,7 +108,11 @@ impl MediaProvider for TwitchProvider {
 
         let rss_items = build_items_from_vods(vods, streams);
 
-        Ok(channel_builder.items(rss_items).build().to_string())
+        Ok(GeneratedFeed {
+            body: channel_builder.items(rss_items).build().to_string(),
+            probe_state: None,
+            quota_units: None,
+        })
     }
 
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {
@@ -451,9 +455,9 @@ mod tests {
             .expect("to run this test set TWITCH_CLIENT_ID env var");
 
         let url = Url::parse("https://www.twitch.tv/tumblurr").unwrap();
-        let rss = provider.generate_rss_feed(url).await.unwrap();
+        let generated = provider.generate_rss_feed(url).await.unwrap();
 
-        let feed = feed_rs::parser::parse(&rss.into_bytes()[..]).unwrap();
+        let feed = feed_rs::parser::parse(&generated.body.into_bytes()[..]).unwrap();
 
         println!("{:#?}", feed);
         assert!(feed.entries.len() > 1);
