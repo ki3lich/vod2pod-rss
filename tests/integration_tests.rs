@@ -9,7 +9,7 @@ async fn health_works() {
 
     // Act
     let response = client
-        .get(format!("{}/health", &address))
+        .get(format!("{}/health", address))
         .send()
         .await
         .expect("Failed to execute request.");
@@ -25,7 +25,7 @@ async fn fetch_yt_feed_by_channel_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", address))
         .query(&[("url", "https://www.youtube.com/@madiele92")])
         .send()
         .await
@@ -50,7 +50,7 @@ async fn fetch_yt_feed_by_channel_id_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", address))
         .query(&[(
             "url",
             "https://www.youtube.com/channel/UCXssEBQ8JWH1NacVIyQXe8g",
@@ -78,7 +78,7 @@ async fn fetch_yt_feed_by_playlist_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", address))
         .query(&[(
             "url",
             "https://www.youtube.com/playlist?list=PL589F357911E267F7",
@@ -112,7 +112,7 @@ async fn fetch_twitch_feed_by_channel_url_ok_requires_api_key() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/transcodize_rss", &address))
+        .get(format!("{}/transcodize_rss", address))
         .query(&[("url", "https://www.twitch.tv/twitch")])
         .send()
         .await

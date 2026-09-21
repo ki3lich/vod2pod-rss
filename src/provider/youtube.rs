@@ -574,7 +574,7 @@ fn build_channel_items_from_playlist(
             let url = Url::parse(&watch_url_for_video_id(&video_id)).ok()?;
 
             let video_infos = videos_infos.get(&video_id).or_else(|| {
-                warn!("no duration found for {:?}", &video_id);
+                warn!("no duration found for {:?}", video_id);
                 None
             })?;
 
@@ -1114,7 +1114,7 @@ mod tests {
 
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
-        println!("{:?}", &playlist.clone().id.unwrap().clone());
+        println!("{:?}", playlist.clone().id.unwrap().clone());
         let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 300)
             .await
             .unwrap();
@@ -1130,7 +1130,7 @@ mod tests {
 
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
-        println!("{:?}", &playlist.clone().id.unwrap().clone());
+        println!("{:?}", playlist.clone().id.unwrap().clone());
         let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 13)
             .await
             .unwrap();
@@ -1147,7 +1147,7 @@ mod tests {
 
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
-        println!("{:?}", &playlist.clone().id.unwrap().clone());
+        println!("{:?}", playlist.clone().id.unwrap().clone());
         let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 50)
             .await
             .unwrap();
@@ -1164,7 +1164,7 @@ mod tests {
 
         let playlist = fetch_playlist(id, &api_key).await.unwrap();
 
-        println!("{:?}", &playlist.clone().id.unwrap().clone());
+        println!("{:?}", playlist.clone().id.unwrap().clone());
         let fetched = fetch_playlist_items(&playlist.id.unwrap(), &api_key, 600)
             .await
             .unwrap();

@@ -40,3 +40,8 @@ jobs:
         with:
           sarif_file: rust-clippy-results.sarif
           wait-for-processing: true
+
+      # Fails the job on any clippy warning. Runs after the upload step so
+      # failing PRs still record their alerts in the code-scanning tab.
+      - name: Enforce zero clippy warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
