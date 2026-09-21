@@ -196,10 +196,7 @@ pub fn http_date(epoch_secs: i64) -> String {
 /// Pure function so tests can exercise it.
 pub fn http_date_at_or_after(if_modified_since: &str, epoch_secs: i64) -> bool {
     // RFC 7231 IMF-fixdate always ends in a literal " GMT", which is UTC
-    match chrono::NaiveDateTime::parse_from_str(
-        if_modified_since,
-        "%a, %d %b %Y %H:%M:%S GMT",
-    ) {
+    match chrono::NaiveDateTime::parse_from_str(if_modified_since, "%a, %d %b %Y %H:%M:%S GMT") {
         Ok(parsed) => parsed.and_utc().timestamp() >= epoch_secs,
         Err(_) => false,
     }
@@ -237,14 +234,17 @@ pub async fn load(
     con: &mut redis::aio::MultiplexedConnection,
     canonical_id: &str,
 ) -> Option<CachedFeed> {
-    let map: HashMap<String, String> =
-        match redis::cmd("HGETALL").arg(feed_key(canonical_id)).query_async(con).await {
-            Ok(map) => map,
-            Err(e) => {
-                warn!("could not read cached feed {canonical_id}: {e}");
-                return None;
-            }
-        };
+    let map: HashMap<String, String> = match redis::cmd("HGETALL")
+        .arg(feed_key(canonical_id))
+        .query_async(con)
+        .await
+    {
+        Ok(map) => map,
+        Err(e) => {
+            warn!("could not read cached feed {canonical_id}: {e}");
+            return None;
+        }
+    };
 
     let body = map.get("body")?;
     Some(CachedFeed {
@@ -272,10 +272,7 @@ pub struct Lookup {
 
 /// Convenience read used by the server: the cached feed plus the remaining
 /// seconds of its fresh marker.
-pub async fn lookup(
-    con: &mut redis::aio::MultiplexedConnection,
-    canonical_id: &str,
-) -> Lookup {
+pub async fn lookup(con: &mut redis::aio::MultiplexedConnection, canonical_id: &str) -> Lookup {
     let entry = load(con, canonical_id).await;
     let fresh_marker_ttl = fresh_marker_ttl(con, canonical_id).await;
     Lookup {
@@ -341,7 +338,11 @@ pub async fn fresh_marker_ttl(
     con: &mut redis::aio::MultiplexedConnection,
     canonical_id: &str,
 ) -> Option<i64> {
-    let ttl: i64 = match redis::cmd("TTL").arg(fresh_key(canonical_id)).query_async(con).await {
+    let ttl: i64 = match redis::cmd("TTL")
+        .arg(fresh_key(canonical_id))
+        .query_async(con)
+        .await
+    {
         Ok(ttl) => ttl,
         Err(e) => {
             warn!("could not read fresh marker ttl for {canonical_id}: {e}");
@@ -447,29 +448,20 @@ async fn regeneration_lock(canonical_id: &str) -> Arc<Mutex<()>> {
     if locks.len() > MAX_TRACKED_REGENERATION_LOCKS {
         locks.clear();
     }
-    locks
-        .entry(canonical_id.to_string())
-        .or_default()
-        .clone()
+    locks.entry(canonical_id.to_string()).or_default().clone()
 }
 
 /// Wait for any in-flight regeneration of this feed, then hold its slot.
 /// Callers MUST re-read the cache after acquiring: the previous holder may
 /// have refreshed the entry in the meantime.
 pub async fn begin_regeneration(canonical_id: &str) -> OwnedMutexGuard<()> {
-    regeneration_lock(canonical_id)
-        .await
-        .lock_owned()
-        .await
+    regeneration_lock(canonical_id).await.lock_owned().await
 }
 
 /// Non-blocking variant for background revalidation: `None` means another
 /// regeneration is already running for this feed, so there is nothing to do.
 pub async fn try_begin_regeneration(canonical_id: &str) -> Option<OwnedMutexGuard<()>> {
-    regeneration_lock(canonical_id)
-        .await
-        .try_lock_owned()
-        .ok()
+    regeneration_lock(canonical_id).await.try_lock_owned().ok()
 }
 
 #[cfg(test)]
@@ -596,7 +588,14 @@ mod tests {
     #[test]
     fn test_classify_freshness_miss_beyond_stale_window() {
         assert_eq!(
-            classify_freshness(true, false, 1_000, 1_000 + 7 * 24 * 3600, 600, 7 * 24 * 3600),
+            classify_freshness(
+                true,
+                false,
+                1_000,
+                1_000 + 7 * 24 * 3600,
+                600,
+                7 * 24 * 3600
+            ),
             ServeDecision::Miss
         );
     }

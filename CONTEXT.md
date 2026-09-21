@@ -42,6 +42,23 @@ disagree, one of them is wrong — fix it before moving on.
   Fewer items and slower to produce than a normal Feed. Exists only so that
   subscribers never receive an error while quota lasts.
 
+## Episode identity
+
+- **Episode**: a single entry in a Feed — one upstream VoD (e.g. one YouTube
+  video) as presented to a podcatcher.
+- **Episode Guid**: the identifier a podcatcher uses to dedupe Episodes. One
+  Episode has exactly one Episode Guid, independent of which Ladder rung
+  produced the Feed that carried it (real conversion or Degraded Feed) and of
+  when it was served. Changing the scheme re-identifies every Episode for
+  every subscriber — a mass duplication — and is forbidden.
+- **Enclosure URL**: the per-Episode audio URL a podcatcher fetches to play or
+  download the Episode.
+- **Deterministic Enclosure URL**: an Enclosure URL whose value for a given
+  Episode is stable across serves and identical across all subscribers of the
+  same instance. Required for conditional GET to be able to answer
+  "unchanged"; a per-serve Enclosure URL makes the served Feed body differ on
+  every fetch and defeats conditional GET.
+
 ## Cache identity
 
 - **Canonical Feed Key**: the single cache identity for a Feed. Two different

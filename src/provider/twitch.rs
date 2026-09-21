@@ -96,12 +96,13 @@ impl MediaProvider for TwitchProvider {
             .title(channel.display_name.clone())
             .link(channel_url.clone())
             .description(channel.description.clone())
-            .itunes_ext(Some(
-                ITunesChannelExtensionBuilder::default()
-                    .image(Some(channel.profile_image_url.clone()))
-                    .author(Some(channel.display_name.clone()))
-                    .build(),
-            ))
+            .itunes_ext(Some({
+                let mut itunes_builder = ITunesChannelExtensionBuilder::default();
+                itunes_builder.image(Some(channel.profile_image_url.clone()));
+                itunes_builder.author(Some(channel.display_name.clone()));
+                provider::apply_apple_channel_tags(&mut itunes_builder);
+                itunes_builder.build()
+            }))
             .image(Some(
                 image_builder.url(channel.profile_image_url.clone()).build(),
             ));

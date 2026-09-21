@@ -4,14 +4,20 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Comment on an issue**: `gh issue comment <number> --body "..."`
-- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
+**Fork boundary (hard rule)**: never write to `madiele/vod2pod-rss` (upstream) —
+no issues, PRs, comments, labels, or pushes. Every `gh` write must pass
+`-R ki3lich/vod2pod-rss` explicitly, because `gh` defaults to the git remote,
+which points upstream. Reading upstream is fine.
 
-Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
+- **Create an issue**: `gh issue create -R ki3lich/vod2pod-rss --title "..." --body "..."`. Use a heredoc for multi-line bodies.
+- **Read an issue**: `gh issue view <number> -R ki3lich/vod2pod-rss --comments`, filtering comments by `jq` and also fetching labels.
+- **List issues**: `gh issue list -R ki3lich/vod2pod-rss --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
+- **Comment on an issue**: `gh issue comment <number> -R ki3lich/vod2pod-rss --body "..."`
+- **Apply / remove labels**: `gh issue edit <number> -R ki3lich/vod2pod-rss --add-label "..."` / `--remove-label "..."`
+- **Close**: `gh issue close <number> -R ki3lich/vod2pod-rss --comment "..."`
+
+Writes default to the git remote (upstream) if `-R` is omitted — that is exactly
+what must never happen; read-only calls may omit `-R` to inspect upstream.
 
 ## Pull requests as a triage surface
 

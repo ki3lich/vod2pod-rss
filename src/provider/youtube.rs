@@ -139,9 +139,7 @@ impl MediaProvider for YoutubeProvider {
             .ok_or_else(|| eyre!("probe state has no probe target"))?;
 
         let page = fetch_probe_page(probe_target, &api_key).await?;
-        info!(
-            "quota: ~1 unit consumed probing freshness of playlist {probe_target}"
-        );
+        info!("quota: ~1 unit consumed probing freshness of playlist {probe_target}");
         Ok(probe_state_unchanged(
             state,
             page.total_results,
@@ -193,14 +191,7 @@ impl MediaProvider for YoutubeProvider {
 fn first_page_snapshot(items: &[PlaylistItem]) -> (Vec<String>, Option<i64>) {
     let ids = items
         .iter()
-        .filter_map(|i| {
-            i.snippet
-                .as_ref()?
-                .resource_id
-                .as_ref()?
-                .video_id
-                .clone()
-        })
+        .filter_map(|i| i.snippet.as_ref()?.resource_id.as_ref()?.video_id.clone())
         .collect();
     let newest = items
         .iter()
@@ -415,8 +406,7 @@ async fn fetch_from_api(
     let max_fetched_items: usize = conf().get(ConfName::YoutubeMaxResults).unwrap().parse()?;
     let fetched = fetch_playlist_items(&upload_playlist, &api_key, max_fetched_items).await?;
 
-    let (duration_map, video_batches) =
-        create_duration_url_map(&fetched.items, &api_key).await?;
+    let (duration_map, video_batches) = create_duration_url_map(&fetched.items, &api_key).await?;
 
     let rss_items = build_channel_items_from_playlist(fetched.items, duration_map, filter_shorts);
 
@@ -445,6 +435,14 @@ async fn fetch_from_api(
     })
 }
 
+/// The watch URL for a video id. Load-bearing as the Episode Guid format:
+/// both the API path and the quota-free atom path emit this exact string as
+/// the item guid (see docs/adr/0002 — the scheme is frozen identity, never
+/// change it without acknowledging a mass duplication in every subscriber).
+fn watch_url_for_video_id(video_id: &str) -> String {
+    format!("https://www.youtube.com/watch?v={video_id}")
+}
+
 macro_rules! get_thumb {
     ($snippet:ident) => {
         $snippet.thumbnails.and_then(|thumbs| {
@@ -469,8 +467,8 @@ fn build_channel_from_yt_channel(channel: api::Channel) -> Channel {
         if let Some(mut thumb) = get_thumb!(snippet) {
             itunes_channel_builder.image(thumb.url.take());
         }
-        itunes_channel_builder.explicit(Some("no".to_owned()));
     }
+    provider::apply_apple_channel_tags(&mut itunes_channel_builder);
     channel_builder.link(format!(
         "https://www.youtube.com/channel/{}",
         channel.id.unwrap_or_default()
@@ -573,7 +571,7 @@ fn build_channel_items_from_playlist(
             let title = snippet.title.take().unwrap_or("".to_owned());
             let description = snippet.description.take().unwrap_or("".to_owned());
             let video_id = snippet.resource_id.take()?.video_id?;
-            let url = Url::parse(&format!("https://www.youtube.com/watch?v={}", &video_id)).ok()?;
+            let url = Url::parse(&watch_url_for_video_id(&video_id)).ok()?;
 
             let video_infos = videos_infos.get(&video_id).or_else(|| {
                 warn!("no duration found for {:?}", &video_id);
@@ -604,10 +602,11 @@ fn build_channel_items_from_playlist(
                     .published_at
                     .map(|pub_date| pub_date.to_rfc2822().to_string()),
             );
-            item_builder.author(snippet.channel_title.take());
-
+            item_builder.author(snippet.channel_title.clone());
             let itunes_item_extension = ITunesItemExtensionBuilder::default()
                 .summary(Some(description))
+                // Apple ignores plain <author>; episodes need itunes:author
+                .author(snippet.channel_title.take())
                 .duration(Some({
                     let hours = video_infos.duration.hour;
                     let minutes = video_infos.duration.minute;
@@ -732,6 +731,7 @@ fn build_channel_from_playlist(playlist: api::Playlist) -> Channel {
             itunes_channel_builder.image(thumb.url.take());
         }
     }
+    provider::apply_apple_channel_tags(&mut itunes_channel_builder);
 
     channel_builder.itunes_ext(Some(itunes_channel_builder.build()));
     channel_builder.build()
@@ -842,7 +842,9 @@ async fn get_youtube_stream_url(url: &Url) -> eyre::Result<Url> {
 /// drift between writer and evictor. Always returns `Ok(())`: a Redis failure
 /// must not mask the original transcode error.
 async fn evict_cached_yt_stream_url(watch_url: &Url) -> eyre::Result<()> {
-    let cache = YT_STREAM_URL_CACHE.get_or_init(build_yt_stream_url_cache).await;
+    let cache = YT_STREAM_URL_CACHE
+        .get_or_init(build_yt_stream_url_cache)
+        .await;
     match cache.async_cache_remove(watch_url).await {
         Ok(Some(_)) => info!("evicted cached youtube stream url for {watch_url}"),
         Ok(None) => debug!("no cached youtube stream url to evict for {watch_url}"),
@@ -939,8 +941,9 @@ fn convert_atom_to_rss(
     filter_shorts: bool,
 ) -> String {
     let mut feed_builder = provider::build_default_rss_structure();
+    let channel_title = feed.title.clone().map(|d| d.content).unwrap_or_default();
     feed_builder.description(feed.description.map(|d| d.content).unwrap_or_default());
-    feed_builder.title(feed.title.map(|d| d.content).unwrap_or_default());
+    feed_builder.title(channel_title.clone());
     feed_builder.language(feed.language);
     let mut image_builder = ImageBuilder::default();
     image_builder.url(feed.icon.clone().map(|d| d.uri).unwrap_or_default());
@@ -954,6 +957,7 @@ fn convert_atom_to_rss(
     );
     let mut itunes_ext_builder = ITunesChannelExtensionBuilder::default();
     itunes_ext_builder.image(feed.icon.map(|d| d.uri));
+    provider::apply_apple_channel_tags(&mut itunes_ext_builder);
     feed_builder.itunes_ext(Some(itunes_ext_builder.build()));
     let items = feed
         .entries
@@ -991,7 +995,26 @@ fn convert_atom_to_rss(
                     .and_then(|d| Some(d.clone().description?.content)),
             );
             item_builder.link(link.clone());
+            // Episode Guid must be identical to the one the API path emits for
+            // the same video, or podcatchers re-identify every episode whenever
+            // the Degradation Ladder serves this quota-free feed (mass
+            // duplication). The API path guids are the watch URL.
+            let guid = match entry.id.strip_prefix("yt:video:") {
+                Some(video_id) => watch_url_for_video_id(video_id),
+                None => link.clone().unwrap_or_else(|| entry.id.clone()),
+            };
+            item_builder.guid(Some(GuidBuilder::default().value(guid).build()));
+            item_builder.pub_date(
+                entry
+                    .published
+                    .or(entry.updated)
+                    .map(|date| date.to_rfc2822().to_string()),
+            );
             let mut itunes_item_builder = ITunesItemExtensionBuilder::default();
+            if !channel_title.is_empty() {
+                // Apple ignores plain <author>; episodes need itunes:author
+                itunes_item_builder.author(Some(channel_title.clone()));
+            }
             let media = entry.media.first();
             itunes_item_builder.image(
                 media
@@ -1002,7 +1025,6 @@ fn convert_atom_to_rss(
                 .map(|a| format!("{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60));
             itunes_item_builder.duration(duration);
             item_builder.itunes_ext(Some(itunes_item_builder.build()));
-            item_builder.guid(Some(GuidBuilder::default().value(entry.id).build()));
             Some(item_builder.build())
         })
         .collect::<Vec<Item>>();
@@ -1267,14 +1289,8 @@ mod tests {
 
     #[test]
     fn test_build_source_fingerprint_is_order_sensitive() {
-        let a = build_source_fingerprint(
-            Some(2),
-            &["vid1".to_string(), "vid2".to_string()],
-        );
-        let b = build_source_fingerprint(
-            Some(2),
-            &["vid2".to_string(), "vid1".to_string()],
-        );
+        let a = build_source_fingerprint(Some(2), &["vid1".to_string(), "vid2".to_string()]);
+        let b = build_source_fingerprint(Some(2), &["vid2".to_string(), "vid1".to_string()]);
         assert_ne!(a, b);
     }
 
@@ -1345,8 +1361,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_canonical_feed_id_for_channel_url() {
-        let url =
-            Url::parse("https://www.youtube.com/channel/UCXssEBQ8JWH1NacVIyQXe8g").unwrap();
+        let url = Url::parse("https://www.youtube.com/channel/UCXssEBQ8JWH1NacVIyQXe8g").unwrap();
         assert_eq!(
             canonical_yt_feed_id(&url).await,
             Some("yt:channel:UCXssEBQ8JWH1NacVIyQXe8g".to_string())
@@ -1364,5 +1379,135 @@ mod tests {
         )
         .unwrap();
         assert_eq!(canonical_yt_feed_id(&url).await, None);
+    }
+
+    // -- Episode identity: guids and pubDates must be identical across the API
+    // path and the quota-free atom path, or podcatchers re-identify every
+    // episode whenever the Degradation Ladder switches rungs (mass duplication).
+
+    const ATOM_FEED_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <title>Test Channel</title>
+  <id>yt:channel:UC123</id>
+  <updated>2024-01-02T03:04:05+00:00</updated>
+  <link rel="alternate" href="https://www.youtube.com/channel/UC123"/>
+  <icon>https://example.com/avatar.jpg</icon>
+  <entry>
+    <id>yt:video:abc123</id>
+    <title>Video One</title>
+    <published>2024-01-01T10:00:00+00:00</published>
+    <updated>2024-01-01T10:05:00+00:00</updated>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=abc123"/>
+    <media:thumbnail url="https://example.com/thumb1.jpg" width="1280" height="720"/>
+  </entry>
+  <entry>
+    <id>yt:video:def456</id>
+    <title>Video Two</title>
+    <updated>2024-01-02T11:00:00+00:00</updated>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=def456"/>
+    <media:thumbnail url="https://example.com/thumb2.jpg" width="1280" height="720"/>
+  </entry>
+</feed>"#;
+
+    fn convert_fixture(atom: &str) -> rss::Channel {
+        let feed = feed_rs::parser::parse(atom.as_bytes()).unwrap();
+        let body = convert_atom_to_rss(feed, HashMap::new(), false);
+        rss::Channel::read_from(body.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn test_atom_items_use_watch_url_guids() {
+        let channel = convert_fixture(ATOM_FEED_FIXTURE);
+        let guids: Vec<String> = channel
+            .items
+            .iter()
+            .map(|i| i.guid().unwrap().value().to_string())
+            .collect();
+        assert_eq!(
+            guids,
+            vec![
+                "https://www.youtube.com/watch?v=abc123".to_string(),
+                "https://www.youtube.com/watch?v=def456".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_atom_items_get_pub_date_from_published() {
+        let channel = convert_fixture(ATOM_FEED_FIXTURE);
+        let expected = chrono::DateTime::parse_from_rfc3339("2024-01-01T10:00:00+00:00")
+            .unwrap()
+            .to_rfc2822()
+            .to_string();
+        assert_eq!(
+            channel.items[0].pub_date().unwrap(),
+            expected.as_str(),
+            "pubDate must come from <published>"
+        );
+    }
+
+    #[test]
+    fn test_atom_item_pub_date_falls_back_to_updated() {
+        let channel = convert_fixture(ATOM_FEED_FIXTURE);
+        let expected = chrono::DateTime::parse_from_rfc3339("2024-01-02T11:00:00+00:00")
+            .unwrap()
+            .to_rfc2822()
+            .to_string();
+        // second entry has no <published>, only <updated>
+        assert_eq!(
+            channel.items[1].pub_date().unwrap(),
+            expected.as_str(),
+            "pubDate must fall back to <updated> when <published> is missing"
+        );
+    }
+
+    #[test]
+    fn test_atom_item_guid_falls_back_to_link_for_unknown_id_prefix() {
+        let atom = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Test Channel</title>
+  <id>urn:test</id>
+  <updated>2024-01-02T03:04:05+00:00</updated>
+  <entry>
+    <id>some-other-scheme:xyz</id>
+    <title>Video X</title>
+    <published>2024-01-01T10:00:00+00:00</published>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=xyz789"/>
+  </entry>
+</feed>"#;
+        let channel = convert_fixture(atom);
+        assert_eq!(
+            channel.items[0].guid().unwrap().value(),
+            "https://www.youtube.com/watch?v=xyz789"
+        );
+    }
+
+    #[test]
+    fn test_atom_channel_carries_apple_conformance_tags() {
+        let channel = convert_fixture(ATOM_FEED_FIXTURE);
+        let itunes = channel.itunes_ext().unwrap();
+        assert_eq!(
+            itunes.explicit(),
+            Some("false"),
+            "Apple accepts only true/false"
+        );
+        assert_eq!(
+            itunes.block(),
+            Some("Yes"),
+            "private feeds must stay out of the Apple directory"
+        );
+        assert_eq!(itunes.r#type(), Some("episodic"));
+    }
+
+    #[test]
+    fn test_atom_items_carry_itunes_author() {
+        let channel = convert_fixture(ATOM_FEED_FIXTURE);
+        for item in &channel.items {
+            assert_eq!(
+                item.itunes_ext().and_then(|i| i.author()),
+                Some("Test Channel"),
+                "Apple ignores plain <author>; items need itunes:author"
+            );
+        }
     }
 }

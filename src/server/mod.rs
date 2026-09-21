@@ -214,9 +214,7 @@ async fn transcodize_rss(
                     entry,
                     should_transcode,
                     &transcode_service_url,
-                    lookup
-                        .fresh_marker_ttl
-                        .unwrap_or(fresh_ttl_secs() as i64),
+                    lookup.fresh_marker_ttl.unwrap_or(fresh_ttl_secs() as i64),
                 ),
                 None => serve_feed(
                     &req,
@@ -326,9 +324,7 @@ fn serve_lookup_hit(
     match decision {
         feed_cache::ServeDecision::Fresh => {
             info!("serving cached rss feed for {parsed_url}");
-            let max_age = lookup
-                .fresh_marker_ttl
-                .unwrap_or(fresh_ttl_secs() as i64);
+            let max_age = lookup.fresh_marker_ttl.unwrap_or(fresh_ttl_secs() as i64);
             serve_feed(req, entry, should_transcode, transcode_service_url, max_age)
         }
         feed_cache::ServeDecision::Stale => {
@@ -406,10 +402,13 @@ fn conditional_response(
     }
 
     HttpResponse::Ok()
-        .content_type("application/xml")
+        .content_type("application/rss+xml")
         .insert_header((http::header::ETAG, format!("\"{etag}\"")))
         .insert_header((http::header::CACHE_CONTROL, cache_control))
-        .insert_header((http::header::LAST_MODIFIED, feed_cache::http_date(generated_at)))
+        .insert_header((
+            http::header::LAST_MODIFIED,
+            feed_cache::http_date(generated_at),
+        ))
         .body(body)
 }
 
@@ -472,7 +471,10 @@ async fn degrade_to_quota_free(
     transcode_service_url: &Url,
 ) -> HttpResponse {
     warn!("degrading to quota-free feed generation for {source_url}");
-    match provider.generate_rss_feed_quota_free(source_url.clone()).await {
+    match provider
+        .generate_rss_feed_quota_free(source_url.clone())
+        .await
+    {
         Ok(body) => {
             let entry = feed_cache::CachedFeed {
                 body,
@@ -511,7 +513,10 @@ async fn degrade_to_quota_free(
 async fn open_quota_breaker(con: &mut redis::aio::MultiplexedConnection, breaker_key: &str) {
     let reset = feed_cache::next_quota_reset(Utc::now());
     match feed_cache::open_quota_breaker(con, breaker_key, reset.timestamp()).await {
-        Ok(()) => warn!("quota breaker {breaker_key} open until {}", reset.to_rfc3339()),
+        Ok(()) => warn!(
+            "quota breaker {breaker_key} open until {}",
+            reset.to_rfc3339()
+        ),
         Err(e) => warn!("could not persist quota breaker: {e}"),
     }
 }
@@ -646,7 +651,13 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
     let stream_url = &query.url;
     let bitrate = query.bitrate;
     let duration_secs = query.duration;
-    let total_streamable_bytes = (duration_secs * bitrate * 1000) / 8;
+    // same arithmetic the enclosure `length` attribute uses (see
+    // rss_transcodizer::streamable_bytes), so advertised size == served size
+    let total_streamable_bytes = usize::try_from(rss_transcodizer::streamable_bytes(
+        duration_secs as u64,
+        bitrate as u64,
+    ))
+    .unwrap_or(usize::MAX);
     info!("processing transcode at {bitrate}k for {stream_url}");
 
     if let Ok(value) = conf().get(ConfName::TranscodingEnabled) {
@@ -785,6 +796,24 @@ mod tests {
         let bytes_count = 200;
         let (start, end, expected) = parse_range_header(content_range_str, bytes_count).unwrap();
         assert_eq!((start, end, expected), (0, 199, 200));
+    }
+
+    #[test]
+    fn test_conditional_response_declares_rss_content_type() {
+        let response = conditional_response(
+            &http::header::HeaderMap::new(),
+            "<rss>feed body</rss>".to_string(),
+            1_758_424_055,
+            3600,
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            // the mime type podcatchers match feeds against
+            Some("application/rss+xml")
+        );
     }
 
     #[test]

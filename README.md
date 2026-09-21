@@ -139,6 +139,20 @@ If you serve many feeds, the `YOUTUBE_MAX_RESULTS` setting (default 300) is
 the main per-conversion cost driver: lowering it reduces the units spent per
 full conversion at the cost of shorter feeds.
 
+## Apple Podcasts compatibility
+
+Feeds are tuned for Apple Podcasts out of the box: the tags Apple validates
+(`itunes:explicit`, `itunes:category`, language, enclosures) are always
+present, `itunes:block=Yes` keeps private instances out of Apple's
+public directory, and enclosure URLs are stable per episode so Apple's
+central crawler can use conditional GET (`304`) instead of re-downloading
+every feed body.
+
+One caveat: Apple Podcasts plays MP3/M4A only. The default `AUDIO_CODEC=MP3`
+is fully compatible; `OPUS` and `OGG_VORBIS` work in other podcatchers but
+their episodes will not play in Apple Podcasts (the server logs a warning at
+startup when they are selected).
+
 # Honorable Mentions
 
 These projects were fundamental for the success of vod2pod-rss, originally they handled the feed generation for youtube and twitch, now this is all done by vod2pod-rss internally so they are not used anymore, but were still helpful to get vod2pod-rss up and running fast.

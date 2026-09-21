@@ -146,10 +146,32 @@ fn check_youtube_feed(feed: Channel) {
     assert_eq!(".", feed.description());
     assert!(feed.image().is_some());
     assert!(!feed.items.is_empty());
+    // Apple Podcasts conformance (see docs/adr/0002 and the tag guide):
+    let itunes = feed.itunes_ext().unwrap();
+    assert_eq!(
+        itunes.explicit(),
+        Some("false"),
+        "Apple accepts only true/false"
+    );
+    assert_eq!(itunes.block(), Some("Yes"));
+    assert_eq!(itunes.r#type(), Some("episodic"));
     let url_format =
         regex::Regex::new(r"^https://i\.ytimg\.com/vi/[a-zA-Z0-9_-]*/.*\.jpg$").unwrap();
     let mut found = 0;
     for item in feed.items() {
+        // every episode: watch-url guid (shared with the quota-free path),
+        // a pubDate, and itunes:author (Apple ignores plain <author>)
+        let guid = item.guid().unwrap().value();
+        assert!(
+            guid.starts_with("https://www.youtube.com/watch?v="),
+            "guid must be the watch url, got: {guid}"
+        );
+        assert!(item.pub_date().is_some(), "missing pubDate on: {guid}");
+        assert_eq!(
+            item.itunes_ext().and_then(|i| i.author()),
+            Some(feed.title()),
+            "missing itunes:author on: {guid}"
+        );
         match item.title() {
             Some("Spin rhythm psmove demo") => {
                 let itunes = item.itunes_ext().unwrap();

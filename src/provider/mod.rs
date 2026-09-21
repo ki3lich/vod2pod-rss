@@ -87,7 +87,9 @@ pub trait MediaProvider {
         _channel_url: &Url,
         _state: &FeedProbeState,
     ) -> eyre::Result<bool> {
-        Err(eyre::eyre!("freshness probe not supported by this provider"))
+        Err(eyre::eyre!(
+            "freshness probe not supported by this provider"
+        ))
     }
 
     /// Produce a feed without consuming any metered provider quota. Used as
@@ -96,7 +98,9 @@ pub trait MediaProvider {
     /// is typically limited (fewer items) compared to `generate_rss_feed`.
     /// The default reports "unsupported".
     async fn generate_rss_feed_quota_free(&self, _channel_url: Url) -> eyre::Result<String> {
-        Err(eyre::eyre!("quota-free feed generation not supported by this provider"))
+        Err(eyre::eyre!(
+            "quota-free feed generation not supported by this provider"
+        ))
     }
 
     /// Redis key of this provider's Quota Breaker, when the provider has a
@@ -106,7 +110,6 @@ pub trait MediaProvider {
     fn quota_breaker_key(&self) -> Option<String> {
         None
     }
-
 
     /// Takes an URL and returns the stream URL, this will be passed to ffmpeg to start the
     /// transcoding process
@@ -151,6 +154,21 @@ pub trait MediaProvider {
     fn domain_whitelist_regexes(&self) -> Vec<Regex>;
 }
 
+/// Apple Podcasts show-level tags applied uniformly to every feed vod2pod
+/// builds itself (Apple's "Podcaster's Guide to RSS"):
+/// - `itunes:explicit` accepts only `true`/`false` — any other value (e.g.
+///   `no`) is a hard validation error;
+/// - `itunes:block` takes effect only when set to exactly `Yes`: it keeps
+///   these feeds out of the public Apple directory, which is what a private
+///   transcoder wants;
+/// - `itunes:type` `episodic` matches VoD feeds (newest-first, no episode
+///   numbering).
+pub fn apply_apple_channel_tags(itunes: &mut ITunesChannelExtensionBuilder) {
+    itunes.block(Some("Yes".to_string()));
+    itunes.explicit(Some("false".to_string()));
+    itunes.r#type(Some("episodic".to_string()));
+}
+
 /// This is the default rss structure used as a base for all the providers,
 pub fn build_default_rss_structure() -> rss::ChannelBuilder {
     let mut feed_builder = rss::ChannelBuilder::default();
@@ -170,14 +188,12 @@ pub fn build_default_rss_structure() -> rss::ChannelBuilder {
 
     // tell well-behaved podcatchers how often the feed is refreshed, in
     // minutes; this mirrors the Fresh TTL the server enforces server-side
-    let fresh_ttl_seconds = crate::configs::conf_u64(
-        ConfName::CacheTTL,
-        crate::configs::DEFAULT_CACHE_TTL_SECS,
-    );
+    let fresh_ttl_seconds =
+        crate::configs::conf_u64(ConfName::CacheTTL, crate::configs::DEFAULT_CACHE_TTL_SECS);
     feed_builder.ttl(Some((fresh_ttl_seconds / 60).max(1).to_string()));
 
     let mut itunes_section = ITunesChannelExtensionBuilder::default();
-    itunes_section.block(Some("yes".to_string())); //this tells podcast players to not index the podcast in their search engines
+    apply_apple_channel_tags(&mut itunes_section);
     feed_builder.itunes_ext(Some(itunes_section.build()));
 
     feed_builder
@@ -185,5 +201,27 @@ pub fn build_default_rss_structure() -> rss::ChannelBuilder {
 
 #[cfg(test)]
 mod tests {
-    //use super::*;
+    use super::*;
+
+    #[test]
+    fn test_apply_apple_channel_tags_sets_conformance_values() {
+        let mut itunes = ITunesChannelExtensionBuilder::default();
+        apply_apple_channel_tags(&mut itunes);
+        let itunes = itunes.build();
+        // Apple accepts only true/false for explicit
+        assert_eq!(itunes.explicit.as_deref(), Some("false"));
+        assert_eq!(itunes.block.as_deref(), Some("Yes"));
+        assert_eq!(itunes.r#type.as_deref(), Some("episodic"));
+    }
+
+    #[test]
+    fn test_default_rss_structure_carries_apple_tags() {
+        let channel = build_default_rss_structure().build();
+        let itunes = channel
+            .itunes_ext
+            .expect("default structure must have itunes_ext");
+        assert_eq!(itunes.explicit.as_deref(), Some("false"));
+        assert_eq!(itunes.block.as_deref(), Some("Yes"));
+        assert_eq!(itunes.r#type.as_deref(), Some("episodic"));
+    }
 }

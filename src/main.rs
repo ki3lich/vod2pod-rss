@@ -1,8 +1,8 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use simple_logger::SimpleLogger;
 use std::{env, net::TcpListener, process::exit};
 use vod2pod_rss::{
-    configs::{conf, Conf, ConfName},
+    configs::{conf, AudioCodec, Conf, ConfName},
     server,
 };
 
@@ -27,6 +27,19 @@ async fn async_main() -> std::io::Result<()> {
         .env()
         .init()
         .unwrap();
+
+    // Apple Podcasts (and most podcatchers) play MP3/M4A only: OGG/Opus
+    // enclosures fail silently there. Keep the trade-off visible at startup.
+    let codec: AudioCodec = conf().get(ConfName::AudioCodec).unwrap().into();
+    match codec {
+        AudioCodec::MP3 => {}
+        AudioCodec::Opus => warn!(
+            "AUDIO_CODEC=OPUS: Apple Podcasts and most podcatchers cannot play Opus/OGG; use AUDIO_CODEC=MP3 for maximum compatibility"
+        ),
+        AudioCodec::OGGVorbis => warn!(
+            "AUDIO_CODEC=OGG_VORBIS: Apple Podcasts and most podcatchers cannot play Vorbis/OGG; use AUDIO_CODEC=MP3 for maximum compatibility"
+        ),
+    }
 
     if let Err(err) = flush_redis_on_new_version().await {
         panic!(

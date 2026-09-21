@@ -36,20 +36,19 @@ pub fn inject_vod2pod_customizations(
     );
     injected_feed.set_namespaces(namespaces);
     injected_feed.set_language("en-US".to_string());
+    let bitrate: u64 = conf()
+        .get(ConfName::Mp3Bitrate)
+        .unwrap()
+        .parse()
+        .expect("MP3_BITRATE must be a number");
+    let codec: AudioCodec = conf().get(ConfName::AudioCodec).unwrap().into();
+    let ext = format!(".{}", codec.get_extension_str());
     injected_feed
         .items_mut()
         .iter_mut()
         .try_for_each(|item| -> eyre::Result<_> {
             let description = get_description(item);
             item.set_description(description);
-            let bitrate: u64 = conf()
-                .get(ConfName::Mp3Bitrate)
-                .unwrap()
-                .parse()
-                .expect("MP3_BITRATE must be a number");
-            let generation_uuid = uuid::Uuid::new_v4().to_string();
-            let codec: AudioCodec = conf().get(ConfName::AudioCodec).unwrap().into();
-            let ext = format!(".{}", codec.get_extension_str());
             if let Some(mut transcode_service_url) = transcode_service_url.clone() {
                 let duration_secs = &item
                     .itunes_ext()
@@ -58,16 +57,35 @@ pub fn inject_vod2pod_customizations(
                         "no duration found or could not parse {:?}",
                         item.itunes_ext()
                     ))?;
+                // the link is mandatory: the enclosure itself points at it
+                let source_link = item
+                    .link()
+                    .ok_or(eyre!("not url found in item"))?
+                    .to_string();
+                // Enclosure URLs must be stable across serves and identical
+                // for every subscriber of the same episode: the server derives
+                // its ETag from the injected body, and podcatchers tie episode
+                // identity to guid + enclosure. A fresh uuid per serve would
+                // defeat conditional GET and fragment identity. The seed is the
+                // episode guid when present, the source link otherwise — an
+                // item with neither cannot be transcoded at all.
+                let episode_seed = item
+                    .guid()
+                    .map(|g| g.value().to_string())
+                    .unwrap_or(source_link.clone());
+                let generation_uuid =
+                    uuid::Uuid::new_v5(&EPISODE_ENCLOSURE_UUID_NAMESPACE, episode_seed.as_bytes())
+                        .to_string();
                 transcode_service_url
                     .query_pairs_mut()
                     .append_pair("bitrate", bitrate.to_string().as_str())
                     .append_pair("uuid", generation_uuid.as_str())
                     .append_pair("duration", duration_secs.to_string().as_str())
-                    .append_pair("url", item.link().ok_or(eyre!("not url found in item"))?)
+                    .append_pair("url", source_link.as_str())
                     .append_pair("ext", ext.as_str()); //this should allways be last, some players refuse to play urls not ending in .mp3
 
                 let enclosure = Enclosure {
-                    length: (bitrate * 1024 * duration_secs).to_string(),
+                    length: streamable_bytes(*duration_secs, bitrate).to_string(),
                     url: transcode_service_url.to_string(),
                     mime_type: "audio/mpeg".to_string(),
                 };
@@ -83,6 +101,23 @@ pub fn inject_vod2pod_customizations(
 
     Ok(injected_feed.to_string())
 }
+
+/// Bytes the transcoder streams for `duration_secs` at `bitrate_kbps`
+/// (constant bitrate, kbits/s * 1000 / 8 = bytes/s). Single source of truth
+/// for the enclosure `length` attribute and the server's Content-Length /
+/// Content-Range arithmetic, so the advertised size always equals the served
+/// size.
+pub fn streamable_bytes(duration_secs: u64, bitrate_kbps: u64) -> u64 {
+    duration_secs * bitrate_kbps * 1000 / 8
+}
+
+/// Fixed uuid-v5 namespace used to derive the per-episode enclosure uuid from
+/// the episode identifier. NEVER change this value: enclosure urls are part
+/// of episode identity for podcatchers (see CONTEXT.md,
+/// "Deterministic Enclosure URL") and every derived uuid would change,
+/// re-downloading every episode for every subscriber.
+const EPISODE_ENCLOSURE_UUID_NAMESPACE: uuid::Uuid =
+    uuid::uuid!("b3e1c9a0-4f2d-4e8a-9c1b-2d5f6a7b8c9d");
 
 fn get_description(item: &Item) -> String {
     const FOOTER: &str = concat!(
@@ -124,4 +159,111 @@ fn parse_duration(duration_str: &str) -> Result<Duration, String> {
 
     let duration_secs = hours * 3600 + minutes * 60 + seconds;
     Ok(Duration::from_secs(duration_secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TWO_ITEM_RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+<channel>
+<title>t</title>
+<link>https://example.com</link>
+<description>d</description>
+<item>
+  <title>episode one</title>
+  <link>https://www.youtube.com/watch?v=abc</link>
+  <guid>https://www.youtube.com/watch?v=abc</guid>
+  <itunes:duration>00:10:00</itunes:duration>
+  <description>about one</description>
+  <itunes:image href="https://example.com/one.jpg"/>
+</item>
+<item>
+  <title>episode two</title>
+  <link>https://www.youtube.com/watch?v=def</link>
+  <guid>https://www.youtube.com/watch?v=def</guid>
+  <itunes:duration>00:20:00</itunes:duration>
+  <description>about two</description>
+  <itunes:image href="https://example.com/two.jpg"/>
+</item>
+</channel>
+</rss>"#;
+
+    fn inject_default() -> rss::Channel {
+        let body = inject_vod2pod_customizations(
+            TWO_ITEM_RSS.to_string(),
+            Some(Url::parse("http://127.0.0.1:8080/transcode_media/to.mp3").unwrap()),
+        )
+        .unwrap();
+        rss::Channel::read_from(body.as_bytes()).unwrap()
+    }
+
+    /// The whole injected body must be byte-identical across serves of the
+    /// same cached feed: the server derives its ETag from this body, so any
+    /// per-serve variation defeats conditional GET (304) entirely.
+    #[test]
+    fn test_injection_is_deterministic() {
+        let first = inject_vod2pod_customizations(
+            TWO_ITEM_RSS.to_string(),
+            Some(Url::parse("http://127.0.0.1:8080/transcode_media/to.mp3").unwrap()),
+        )
+        .unwrap();
+        let second = inject_vod2pod_customizations(
+            TWO_ITEM_RSS.to_string(),
+            Some(Url::parse("http://127.0.0.1:8080/transcode_media/to.mp3").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_enclosure_uuid_differs_per_episode() {
+        let channel = inject_default();
+        let urls: Vec<String> = channel
+            .items
+            .iter()
+            .map(|i| i.enclosure().unwrap().url().to_string())
+            .collect();
+        assert_ne!(
+            urls[0], urls[1],
+            "two episodes must not share an enclosure url"
+        );
+    }
+
+    /// Pin the derivation itself, not just its stability: the uuid must be
+    /// v5-of(guid) under the compiled-in namespace, so a regression back to a
+    /// random uuid (or a re-keying) fails loudly instead of silently drifting.
+    #[test]
+    fn test_enclosure_uuid_is_v5_of_episode_guid() {
+        let channel = inject_default();
+        let expected = uuid::Uuid::new_v5(
+            &EPISODE_ENCLOSURE_UUID_NAMESPACE,
+            b"https://www.youtube.com/watch?v=abc",
+        )
+        .to_string();
+        let url = channel.items[0].enclosure().unwrap().url().to_string();
+        assert!(
+            url.contains(&format!("uuid={expected}")),
+            "enclosure url must embed uuid v5 of the episode guid, got: {url}"
+        );
+    }
+
+    #[test]
+    fn test_enclosure_length_matches_served_bytes() {
+        // the server streams duration * bitrate * 1000 / 8 bytes (192 kbps
+        // default): the enclosure length must be the same number, not the old
+        // bitrate * 1024 * seconds formula
+        let channel = inject_default();
+        for item in &channel.items {
+            let duration = item.itunes_ext().unwrap().duration().unwrap();
+            let secs = parse_duration(duration).unwrap().as_secs();
+            let expected = secs * 192 * 1000 / 8;
+            assert_eq!(
+                item.enclosure().unwrap().length(),
+                expected.to_string(),
+                "enclosure length must equal the byte count the server serves"
+            );
+        }
+    }
 }
