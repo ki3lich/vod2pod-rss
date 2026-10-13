@@ -284,6 +284,39 @@ impl Transcoder {
                             }
 
                             if read_bytes == 0 {
+                                // An input that dies early is indistinguishable from a
+                                // finished one at the stdout level: both close the pipe,
+                                // and ffmpeg exits 0 with an empty stderr. Only the byte
+                                // shortfall tells them apart. Within MAX_OK_SHORTFALL_RATIO
+                                // the EOF is a finished, slightly-shorter-than-declared
+                                // stream (encoder overhead, duration rounding — a
+                                // fraction of a percent in production) and keeps the
+                                // historical padding; beyond it the upstream ended
+                                // prematurely, and padding would yield a full-length 200
+                                // of mostly NUL bytes that podcatchers cache and then
+                                // fail to play — fail the stream instead so the client
+                                // sees a broken transfer and retries later. Tail ranges
+                                // mapping past the real end of a shorter-than-declared
+                                // stream land on the same error path on purpose: a
+                                // broken transfer beats cached zeros. See
+                                // `transcode_stream_errors_when_input_ends_far_short_of_expected`
+                                // for the incident that motivated the threshold.
+                                const MAX_OK_SHORTFALL_RATIO: f64 = 0.1;
+                                let shortfall = expected_bytes_count - sent_bytes_count;
+                                if shortfall as f64
+                                    > expected_bytes_count as f64 * MAX_OK_SHORTFALL_RATIO
+                                {
+                                    error!(
+                                        "input stream ended after {sent_bytes_count} of {expected_bytes_count} expected bytes; not padding the shortfall"
+                                    );
+                                    _ = tx_stdout.blocking_send(Err(std::io::Error::other(
+                                        format!(
+                                            "media stream ended prematurely: got {sent_bytes_count} of {expected_bytes_count} bytes"
+                                        ),
+                                    )));
+                                    _ = child.wait();
+                                    break;
+                                }
                                 info!("transcoded everything");
                                 //pad end of stream with 00000000 bytes if client expects more data to be sent
                                 const NULL_BUFF: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
@@ -530,5 +563,162 @@ mod test {
             "expected preflight to pass for a listening local port, got {transcoder:?}"
         );
         drop(listener);
+    }
+
+    #[test]
+    fn transcode_stream_errors_when_input_ends_far_short_of_expected() {
+        // Real incident (2026-10-13, Kwadrans z Kangą #327): a flaky googlevideo
+        // edge delivered ~2s of a 50-minute episode and closed the connection
+        // cleanly. ffmpeg exited 0 with an empty stderr — indistinguishable from
+        // a finished input at the stdout level — and the transcoder dressed the
+        // result up as a full-length 200 by padding the shortfall with NUL
+        // bytes. Apple Podcasts cached that "valid" file, failed to decode the
+        // padding after the real audio, skipped the episode and marked it
+        // played. An input that ends this far short of the declared length must
+        // surface as an error, so the client sees a broken transfer and retries
+        // later instead of caching garbage.
+        //
+        // Deterministic: a local 2s fixture "ends" in well under a second while
+        // the declared length claims ~15x more audio. No network involved (the
+        // `file` protocol is in ffmpeg's whitelist).
+        let fixture_dir = std::env::temp_dir().join(format!("vod2pod-test-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let fixture = fixture_dir.join("short.mp3");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-acodec",
+                "libmp3lame",
+                "-ab",
+                "32k",
+                fixture.to_str().unwrap(),
+            ])
+            .status()
+            .expect("ffmpeg must be available to run this test");
+        assert!(generated.success(), "failed to generate test fixture");
+
+        let real_len = std::fs::metadata(&fixture).unwrap().len() as usize;
+        let url = Url::from_file_path(&fixture).unwrap();
+        let expected_bytes_count = real_len * 15;
+        let params = FfmpegParameters {
+            seek_time: 0.0,
+            url,
+            audio_codec: AudioCodec::MP3,
+            bitrate_kbit: 32,
+            max_rate_kbit: 960,
+            expected_bytes_count,
+            timeout_in_seconds: 600,
+        };
+        let transcoder = Transcoder {
+            ffmpeg_command: Transcoder::get_ffmpeg_command(&params),
+            expected_bytes_count,
+        };
+
+        use futures::StreamExt;
+        let mut stream = transcoder.get_transcode_stream();
+        let mut ok_bytes = 0usize;
+        let mut stream_err = None;
+        futures::executor::block_on(async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => ok_bytes += bytes.len(),
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        });
+        // Clean up before any assertion so a failing run leaves no /tmp litter.
+        std::fs::remove_dir_all(&fixture_dir).ok();
+
+        let err = stream_err.unwrap_or_else(|| {
+            panic!(
+                "transcode stream reported success after only {ok_bytes} of \
+                 {expected_bytes_count} expected bytes — early input death was \
+                 padded over instead of surfacing as an error"
+            )
+        });
+        info!("stream failed as expected after {ok_bytes} bytes: {err}");
+        assert!(ok_bytes < expected_bytes_count);
+    }
+
+    #[test]
+    fn transcode_stream_still_pads_small_undershoot() {
+        // The other side of the threshold: a stream that ends within legitimate
+        // encoder undershoot of the declared length is a finished, slightly
+        // short stream — not a dead one — and must keep the historical padding
+        // behavior, completing the transfer with the full declared length.
+        let fixture_dir = std::env::temp_dir().join(format!("vod2pod-test-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let fixture = fixture_dir.join("short.mp3");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-acodec",
+                "libmp3lame",
+                "-ab",
+                "32k",
+                fixture.to_str().unwrap(),
+            ])
+            .status()
+            .expect("ffmpeg must be available to run this test");
+        assert!(generated.success(), "failed to generate test fixture");
+
+        let real_len = std::fs::metadata(&fixture).unwrap().len() as usize;
+        let url = Url::from_file_path(&fixture).unwrap();
+        // Re-encoding the same audio at the same bitrate lands within a few
+        // percent of the fixture size — well inside the 10% threshold either
+        // way (a slightly larger output takes the partial-request truncation
+        // branch, a slightly smaller one the padding branch; both complete).
+        let expected_bytes_count = real_len;
+        let params = FfmpegParameters {
+            seek_time: 0.0,
+            url,
+            audio_codec: AudioCodec::MP3,
+            bitrate_kbit: 32,
+            max_rate_kbit: 960,
+            expected_bytes_count,
+            timeout_in_seconds: 600,
+        };
+        let transcoder = Transcoder {
+            ffmpeg_command: Transcoder::get_ffmpeg_command(&params),
+            expected_bytes_count,
+        };
+
+        use futures::StreamExt;
+        let mut stream = transcoder.get_transcode_stream();
+        let mut ok_bytes = 0usize;
+        let mut stream_err = None;
+        futures::executor::block_on(async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => ok_bytes += bytes.len(),
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        });
+        std::fs::remove_dir_all(&fixture_dir).ok();
+
+        assert!(
+            stream_err.is_none(),
+            "small undershoot was surfaced as an error: {stream_err:?}"
+        );
+        assert_eq!(ok_bytes, expected_bytes_count);
     }
 }
