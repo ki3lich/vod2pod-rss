@@ -46,6 +46,10 @@ disagree, one of them is wrong — fix it before moving on.
 
 - **Episode**: a single entry in a Feed — one upstream VoD (e.g. one YouTube
   video) as presented to a podcatcher.
+- **Episode Metadata**: the per-Episode presentation fields a Feed carries —
+  title, description, artwork, publish date — what a podcatcher renders for an
+  Episode. Distinct from Episode Guid and Enclosure URL, which identify and
+  deliver an Episode rather than present it.
 - **Episode Guid**: the identifier a podcatcher uses to dedupe Episodes. One
   Episode has exactly one Episode Guid, independent of which Ladder rung
   produced the Feed that carried it (real conversion or Degraded Feed) and of

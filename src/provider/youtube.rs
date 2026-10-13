@@ -1510,4 +1510,102 @@ mod tests {
             );
         }
     }
+
+    // -- Episode Metadata: the media-derived fields a podcatcher renders
+    // (description, artwork) must survive the quota-free atom path. Pinned
+    // against a real captured feed because the synthetic fixture above cannot
+    // express the media:group structure YouTube actually sends — exactly where
+    // parser majors have broken us before. The file is a pinned contract
+    // input: entries are verbatim, unselected ones removed. Re-capture with:
+    //   curl -s "https://www.youtube.com/feeds/videos.xml?channel_id=UCBR8-60-B28hp2BmDPdntcQ"
+    // (keyless public endpoint — no API key involved).
+
+    const REAL_ATOM_FEED_FIXTURE: &str = include_str!("testdata/youtube_channel_atom.xml");
+
+    #[test]
+    fn test_real_atom_feed_yields_one_item_per_entry() {
+        let channel = convert_fixture(REAL_ATOM_FEED_FIXTURE);
+        assert_eq!(channel.items.len(), 3, "one Episode per entry");
+        let titles: Vec<&str> = channel.items.iter().map(|i| i.title().unwrap()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "*cries in micro bang*",
+                "20 years of esports history explained",
+                "one year married and 5 full-length episodes, exclusively on YouTube on @DorothyWang's channel 💍",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_real_atom_item_description_survives_empty_media_description() {
+        let channel = convert_fixture(REAL_ATOM_FEED_FIXTURE);
+        // Real YouTube feeds routinely emit empty <media:description>; it must
+        // not kill the parse nor produce phantom text. (feed-rs yields Some("")
+        // here; the rss round-trip in convert_fixture normalizes the empty
+        // element back to None, so the observable contract is absent-or-empty.)
+        assert!(
+            channel.items[0].description().is_none_or(|d| d.is_empty()),
+            "empty media:description must stay an empty Episode description"
+        );
+        assert!(channel.items[2].description().is_none_or(|d| d.is_empty()));
+        let long = channel.items[1].description().expect("populated description");
+        assert!(long.starts_with("Join @Valkyrae"), "description text survives");
+        assert!(
+            long.contains("Created & Produced by Portal A"),
+            "XML entities must be decoded (&amp; → &)"
+        );
+        assert!(!long.contains("&amp;"), "no raw entity may leak through");
+        assert!(
+            long.ends_with("Sound Mix: Austin Krier"),
+            "description must arrive complete, not silently truncated"
+        );
+    }
+
+    #[test]
+    fn test_real_atom_item_carries_media_thumbnail_as_itunes_image() {
+        let channel = convert_fixture(REAL_ATOM_FEED_FIXTURE);
+        // media:thumbnail lives inside media:group in real feeds; it must land
+        // on the Episode as itunes:image or podcatchers lose all artwork.
+        let images: Vec<Option<&str>> = channel
+            .items
+            .iter()
+            .map(|i| i.itunes_ext().and_then(|it| it.image()))
+            .collect();
+        assert_eq!(
+            images,
+            vec![
+                Some("https://i1.ytimg.com/vi/dWuPnW0EHKM/hqdefault.jpg"),
+                Some("https://i4.ytimg.com/vi/71ya_JC_IbM/hqdefault.jpg"),
+                Some("https://i2.ytimg.com/vi/q4-rVbyEmrc/hqdefault.jpg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_real_atom_items_carry_watch_url_guids_and_pub_dates() {
+        let channel = convert_fixture(REAL_ATOM_FEED_FIXTURE);
+        // Two of the three captured entries are Shorts; the Episode Guid scheme
+        // is the watch URL regardless of the entry's link shape, or the API
+        // path and this path would re-identify episodes (mass duplication).
+        let guids: Vec<&str> = channel
+            .items
+            .iter()
+            .map(|i| i.guid().unwrap().value())
+            .collect();
+        assert_eq!(
+            guids,
+            vec![
+                "https://www.youtube.com/watch?v=dWuPnW0EHKM",
+                "https://www.youtube.com/watch?v=71ya_JC_IbM",
+                "https://www.youtube.com/watch?v=q4-rVbyEmrc",
+            ]
+        );
+        for item in &channel.items {
+            assert!(
+                item.pub_date().is_some_and(|d| !d.is_empty()),
+                "every Episode needs a pubDate"
+            );
+        }
+    }
 }
