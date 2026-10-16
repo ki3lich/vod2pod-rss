@@ -89,3 +89,67 @@ disagree, one of them is wrong — fix it before moving on.
   Degraded rung applies when the Feed Conversion fails — quota exhaustion
   included, and it applies preemptively while the Quota Breaker is open. A
   rung is skipped only when it cannot produce a result.
+
+## Source staging
+
+- **Source Stage**: the act of fetching an Episode's source media to a local
+  file with parallel bounded ranged GETs before ffmpeg reads it. Exists
+  because the googlevideo edge serves bounded ranges at full speed while
+  throttling open-ended reads to ~27 KB/s (measured 2026-10-16, issue #166).
+- **Staged Source**: the local, byte-verified file a Source Stage produces.
+  Byte-verified means every byte range was served in full against the
+  **Origin Total**; ffmpeg never sees a staged file that failed verification.
+  On the Open-ended Fallback there is no declared total — verification there
+  is the body's clean end, and the received count is the truth.
+- **Direct Media Source**: a provider whose resolved Stream URL is the media
+  bytes themselves (YouTube's googlevideo URL) — the only kind a Source
+  Stage can fetch. Manifest-based providers (Twitch HLS, PeerTube's
+  streaming playlists) resolve to playlists and are never staged, whatever
+  the kill switch says; the provider declares this (`streams_direct_media`).
+- **Staging Kill Switch**: the `STAGE_SOURCES` config, default on — staged
+  fetching is the production path. Only the exact rollback spellings
+  ("false", "0", "off", "no" — case-insensitive, trimmed) return every
+  request to the legacy path: the resolved Stream URL goes straight to
+  ffmpeg with the TCP preflight. A typo of one of them keeps staging on:
+  an unrecognized value is never read as a rollback.
+- **Staging Slot**: the concurrency unit of Source Staging — one per Staged
+  Source on disk, taken before the stage creates its temp file and held
+  until the transcode deletes it. Slots are handed out by the **Staging
+  Gate** (`stage_gate()` in code), the process-wide pool whose capacity is
+  the **Staging Concurrency** (`STAGE_CONCURRENCY`, default 4); transcodes
+  beyond it queue instead of staging in parallel, bounding egress and
+  ephemeral storage alike. A slot is held only on the staged path: the kill
+  switch, manifest-based sources and the legacy path go slotless.
+- **Startup Sweep**: the process-start removal of staged temp files a
+  crashed predecessor left. Runs once, before the server accepts its first
+  request — so a live staged file is never swept — and only touches files
+  under the staged-file prefix; guard-owned deletion covers everything
+  created after it.
+- **Check Stage**: the pipeline step consulted with the resolved Stream URL
+  before ffmpeg runs. The legacy one is the TCP preflight (fail fast on a
+  SYN-dropping edge); a staging one performs the Source Stage and hands
+  back the Staged Source in place of the Stream URL. Either kind's failure
+  evicts the cached resolution and fails the request fast.
+- **Chunk**: one bounded ranged GET of a Source Stage, identified by the byte
+  span it fetches (`ChunkSpan` in code). Bounded means an explicit start and
+  end — the shape the edge serves at full speed. A stage runs
+  `STAGE_CHUNK_CONCURRENCY` (default 4, the measured full-aggregate speed)
+  Chunks at once; distinct from the **Staging Concurrency**, which bounds
+  how many sources stage at the same time.
+- **Chunk Plan**: the ordered list of Chunks tiling the source exactly,
+  decided purely from the Origin Total and the chunk size. Pure decision
+  code, no I/O — the fetcher executes it.
+- **Origin Total**: the source byte count the first Chunk's Content-Range
+  reports. That first request doubles as the **Source Probe**: a dead CDN
+  edge fails it within the attempt budget, fast, the way the TCP preflight
+  fails a dead resolution today.
+- **Open-ended Fallback**: the fallback ladder's second rung (issue #171).
+  When the Source Probe's ranged GET is answered with a 200 full body — the
+  origin ignores Range and no Chunk Plan can be built — the Source Stage
+  fetches the whole source with one open-ended GET into the same temp file,
+  engaging on its own with no operator action. ffmpeg still reads locally;
+  the attempt budget and the fast, clean failure rules are the ranged path's.
+- **Scripted Origin**: the test fixture encoding the measured edge behavior
+  (fast bounded ranges, throttled open-ended reads, stalled responses,
+  mid-body drops, Range ignored, 5xx, Content-Range lies) so the throttle bug
+  keeps a permanent regression test.

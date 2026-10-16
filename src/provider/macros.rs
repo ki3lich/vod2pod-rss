@@ -66,6 +66,10 @@ impl MediaProvider for $name {
         provider_dispatcher!($name, self, $($provider,)* $fallback ; get_stream_url(&media_url).await);
     }
 
+    fn streams_direct_media(&self) -> bool {
+        provider_dispatcher!($name, self, $($provider,)* $fallback ; streams_direct_media());
+    }
+
     async fn evict_stream_url_cache(&self, media_url: &Url) -> eyre::Result<()> {
         provider_dispatcher!($name, self, $($provider,)* $fallback ; evict_stream_url_cache(media_url).await);
     }

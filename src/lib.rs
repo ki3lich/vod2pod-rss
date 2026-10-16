@@ -17,6 +17,9 @@ fn init_crypto_provider() {
         .expect("Failed to install rustls ring crypto provider");
 }
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub async fn get_redis_client() -> Result<redis::aio::MultiplexedConnection, eyre::Error> {
     let redis_address = conf().get(ConfName::RedisAddress).unwrap();
     let redis_port = conf().get(ConfName::RedisPort).unwrap();

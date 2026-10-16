@@ -201,6 +201,18 @@ pub trait MediaProvider: Send + Sync {
     /// * `media_url` - The original URL found inside the RSS that should be streamed.
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url>;
 
+    /// Whether this provider's resolved Stream URL is the media bytes
+    /// themselves (for YouTube: a googlevideo file URL) — as opposed to a
+    /// manifest, an HLS/DASH playlist that merely names other URLs.
+    /// Consumers of the resolved source consult this to tell a fetchable
+    /// byte source from a playlist: a manifest-based provider is never
+    /// treated as a direct media source.
+    ///
+    /// Defaults to `false`: declaring direct media is opt-in per provider.
+    fn streams_direct_media(&self) -> bool {
+        false
+    }
+
     /// Drop any cached resolved stream URL for `media_url`.
     ///
     /// Providers that cache the resolved stream URL (e.g. YouTube, which caches

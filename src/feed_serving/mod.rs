@@ -643,7 +643,11 @@ impl FeedServing {
         windows: FreshnessWindows,
     ) {
         if let Err(e) = cache.store(canonical_key, entry, windows).await {
-            let kind = if entry.degraded { "degraded feed" } else { "feed" };
+            let kind = if entry.degraded {
+                "degraded feed"
+            } else {
+                "feed"
+            };
             warn!("could not store {kind} {canonical_key} in cache: {e}");
         }
     }

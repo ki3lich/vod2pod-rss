@@ -243,6 +243,12 @@ impl MediaProvider for YoutubeProvider {
         Some(now_utc.with_timezone(&Los_Angeles).format("%F").to_string())
     }
 
+    fn streams_direct_media(&self) -> bool {
+        // yt-dlp resolves to a googlevideo file URL: the media bytes
+        // themselves.
+        true
+    }
+
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {
         get_youtube_stream_url(media_url).await
     }
@@ -1088,7 +1094,7 @@ fn convert_atom_to_rss(
                     .and_then(|m| m.thumbnails.first())
                     .map(|t| t.clone().image.uri),
             );
-            itunes_item_builder.duration(duration_seconds.map(|a| format_duration(a as u64)));
+            itunes_item_builder.duration(duration_seconds.map(format_duration));
             item_builder.itunes_ext(Some(itunes_item_builder.build()));
             Some(item_builder.build())
         })

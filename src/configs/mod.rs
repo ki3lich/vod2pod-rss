@@ -15,6 +15,24 @@ pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
 pub const DEFAULT_STALE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// Default Fresh Period bound, seconds (24 hours).
 pub const DEFAULT_MAX_FRESH_PERIOD_SECS: u64 = 24 * 3600;
+/// Default staged-chunk size, bytes (8 MiB — the measured googlevideo fast
+/// ceiling; bigger single ranged requests get throttled).
+pub const DEFAULT_STAGE_CHUNK_SIZE_BYTES: u64 = 8 * 1024 * 1024;
+/// Default staging concurrency: how many source stages may run at once.
+/// One staged file on disk per stage, so this also bounds ephemeral-storage
+/// use by staged sources (headroom: largest episode source × this).
+pub const DEFAULT_STAGE_CONCURRENCY: u64 = 4;
+/// Default chunk-fetch parallelism: how many ranged GETs one Source Stage
+/// runs at once. 4 is the measured full-aggregate speed of the googlevideo
+/// edge (issue #166): four parallel chunks drained a 27.9 MB source in 1.09 s.
+pub const DEFAULT_STAGE_CHUNK_CONCURRENCY: u64 = 4;
+/// Default total stage deadline, seconds (240 — inside the
+/// transcoder-construction timeout that also covers resolution).
+pub const DEFAULT_STAGE_TOTAL_TIMEOUT_SECS: u64 = 240;
+/// Default per-request deadline, seconds (60 — one chunk attempt's connect,
+/// headers and body combined; a slower read is retried on a fresh
+/// connection).
+pub const DEFAULT_STAGE_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 pub enum ConfName {
     RedisAddress,
@@ -37,6 +55,12 @@ pub enum ConfName {
     MaxFreshPeriod,
     FfmpegTimeoutSeconds,
     PreflightTimeoutSeconds,
+    StageSources,
+    StageChunkSizeBytes,
+    StageChunkConcurrency,
+    StageConcurrency,
+    StageTotalTimeoutSeconds,
+    StageRequestTimeoutSeconds,
     Host,
     Port,
 }
@@ -160,6 +184,57 @@ impl Conf for EnvConf {
                 // (the kernel ~127s ETIMEDOUT that ffmpeg would otherwise hang
                 // on). Tunable because some ISPs route to flaky edge nodes.
                 Ok(std::env::var("PREFLIGHT_TIMEOUT_SECONDS").unwrap_or_else(|_| "3".to_string()))
+            }
+            ConfName::StageSources => {
+                // Source staging kill switch (issues #166–#170): staged
+                // fetching is the production path, so this defaults to on.
+                // Parsed opt-out by the consumer: only the exact rollback
+                // spellings ("false", "0", "off", "no" — case insensitive,
+                // trimmed) return every request to the legacy path — the
+                // resolved Stream URL straight to ffmpeg with the TCP
+                // preflight. A typo of one of them keeps staging on: the
+                // rollback value a struggling operator types is the one
+                // that must work, and exact matching is what keeps a typo
+                // from silently flipping the meaning.
+                Ok(std::env::var("STAGE_SOURCES").unwrap_or_else(|_| "True".to_string()))
+            }
+            ConfName::StageChunkSizeBytes => {
+                // Size of one ranged GET of a Source Stage. The measured
+                // fast ceiling (issue #166): bounded requests up to ~8 MiB
+                // serve at full speed, anything bigger gets throttled.
+                Ok(std::env::var("STAGE_CHUNK_SIZE_BYTES")
+                    .unwrap_or_else(|_| DEFAULT_STAGE_CHUNK_SIZE_BYTES.to_string()))
+            }
+            ConfName::StageChunkConcurrency => {
+                // How many ranged GETs one Source Stage runs in parallel —
+                // the chunk window over the plan (issue #166). The measured
+                // full-aggregate speed is 4; a configured zero must never
+                // stall the plan window, so the consumer floors it at one.
+                Ok(std::env::var("STAGE_CHUNK_CONCURRENCY")
+                    .unwrap_or_else(|_| DEFAULT_STAGE_CHUNK_CONCURRENCY.to_string()))
+            }
+            ConfName::StageConcurrency => {
+                // How many source stages run at the same time (issue #172).
+                // Excess transcodes queue for a staging slot instead of
+                // staging in parallel, so many simultaneous subscribers
+                // can neither exhaust egress nor fill ephemeral storage
+                // with staged sources.
+                Ok(std::env::var("STAGE_CONCURRENCY")
+                    .unwrap_or_else(|_| DEFAULT_STAGE_CONCURRENCY.to_string()))
+            }
+            ConfName::StageTotalTimeoutSeconds => {
+                // Deadline for one whole Source Stage, resolution included
+                // upstream of it. Bounds the largest source a stage may
+                // fetch before the request fails fast.
+                Ok(std::env::var("STAGE_TOTAL_TIMEOUT_SECONDS")
+                    .unwrap_or_else(|_| DEFAULT_STAGE_TOTAL_TIMEOUT_SECS.to_string()))
+            }
+            ConfName::StageRequestTimeoutSeconds => {
+                // Deadline for one chunk attempt — connect, response
+                // headers and body streaming combined. A chunk read that
+                // cannot finish in time is retried on a fresh connection.
+                Ok(std::env::var("STAGE_REQUEST_TIMEOUT_SECONDS")
+                    .unwrap_or_else(|_| DEFAULT_STAGE_REQUEST_TIMEOUT_SECS.to_string()))
             }
             ConfName::Host => {
                 Ok(std::env::var("VOD2POD_RSS_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()))

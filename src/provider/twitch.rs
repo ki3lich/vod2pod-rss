@@ -116,6 +116,11 @@ impl MediaProvider for TwitchProvider {
         })
     }
 
+    fn streams_direct_media(&self) -> bool {
+        // yt-dlp resolves Twitch VODs to an HLS playlist, not media bytes.
+        false
+    }
+
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {
         yt_dlp::stream_url(media_url, &[]).await
     }

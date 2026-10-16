@@ -28,6 +28,12 @@ async fn async_main() -> std::io::Result<()> {
         .init()
         .unwrap();
 
+    // Sweep away the staged temp files a crashed predecessor left before the
+    // server accepts its first request: at this point this process has no
+    // staged sources, so nothing in flight can be caught by the sweep
+    // (issue #172). Best-effort — a failure must not block startup.
+    vod2pod_rss::transcoder::sweep_stale_staged_sources();
+
     // Apple Podcasts (and most podcatchers) play MP3/M4A only: OGG/Opus
     // enclosures fail silently there. Keep the trade-off visible at startup.
     let codec: AudioCodec = conf().get(ConfName::AudioCodec).unwrap().into();

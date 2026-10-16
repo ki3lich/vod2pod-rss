@@ -40,6 +40,12 @@ impl MediaProvider for PeerTubeProvider {
         Ok(video.streamingPlaylists[0].playlistUrl.clone())
     }
 
+    fn streams_direct_media(&self) -> bool {
+        // the resolved URL is an HLS playlist (streamingPlaylists[0]
+        // .playlistUrl) — not media bytes.
+        false
+    }
+
     fn domain_whitelist_regexes(&self) -> Vec<Regex> {
         let hosts = get_peertube_hosts();
         let mut regexes: Vec<Regex> = Vec::with_capacity(hosts.len());

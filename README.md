@@ -115,6 +115,32 @@ Note: These can also be set using Docker [.env files](https://docs.docker.com/co
 - `MAX_FRESH_PERIOD`: (optional) Upper bound on how long freshness probes may keep a cached feed "fresh" without a full regeneration, in seconds. Default is 86400 (24 hours)
 - `YOUTUBE_YT_DLP_GET_URL_EXTRA_ARGS`
 
+### Source staging
+
+For direct-media sources (YouTube), the episode's source media is staged to a
+local temp file with parallel bounded ranged GETs before ffmpeg transcodes it.
+Bounded ranges are what CDN edges serve at full speed, while open-ended reads
+can throttle to ~27 KB/s — staging turns a ~20-minute download into a
+seconds-long fetch plus the transcode itself. The staged file is verified
+byte-complete against the origin before ffmpeg starts, and deleted when the
+transcode ends; a failed stage evicts the cached resolution and fails the
+request fast, so the next try re-resolves.
+
+- `STAGE_SOURCES`: (optional) Set to "false" (or "0", "off", "no" — exact spellings only, case-insensitive) to roll back to the legacy path — the resolved URL goes straight to ffmpeg over the network with a TCP preflight. Anything else, including a typo of one of those, keeps staged fetching on (the default)
+- `STAGE_CHUNK_SIZE_BYTES`: (optional) Size of one ranged GET of the source stage, in bytes. Default is 8388608 (8 MiB — the size CDN edges serve at full speed; larger single requests get throttled)
+- `STAGE_CHUNK_CONCURRENCY`: (optional) How many ranged GETs one source stage runs in parallel. Default is 4 (the measured full-aggregate speed of the CDN edge)
+- `STAGE_CONCURRENCY`: (optional) How many episode sources may stage at the same time. Transcodes beyond this queue until a slot frees up instead of staging in parallel. Default is 4
+- `STAGE_TOTAL_TIMEOUT_SECONDS`: (optional) Deadline for one whole source stage, in seconds. Default is 240
+- `STAGE_REQUEST_TIMEOUT_SECONDS`: (optional) Deadline for one ranged request (connect, response headers and body combined), in seconds; a read that cannot finish in time is retried on a fresh connection. Default is 60
+
+Note: staging holds a temp copy of the episode source on disk while it
+transcodes (logs report each stage's size and rate) — at most
+`STAGE_CONCURRENCY` copies at once, so give the container's ephemeral
+storage headroom of roughly the largest episode source ×
+`STAGE_CONCURRENCY`. Requests beyond that concurrency wait for a slot
+(bounded by the transcode construction timeout, `FFMPEG_TIMEOUT_SECONDS`).
+Staged files a crashed process left behind are removed at startup.
+
 ### Quota behavior
 
 YouTube's Data API has a daily quota (10,000 units on the free tier, resetting
