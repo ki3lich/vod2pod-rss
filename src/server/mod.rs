@@ -3,8 +3,6 @@ use std::{collections::HashMap, net::TcpListener, sync::Arc, time::Duration};
 use actix_web::{
     dev::Server, guard, http, middleware, web, App, HttpRequest, HttpResponse, HttpServer,
 };
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
 use regex::Regex;
 use serde::Deserialize;
@@ -13,7 +11,7 @@ use url::Url;
 use crate::{
     configs::{conf, conf_u64, Conf, ConfName},
     feed_cache,
-    feed_serving::{self, DownstreamRungs, FeedServing, ServedFeed, ServingPolicy},
+    feed_serving::{self, FeedServing, ServedFeed, ServingPolicy},
     provider::{self, MediaProvider},
     rss_transcodizer,
     transcoder::{FfmpegParameters, Transcoder},
@@ -130,7 +128,6 @@ async fn transcodize_rss(
         serving_policy(),
         Arc::new(feed_serving::WallClock),
         Arc::new(feed_serving::ActixSpawner),
-        Arc::new(QuotaFreeDegrade::new(redis)),
     );
 
     match serving.serve(cache, &parsed_url, provider).await {
@@ -187,6 +184,7 @@ fn serving_policy() -> ServingPolicy {
         stale_window_secs: stale_max_age_secs(),
         max_fresh_period_secs: max_fresh_period_secs(),
         stale_serve_max_age_secs: STALE_SERVE_MAX_AGE_SECS,
+        degraded_fresh_ttl_secs: feed_serving::DEGRADED_FRESH_TTL_SECS,
         fresh_ttl_jitter_secs: feed_serving::FRESH_TTL_JITTER_SECS,
     }
 }
@@ -260,185 +258,6 @@ fn conditional_response(
             feed_cache::http_date(generated_at),
         ))
         .body(body)
-}
-
-/// Fresh TTL given to a Degraded Feed: short on purpose, so the next
-/// revalidation replaces it with a full feed as soon as possible (e.g. right
-/// after the quota reset) instead of serving the limited feed for a full hour.
-const DEGRADED_FRESH_TTL_SECS: u64 = 300;
-
-/// The tail of the Degradation Ladder not yet carved into the Feed Serving
-/// module: Quota Breaker preemption and the quota-free Degraded Feed rung.
-/// The module calls it at exactly the two ladder points where these rungs
-/// apply, so the rung order of docs/adr/0001 is unchanged.
-/// ceiling: adapter-owned tail — carve into the module per issue #157,
-/// which also deletes this adapter.
-struct QuotaFreeDegrade {
-    /// Handle on the request's multiplexed Redis connection, so the breaker
-    /// check and the degraded store cost no extra connection.
-    redis: redis::aio::MultiplexedConnection,
-}
-
-impl QuotaFreeDegrade {
-    fn new(redis: redis::aio::MultiplexedConnection) -> Self {
-        Self { redis }
-    }
-
-    /// The provider's Quota Breaker state: `Some(reset-at, unix seconds)`
-    /// while metered calls to this provider must not be made.
-    async fn breaker_open(&self, provider: &dyn MediaProvider) -> Option<i64> {
-        let mut con = self.redis.clone();
-        match provider.quota_breaker_key().as_deref() {
-            Some(key) => feed_cache::quota_breaker_open(&mut con, key).await,
-            None => None,
-        }
-    }
-
-    /// Open the provider's Quota Breaker (until its next reset) when the
-    /// error means the quota is exhausted.
-    async fn open_breaker_if_quota_exhausted(
-        &self,
-        provider: &dyn MediaProvider,
-        err: &eyre::Error,
-    ) {
-        if !feed_cache::is_quota_exceeded(err) {
-            return;
-        }
-        if let Some(key) = provider.quota_breaker_key() {
-            let mut con = self.redis.clone();
-            open_quota_breaker(&mut con, &key).await;
-        }
-    }
-
-    /// Degradation Ladder rung: produce a feed without metered API usage (the
-    /// youtube public atom feed) and cache it as a Degraded Feed. Used when
-    /// the Feed Conversion failed (quota exhaustion included) and no cached
-    /// copy can serve the client.
-    async fn degrade(
-        &self,
-        provider: &dyn MediaProvider,
-        source_url: &Url,
-        canonical_key: &str,
-        con: &mut redis::aio::MultiplexedConnection,
-    ) -> Option<ServedFeed> {
-        warn!("degrading to quota-free feed generation for {source_url}");
-        match provider
-            .generate_rss_feed_quota_free(source_url.clone())
-            .await
-        {
-            Ok(body) => {
-                let entry = feed_cache::CachedFeed {
-                    body,
-                    generated_at: feed_cache::unix_now(),
-                    probe_state: None,
-                    degraded: true,
-                };
-                if let Err(e) = feed_cache::store(
-                    con,
-                    canonical_key,
-                    &entry,
-                    DEGRADED_FRESH_TTL_SECS,
-                    stale_max_age_secs(),
-                )
-                .await
-                {
-                    warn!("could not store degraded feed {canonical_key} in cache: {e}");
-                }
-                Some(ServedFeed {
-                    body: entry.body,
-                    generated_at: entry.generated_at,
-                    degraded: true,
-                    freshness: feed_serving::Freshness::FreshlyGenerated,
-                    max_age_secs: DEGRADED_FRESH_TTL_SECS as i64,
-                    canonical_key: canonical_key.to_string(),
-                })
-            }
-            Err(fallback_err) => {
-                error!("quota-free fallback failed for {source_url}:\n{fallback_err}");
-                None
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl DownstreamRungs for QuotaFreeDegrade {
-    async fn before_conversion(
-        &self,
-        source_url: &Url,
-        provider: &dyn MediaProvider,
-        canonical_key: &str,
-    ) -> Option<ServedFeed> {
-        // Quota Breaker: when THIS provider's quota is known to be exhausted,
-        // metered calls are skipped entirely and the ladder degrades right away
-        if let Some(reset) = self.breaker_open(provider).await {
-            info!(
-                "quota breaker open until {}, degrading to quota-free generation for {source_url}",
-                DateTime::<Utc>::from_timestamp(reset, 0)
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_default()
-            );
-            let mut con = self.redis.clone();
-            return self
-                .degrade(provider, source_url, canonical_key, &mut con)
-                .await;
-        }
-        None
-    }
-
-    async fn on_conversion_failed(
-        &self,
-        source_url: &Url,
-        provider: &dyn MediaProvider,
-        canonical_key: &str,
-        err: eyre::Error,
-    ) -> Option<ServedFeed> {
-        if feed_cache::is_quota_exceeded(&err) {
-            error!("provider quota exhausted for {source_url}:\n{err}");
-        } else {
-            error!("could not generate rss feed for {source_url}:\n{err}");
-        }
-        self.open_breaker_if_quota_exhausted(provider, &err).await;
-        let mut con = self.redis.clone();
-        // Degradation Ladder rung 2: quota-free generation, on any conversion
-        // failure (quota exhaustion included); the fallback itself failing
-        // surfaces the error to the client
-        self.degrade(provider, source_url, canonical_key, &mut con)
-            .await
-    }
-
-    async fn blocks_metered_revalidation(&self, provider: &dyn MediaProvider) -> bool {
-        self.breaker_open(provider).await.is_some()
-    }
-
-    async fn on_revalidation_failed(
-        &self,
-        _source_url: &Url,
-        provider: &dyn MediaProvider,
-        canonical_key: &str,
-        err: &eyre::Error,
-    ) {
-        if feed_cache::is_quota_exceeded(err) {
-            warn!("provider quota exhausted during background revalidation of {canonical_key}");
-            self.open_breaker_if_quota_exhausted(provider, err).await;
-        } else {
-            error!("background revalidation of {canonical_key} failed:\n{err}");
-        }
-        // the stale body is kept on purpose, it keeps serving clients
-    }
-}
-
-/// Record that a provider's quota is exhausted until its next reset (midnight
-/// pacific for youtube), so no request pays the failing-call cost until then.
-async fn open_quota_breaker(con: &mut redis::aio::MultiplexedConnection, breaker_key: &str) {
-    let reset = feed_cache::next_quota_reset(Utc::now());
-    match feed_cache::open_quota_breaker(con, breaker_key, reset.timestamp()).await {
-        Ok(()) => warn!(
-            "quota breaker {breaker_key} open until {}",
-            reset.to_rfc3339()
-        ),
-        Err(e) => warn!("could not persist quota breaker: {e}"),
-    }
 }
 
 #[derive(Deserialize)]

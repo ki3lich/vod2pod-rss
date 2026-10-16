@@ -1,20 +1,18 @@
 //! The Feed Serving module: the single seam for serving a Feed. It owns the
-//! served rungs of the Degradation Ladder (docs/adr/0001) — Fresh hit, Stale
-//! hit (+ background revalidation), Feed Conversion — plus the serving policy
-//! numbers, Canonical Feed Key derivation and stale-while-revalidate
-//! coalescing. Storage sits behind the [`FeedCacheStore`] adapter (Redis in
-//! production, in-memory in tests), time behind the [`Clock`] adapter (wall
-//! clock in production, fixed clock in tests) and background scheduling
-//! behind the [`RevalidationSpawner`] adapter (actix runtime in production,
-//! recording spawner in tests), so every served rung is exercised hermetically
-//! at this interface (the adapter-owned tail is driven through fakes until it
-//! moves in).
+//! whole Degradation Ladder (docs/adr/0001) — Fresh hit, Stale hit
+//! (+ background revalidation), Feed Conversion, Quota Breaker preemption,
+//! Degraded Feed, error — plus the serving policy numbers, Canonical Feed Key
+//! derivation and stale-while-revalidate coalescing. Storage sits behind the
+//! [`FeedCacheStore`] adapter (Redis in production, in-memory in tests), time
+//! behind the [`Clock`] adapter (wall clock in production, fixed clock in
+//! tests) and background scheduling behind the [`RevalidationSpawner`]
+//! adapter (actix runtime in production, recording spawner in tests), so
+//! every rung is exercised hermetically at this interface.
 //!
 //! The module reads no environment configuration: the HTTP adapter reads the
-//! config and injects a [`ServingPolicy`]. The ladder tail (Quota Breaker
-//! preemption and the Degraded Feed rung) still lives in the HTTP adapter and
-//! is injected as [`DownstreamRungs`] — ceiling: tail outside the module,
-//! carve it in per issue #157.
+//! config and injects a [`ServingPolicy`]. Quota exhaustion is still detected
+//! by the inherited string match (the reset rule alongside it) — both are
+//! retyped across the provider seam by the next ticket.
 
 use std::{
     collections::HashMap,
@@ -25,19 +23,30 @@ use std::{
 };
 
 use async_trait::async_trait;
-use log::{debug, info, warn};
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use url::Url;
 
-use crate::{feed_cache::CachedFeed, provider::MediaProvider};
+use crate::{
+    feed_cache::{is_quota_exceeded, next_quota_reset, CachedFeed},
+    provider::MediaProvider,
+};
 
 /// Seconds of jitter added on top of the Fresh TTL so that many feeds polled
 /// by the same podcatcher do not all expire (and regenerate) at the same
 /// time. The HTTP adapter injects it into the policy.
 pub const FRESH_TTL_JITTER_SECS: u64 = 300;
 
+/// Fresh TTL given to a Degraded Feed: short on purpose, so the next
+/// revalidation replaces it with a full feed as soon as possible (e.g. right
+/// after the quota reset) instead of serving the limited feed for a full
+/// hour. The HTTP adapter injects it into the policy.
+pub const DEGRADED_FRESH_TTL_SECS: u64 = 300;
+
 /// Serving policy numbers, injected at construction. Defaults live in
-/// docs/adr/0001; the values come from the environment read by the HTTP
+/// docs/adr/0001; the values come from the environment (or from this
+/// module's fixed constants, e.g. the degraded Fresh TTL) read by the HTTP
 /// adapter, never by this module.
 #[derive(Clone, Copy, Debug)]
 pub struct ServingPolicy {
@@ -54,6 +63,9 @@ pub struct ServingPolicy {
     /// Max-Age sent when serving a Stale copy: tell the client to come back
     /// soon, the background revalidation is likely done by then.
     pub stale_serve_max_age_secs: u64,
+    /// Fresh TTL given to a Degraded Feed: short on purpose (see
+    /// [`DEGRADED_FRESH_TTL_SECS`] for why).
+    pub degraded_fresh_ttl_secs: u64,
     /// Jitter added on top of the Fresh TTL (see [`FRESH_TTL_JITTER_SECS`]).
     pub fresh_ttl_jitter_secs: u64,
 }
@@ -110,10 +122,10 @@ impl RevalidationSpawner for ActixSpawner {
     }
 }
 
-/// Storage of cached Feeds, behind which the byte layout hides: the module
-/// owns freshness policy, the adapter owns storage mechanics. The Redis
-/// adapter runs in production (current data layout), the in-memory adapter
-/// in tests.
+/// Storage behind the serving ladder: cached Feeds and the shared Quota
+/// Breaker flag. The module owns freshness and quota policy, the adapter owns
+/// storage mechanics. The Redis adapter runs in production (current data
+/// layout), the in-memory adapter in tests.
 #[async_trait]
 pub trait FeedCacheStore: Send + Sync {
     /// The cached Feed for a Canonical Feed Key, when one is stored and still
@@ -151,57 +163,22 @@ pub trait FeedCacheStore: Send + Sync {
         fresh_ttl_secs: u64,
         stale_window_secs: u64,
     ) -> eyre::Result<()>;
-}
 
-/// The tail of the Degradation Ladder not yet owned by this module: Quota
-/// Breaker preemption and the Degraded Feed rung. Injected at construction;
-/// the module calls it at exactly the ladder points where the tail applies —
-/// the two serving points of the request path, and the two points where
-/// background revalidation meets metered work — so the rung order of
-/// docs/adr/0001 is unchanged.
-/// ceiling: adapter-owned tail — carve into this module per issue #157,
-/// which also deletes this trait.
-#[async_trait]
-pub trait DownstreamRungs: Send + Sync {
-    /// Called on a miss, after the coalescing re-read, before any metered
-    /// conversion. `Some(feed)`: a downstream rung produced it (e.g. the
-    /// breaker is open and a Degraded Feed applies) — serve it. `None`: no
-    /// downstream rung applies, proceed with the Feed Conversion.
-    async fn before_conversion(
+    /// The Quota Breaker identified by `breaker_key` while it is open —
+    /// metered calls to the provider owning the key must not be made —
+    /// carrying the unix time it holds until. `None` when it is closed (or
+    /// its state could not be read: a closed breaker only ever costs quota).
+    async fn quota_breaker_open(&self, breaker_key: &str) -> Option<i64>;
+
+    /// Open the Quota Breaker identified by `breaker_key` until
+    /// `reset_epoch_secs`, so no request pays the failing-call cost until
+    /// then. Persistence is best-effort: a failure only delays the
+    /// preemption, the ladder keeps serving clients either way.
+    async fn open_quota_breaker(
         &self,
-        source_url: &Url,
-        provider: &dyn MediaProvider,
-        canonical_key: &str,
-    ) -> Option<ServedFeed>;
-
-    /// Called when the Feed Conversion failed. `Some(feed)`: the degrade rung
-    /// produced it — serve it. `None`: the ladder is exhausted, the request
-    /// errors.
-    async fn on_conversion_failed(
-        &self,
-        source_url: &Url,
-        provider: &dyn MediaProvider,
-        canonical_key: &str,
-        err: eyre::Error,
-    ) -> Option<ServedFeed>;
-
-    /// Background revalidation asks the tail before doing metered work (the
-    /// Freshness Probe and the Feed Conversion both are): `true` when a
-    /// downstream rung preempts it — the Quota Breaker is open for the
-    /// provider — and the stale body must keep serving untouched.
-    async fn blocks_metered_revalidation(&self, provider: &dyn MediaProvider) -> bool;
-
-    /// Background revalidation's Feed Conversion failed. The tail records the
-    /// failure's ladder consequences (opening the Quota Breaker on quota
-    /// exhaustion); the stale body stays cached either way and nothing is
-    /// served from here.
-    async fn on_revalidation_failed(
-        &self,
-        source_url: &Url,
-        provider: &dyn MediaProvider,
-        canonical_key: &str,
-        err: &eyre::Error,
-    );
+        breaker_key: &str,
+        reset_epoch_secs: i64,
+    ) -> eyre::Result<()>;
 }
 
 /// Which ladder rung produced the served Feed: the metadata the HTTP side
@@ -351,11 +328,11 @@ async fn try_begin_regeneration(canonical_key: &str) -> Option<OwnedMutexGuard<(
     regeneration_lock(canonical_key).await.try_lock_owned().ok()
 }
 
-/// The Feed Serving module. Constructed with an injected policy, clock,
-/// spawner and downstream rungs; the cache adapter is supplied per serve
-/// call, so the HTTP adapter keeps its connection handling. Cloning is cheap:
-/// the adapters are shared through `Arc`s, which is how the background
-/// revalidation future owns the module logic it runs.
+/// The Feed Serving module. Constructed with an injected policy, clock and
+/// spawner; the cache adapter is supplied per serve call, so the HTTP adapter
+/// keeps its connection handling. Cloning is cheap: the adapters are shared
+/// through `Arc`s, which is how the background revalidation future owns the
+/// module logic it runs.
 #[derive(Clone)]
 pub struct FeedServing {
     policy: ServingPolicy,
@@ -364,7 +341,6 @@ pub struct FeedServing {
     /// request: the actix runtime in production, a recording spawner in
     /// tests.
     spawner: Arc<dyn RevalidationSpawner>,
-    downstream: Arc<dyn DownstreamRungs>,
 }
 
 impl FeedServing {
@@ -372,13 +348,11 @@ impl FeedServing {
         policy: ServingPolicy,
         clock: Arc<dyn Clock>,
         spawner: Arc<dyn RevalidationSpawner>,
-        downstream: Arc<dyn DownstreamRungs>,
     ) -> Self {
         Self {
             policy,
             clock,
             spawner,
-            downstream,
         }
     }
 
@@ -386,11 +360,12 @@ impl FeedServing {
     /// serve (docs/adr/0001): a Fresh copy is served as-is; a Stale copy is
     /// served within the Stale Window while its background revalidation is
     /// scheduled through the spawner adapter (stale-while-revalidate); a miss
-    /// performs a coalesced Feed Conversion, stores the result and serves it.
-    /// The remaining rungs (Quota Breaker preemption, Degraded Feed) come from
-    /// the injected downstream rungs until they are carved into this module.
-    /// An error means the ladder is exhausted: the adapter answers the client
-    /// with an error.
+    /// first consults the Quota Breaker — while it is open no metered call is
+    /// attempted at all and the Degraded Feed rung applies right away — then
+    /// performs a coalesced Feed Conversion, stores the result and serves it;
+    /// a failed conversion opens the breaker on quota exhaustion and falls
+    /// through to the Degraded Feed rung. An error means the ladder is
+    /// exhausted: the adapter answers the client with an error.
     ///
     /// The cache and provider are `Arc`s because the scheduled revalidation
     /// keeps working with them after this request returns.
@@ -436,14 +411,19 @@ impl FeedServing {
             return Ok(served);
         }
 
-        // the ladder tail (Quota Breaker preemption) gets the first shot at a
-        // miss, before any metered call
-        if let Some(served) = self
-            .downstream
-            .before_conversion(source_url, provider.as_ref(), &canonical_key)
-            .await
-        {
-            return Ok(served);
+        // the Quota Breaker preempts when THIS provider's quota is known to
+        // be exhausted: metered calls are skipped entirely and the ladder
+        // degrades right away
+        if let Some(reset) = self.breaker_open(&*cache, provider.as_ref()).await {
+            info!(
+                "quota breaker open until {}, degrading to quota-free generation for {source_url}",
+                DateTime::<Utc>::from_timestamp(reset, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default()
+            );
+            return self
+                .degrade(&*cache, provider.as_ref(), source_url, &canonical_key)
+                .await;
         }
 
         // rung 2: Feed Conversion
@@ -453,13 +433,21 @@ impl FeedServing {
         {
             Ok(served) => Ok(served),
             Err(e) => {
-                // the remaining rungs apply on any conversion failure (quota
-                // exhaustion included); the fallback itself failing surfaces
-                // the error to the client
-                self.downstream
-                    .on_conversion_failed(source_url, provider.as_ref(), &canonical_key, e)
+                // the Degraded Feed rung applies on any conversion failure —
+                // quota exhaustion included, opening the breaker so no further
+                // request pays the failing-call cost; the fallback itself
+                // failing is the ladder's end: the request errors rather than
+                // serving a silent empty feed
+                if self
+                    .open_breaker_if_quota_exhausted(&*cache, provider.as_ref(), &e)
                     .await
-                    .ok_or_else(|| eyre::eyre!("degradation ladder exhausted for {source_url}"))
+                {
+                    error!("provider quota exhausted for {source_url}:\n{e}");
+                } else {
+                    error!("could not generate rss feed for {source_url}:\n{e}");
+                }
+                self.degrade(&*cache, provider.as_ref(), source_url, &canonical_key)
+                    .await
             }
         }
     }
@@ -516,9 +504,9 @@ impl FeedServing {
         // metered work (probe and conversion alike) is preempted while the
         // Quota Breaker is open: the stale body keeps serving untouched
         if self
-            .downstream
-            .blocks_metered_revalidation(provider.as_ref())
+            .breaker_open(&*cache, provider.as_ref())
             .await
+            .is_some()
         {
             info!("quota breaker open, skipping background revalidation of {canonical_key}");
             return;
@@ -574,11 +562,17 @@ impl FeedServing {
             .await
         {
             // the stale body is kept on purpose, it keeps serving clients;
-            // the ladder tail records the failure's consequences (opening the
-            // Quota Breaker on quota exhaustion)
-            self.downstream
-                .on_revalidation_failed(&source_url, provider.as_ref(), &canonical_key, &e)
-                .await;
+            // a quota exhaustion additionally opens the breaker, so the
+            // instance stops attempting metered calls until the provider's
+            // reset
+            if self
+                .open_breaker_if_quota_exhausted(&*cache, provider.as_ref(), &e)
+                .await
+            {
+                warn!("provider quota exhausted during background revalidation of {canonical_key}");
+            } else {
+                error!("background revalidation of {canonical_key} failed:\n{e}");
+            }
         }
     }
 
@@ -683,6 +677,97 @@ impl FeedServing {
             degraded: false,
             freshness: Freshness::FreshlyGenerated,
             max_age_secs: fresh_marker_ttl.unwrap_or(self.policy.fresh_ttl_secs as i64),
+            canonical_key: canonical_key.to_string(),
+        })
+    }
+
+    /// The provider's Quota Breaker state, read through the cache adapter:
+    /// `Some(reset-at)` while metered calls to this provider must not be
+    /// made. Providers without a breaker key have no metered quota; their
+    /// conversions are never preempted.
+    async fn breaker_open(
+        &self,
+        cache: &dyn FeedCacheStore,
+        provider: &dyn MediaProvider,
+    ) -> Option<i64> {
+        match provider.quota_breaker_key().as_deref() {
+            Some(key) => cache.quota_breaker_open(key).await,
+            None => None,
+        }
+    }
+
+    /// Open the provider's Quota Breaker (until its next reset — midnight
+    /// pacific for YouTube) when the error means the quota is exhausted, so
+    /// no request pays the failing-call cost until then. Returns whether the
+    /// error was classified as quota exhaustion (the inherited upstream
+    /// string match, retyped by the next ticket).
+    async fn open_breaker_if_quota_exhausted(
+        &self,
+        cache: &dyn FeedCacheStore,
+        provider: &dyn MediaProvider,
+        err: &eyre::Error,
+    ) -> bool {
+        if !is_quota_exceeded(err) {
+            return false;
+        }
+        if let Some(key) = provider.quota_breaker_key() {
+            let reset =
+                DateTime::<Utc>::from_timestamp(self.clock.unix_now(), 0).map(next_quota_reset);
+            match reset {
+                Some(reset) => match cache.open_quota_breaker(&key, reset.timestamp()).await {
+                    Ok(()) => warn!("quota breaker {key} open until {}", reset.to_rfc3339()),
+                    Err(e) => warn!("could not persist quota breaker: {e}"),
+                },
+                None => {
+                    warn!("could not determine the next quota reset for {key}, breaker not opened")
+                }
+            }
+        }
+        true
+    }
+
+    /// The Degraded Feed rung: produce a feed without consuming metered
+    /// provider quota (for YouTube: the provider's public atom feed) and
+    /// store it with its own short Fresh TTL, so the next revalidation
+    /// replaces it with a full feed as soon as possible (e.g. right after the
+    /// quota reset). An error here is the ladder's end: the request errors
+    /// rather than serving a silent empty feed.
+    async fn degrade(
+        &self,
+        cache: &dyn FeedCacheStore,
+        provider: &dyn MediaProvider,
+        source_url: &Url,
+        canonical_key: &str,
+    ) -> eyre::Result<ServedFeed> {
+        warn!("degrading to quota-free feed generation for {source_url}");
+        let body = provider
+            .generate_rss_feed_quota_free(source_url.clone())
+            .await?;
+        let entry = CachedFeed {
+            body,
+            generated_at: self.clock.unix_now(),
+            // the Degraded Feed is never probed; it is replaced by a full
+            // conversion as soon as possible
+            probe_state: None,
+            degraded: true,
+        };
+        if let Err(e) = cache
+            .store(
+                canonical_key,
+                &entry,
+                self.policy.degraded_fresh_ttl_secs,
+                self.policy.stale_window_secs,
+            )
+            .await
+        {
+            warn!("could not store degraded feed {canonical_key} in cache: {e}");
+        }
+        Ok(ServedFeed {
+            body: entry.body,
+            generated_at: entry.generated_at,
+            degraded: true,
+            freshness: Freshness::FreshlyGenerated,
+            max_age_secs: self.policy.degraded_fresh_ttl_secs as i64,
             canonical_key: canonical_key.to_string(),
         })
     }

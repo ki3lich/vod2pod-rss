@@ -10,12 +10,13 @@ use std::sync::{
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{
     FeedCacheStore, FeedServing, Freshness, RevalidationSpawner, RevalidationTask, ServingPolicy,
 };
-use crate::feed_cache::CachedFeed;
+use crate::feed_cache::{next_quota_reset, CachedFeed};
 use crate::provider::{FeedProbeState, GeneratedFeed, MediaProvider};
 
 use super::memory::InMemoryCache;
@@ -58,25 +59,47 @@ impl Clock for FixedClock {
     }
 }
 
-/// Conversion and probe counters shared between the test and its provider
-/// fake.
+/// Conversion, probe and quota-free-generation counters shared between the
+/// test and its provider fake.
 #[derive(Default)]
 struct Counters {
     conversions: AtomicUsize,
     probes: AtomicUsize,
+    quota_free_generations: AtomicUsize,
 }
 
-/// Provider fake whose conversions and probes are counted; conversions can
-/// be slowed down (to make coalescing observable) or failed (to reach the
-/// ladder tail), and the probe outcome is scripted.
+/// How the fake's quota-free (Degraded Feed) generation answers.
+enum QuotaFreeOutcome {
+    /// The provider supports no quota-free generation (the trait default):
+    /// the degrade rung errors.
+    Unsupported,
+    /// The degrade rung produces this body.
+    Body(String),
+    /// The degrade rung fails with this error.
+    Fail(String),
+}
+
+/// Provider fake whose conversions, probes and quota-free generations are
+/// counted; conversions can be slowed down (to make coalescing observable) or
+/// failed — plain or quota-exhausted — to reach the Degraded Feed rung, the
+/// probe outcome is scripted, and the Quota Breaker preemption and degrade
+/// rung behavior are reachable without any provider facts hardcoded here.
 struct FakeProvider {
     canonical_id: Option<String>,
     counters: Arc<Counters>,
     conversion_delay: Duration,
     fail_conversions: bool,
+    /// Conversion failures carrying YouTube's quotaExceeded marker, so the
+    /// module's inherited string match classifies them as quota exhaustion.
+    quota_exhausted_conversions: bool,
     /// Scripted probe answer: `Some(unchanged)` answers the probe, `None`
     /// reports the probe unsupported (revalidation then converts).
     probe_unchanged: Option<bool>,
+    /// Redis key of the fake's Quota Breaker; `None` for a provider without
+    /// metered quota.
+    quota_breaker_key: Option<String>,
+    /// Scripted answer of the quota-free (Degraded Feed) generation.
+    quota_free_outcome: QuotaFreeOutcome,
 }
 
 impl FakeProvider {
@@ -90,7 +113,10 @@ impl FakeProvider {
                 counters: counters.clone(),
                 conversion_delay: Duration::ZERO,
                 fail_conversions: false,
+                quota_exhausted_conversions: false,
                 probe_unchanged: None,
+                quota_breaker_key: None,
+                quota_free_outcome: QuotaFreeOutcome::Unsupported,
             },
             counters,
         )
@@ -102,6 +128,11 @@ impl MediaProvider for FakeProvider {
     async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<GeneratedFeed> {
         self.counters.conversions.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.conversion_delay).await;
+        if self.quota_exhausted_conversions {
+            return Err(eyre::eyre!(
+                "Bad Request: {{\"error\":{{\"code\":403,\"errors\":[{{\"domain\":\"youtube.quota\",\"reason\":\"quotaExceeded\"}}]}}}}"
+            ));
+        }
         if self.fail_conversions {
             return Err(eyre::eyre!("conversion failed"));
         }
@@ -122,6 +153,23 @@ impl MediaProvider for FakeProvider {
             Some(unchanged) => Ok(unchanged),
             None => Err(eyre::eyre!("probe not supported by the fake provider")),
         }
+    }
+
+    async fn generate_rss_feed_quota_free(&self, _channel_url: Url) -> eyre::Result<String> {
+        self.counters
+            .quota_free_generations
+            .fetch_add(1, Ordering::SeqCst);
+        match &self.quota_free_outcome {
+            QuotaFreeOutcome::Body(body) => Ok(body.clone()),
+            QuotaFreeOutcome::Fail(message) => Err(eyre::eyre!("{message}")),
+            QuotaFreeOutcome::Unsupported => Err(eyre::eyre!(
+                "quota-free feed generation not supported by this provider"
+            )),
+        }
+    }
+
+    fn quota_breaker_key(&self) -> Option<String> {
+        self.quota_breaker_key.clone()
     }
 
     async fn canonical_feed_id(&self, _channel_url: &Url) -> Option<String> {
@@ -183,53 +231,10 @@ impl RevalidationSpawner for RecordingSpawner {
     }
 }
 
-/// Downstream rungs that never apply: the module converts on every miss.
-/// Counts how often the module consulted the ladder tail, can be scripted to
-/// preempt metered revalidation work, and records revalidation failures.
-#[derive(Default)]
-struct FakeDownstream {
-    consulted: AtomicUsize,
-    preempts: bool,
-    failed_revalidations: AtomicUsize,
-}
-
-#[async_trait]
-impl super::DownstreamRungs for FakeDownstream {
-    async fn before_conversion(
-        &self,
-        _source_url: &Url,
-        _provider: &dyn MediaProvider,
-        _canonical_key: &str,
-    ) -> Option<super::ServedFeed> {
-        self.consulted.fetch_add(1, Ordering::SeqCst);
-        None
-    }
-
-    async fn on_conversion_failed(
-        &self,
-        _source_url: &Url,
-        _provider: &dyn MediaProvider,
-        _canonical_key: &str,
-        _err: eyre::Error,
-    ) -> Option<super::ServedFeed> {
-        self.consulted.fetch_add(1, Ordering::SeqCst);
-        None
-    }
-
-    async fn blocks_metered_revalidation(&self, _provider: &dyn MediaProvider) -> bool {
-        self.preempts
-    }
-
-    async fn on_revalidation_failed(
-        &self,
-        _source_url: &Url,
-        _provider: &dyn MediaProvider,
-        _canonical_key: &str,
-        _err: &eyre::Error,
-    ) {
-        self.failed_revalidations.fetch_add(1, Ordering::SeqCst);
-    }
-}
+/// Redis key shared by the provider fake and the breaker manipulations in
+/// the tests below: both sides must name the same breaker for the preemption
+/// and opening behavior to engage.
+const FAKE_BREAKER_KEY: &str = "vod2pod:quota_breaker:fake";
 
 fn test_policy() -> ServingPolicy {
     ServingPolicy {
@@ -237,6 +242,7 @@ fn test_policy() -> ServingPolicy {
         stale_window_secs: 7 * 24 * 3600,
         max_fresh_period_secs: 24 * 3600,
         stale_serve_max_age_secs: 60,
+        degraded_fresh_ttl_secs: 300,
         fresh_ttl_jitter_secs: 0,
     }
 }
@@ -296,7 +302,6 @@ async fn fresh_hit_serves_cached_body_with_freshness_metadata() {
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
     );
     seed(&cache, "k", &clock, "<rss>cached</rss>", 3600).await;
     clock.advance_secs(10);
@@ -330,7 +335,6 @@ async fn stale_hit_serves_within_stale_window_honoring_stale_serve_max_age() {
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
     );
     seed(&cache, "k", &clock, "<rss>cached</rss>", 3600).await;
     // the fresh marker (1h) is gone, the copy (7d window) is not
@@ -362,7 +366,6 @@ async fn fresh_period_expiry_serves_stale_even_with_live_marker() {
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
     );
     // marker outlives the fresh period on purpose
     seed(&cache, "k", &clock, "<rss>cached</rss>", 100_000).await;
@@ -391,12 +394,10 @@ async fn miss_converts_stores_and_serves() {
     let cache = Arc::new(InMemoryCache::new(clock.clone()));
     let (provider, counters) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
-    let downstream = FakeDownstream::default();
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(downstream),
     );
 
     let served = serving
@@ -446,14 +447,10 @@ async fn injected_policy_governs_the_windows() {
         stale_window_secs: 100,
         max_fresh_period_secs: 20,
         stale_serve_max_age_secs: 7,
+        degraded_fresh_ttl_secs: 123,
         fresh_ttl_jitter_secs: 0,
     };
-    let serving = FeedServing::new(
-        policy,
-        clock.clone(),
-        Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(policy, clock.clone(), Arc::new(RecordingSpawner::default()));
 
     let generated = serving
         .serve(
@@ -516,14 +513,10 @@ async fn injected_fresh_ttl_jitter_spreads_expiry() {
         stale_window_secs: 100_000,
         max_fresh_period_secs: 100_000,
         stale_serve_max_age_secs: 60,
+        degraded_fresh_ttl_secs: 300,
         fresh_ttl_jitter_secs: 100,
     };
-    let serving = FeedServing::new(
-        policy,
-        clock.clone(),
-        Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(policy, clock.clone(), Arc::new(RecordingSpawner::default()));
 
     serving
         .serve(
@@ -556,7 +549,6 @@ async fn provider_canonical_key_shares_entry_freshness_and_conversion() {
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
     );
 
     let first = serving
@@ -597,7 +589,6 @@ async fn normalized_url_canonical_key_shares_conversion() {
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
     );
 
     let first = serving
@@ -636,7 +627,6 @@ async fn concurrent_misses_coalesce_into_one_conversion() {
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(FakeDownstream::default()),
     ));
 
     // two concurrent polls for the same feed: the second caller waits for
@@ -664,12 +654,7 @@ async fn stale_hit_records_one_revalidation_request_per_hit_and_fresh_none() {
     let (provider, counters) = FakeProvider::new(Some("req-per-hit"));
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     seed(&cache, "req-per-hit", &clock, "<rss>cached</rss>", 3600).await;
 
     // a fresh hit schedules nothing
@@ -723,12 +708,7 @@ async fn revalidation_probes_and_renews_freshness_without_conversion() {
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     // the fresh marker (10s) dies before the body does: the poll serves
     // stale, the copy is still young enough to be probeable
     seed_with(
@@ -783,12 +763,7 @@ async fn probe_changed_falls_through_to_full_conversion() {
     provider.probe_unchanged = Some(false);
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     seed_with(
         &cache,
         "probe-changed",
@@ -837,12 +812,7 @@ async fn probe_failure_falls_through_to_full_conversion() {
     let (provider, counters) = FakeProvider::new(Some("probe-failure"));
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     seed_with(
         &cache,
         "probe-failure",
@@ -891,12 +861,7 @@ async fn feed_past_fresh_period_is_never_probed_and_converts_fully() {
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     // marker outlives the fresh period on purpose; the copy is one second
     // past it
     seed_with(
@@ -936,12 +901,7 @@ async fn degraded_feed_is_never_probed_and_converts_fully() {
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     // degraded copies must be replaced by a real conversion as soon as
     // possible, never renewed by a probe
     seed_with(
@@ -990,12 +950,7 @@ async fn revalidation_coalesces_when_one_is_already_in_flight() {
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        Arc::new(FakeDownstream::default()),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     seed_with(
         &cache,
         "coalesce-reval",
@@ -1030,18 +985,15 @@ async fn revalidation_coalesces_when_one_is_already_in_flight() {
 }
 
 #[tokio::test]
-async fn revalidation_is_skipped_while_the_tail_preempts_metered_work() {
+async fn revalidation_is_skipped_while_the_quota_breaker_is_open() {
     let clock = Arc::new(FixedClock::at(1_000));
     let cache = Arc::new(InMemoryCache::new(clock.clone()));
     let (mut provider, counters) = FakeProvider::new(Some("tail-preempts"));
     provider.probe_unchanged = Some(true);
+    provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let downstream = Arc::new(FakeDownstream {
-        preempts: true,
-        ..Default::default()
-    });
-    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone(), downstream);
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     seed_with(
         &cache,
         "tail-preempts",
@@ -1052,6 +1004,12 @@ async fn revalidation_is_skipped_while_the_tail_preempts_metered_work() {
         false,
     )
     .await;
+    // the provider's quota is known to be exhausted until far past the test's
+    // clock
+    cache
+        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000)
+        .await
+        .unwrap();
     clock.advance_secs(20);
 
     let stale = serving
@@ -1082,20 +1040,15 @@ async fn revalidation_is_skipped_while_the_tail_preempts_metered_work() {
 }
 
 #[tokio::test]
-async fn revalidation_failure_keeps_the_stale_body_and_reaches_the_tail() {
+async fn revalidation_failure_keeps_the_stale_body_and_does_not_degrade() {
     let clock = Arc::new(FixedClock::at(1_000));
     let cache = Arc::new(InMemoryCache::new(clock.clone()));
     let (mut provider, counters) = FakeProvider::new(Some("reval-failure"));
     provider.fail_conversions = true;
+    provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
-    let downstream = Arc::new(FakeDownstream::default());
-    let serving = FeedServing::new(
-        test_policy(),
-        clock.clone(),
-        spawner.clone(),
-        downstream.clone(),
-    );
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
     seed(&cache, "reval-failure", &clock, "<rss>cached</rss>", 3600).await;
     clock.advance_secs(3600 + 1);
 
@@ -1111,10 +1064,58 @@ async fn revalidation_failure_keeps_the_stale_body_and_reaches_the_tail() {
 
     spawner.run_pending().await;
 
-    // the conversion failure reached the ladder tail...
+    // the revalidation converted and failed; the stale body was kept on
+    // purpose, and no Degraded Feed was produced: the background has no
+    // client to serve, the stale body keeps serving clients
     assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
-    assert_eq!(downstream.failed_revalidations.load(Ordering::SeqCst), 1);
-    // ...and the stale body was kept on purpose: clients keep being served
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 0);
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.freshness, Freshness::Stale);
+    assert_eq!(served.body, "<rss>cached</rss>");
+}
+
+#[tokio::test]
+async fn revalidation_quota_exhaustion_opens_the_breaker() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("reval-quota"));
+    provider.quota_exhausted_conversions = true;
+    provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone());
+    seed(&cache, "reval-quota", &clock, "<rss>cached</rss>", 3600).await;
+    clock.advance_secs(3600 + 1);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    // the quota exhaustion opened the breaker, holding until the provider's
+    // next reset after the fixed clock's now
+    let now = DateTime::<Utc>::from_timestamp(clock.unix_now(), 0).unwrap();
+    assert_eq!(
+        cache.breaker_reset(FAKE_BREAKER_KEY).await,
+        Some(next_quota_reset(now).timestamp())
+    );
+    // the background produced no Degraded Feed: there is no client to serve
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 0);
+    // the stale body was kept on purpose: clients keep being served
     let served = serving
         .serve(
             cache.clone(),
@@ -1244,18 +1245,18 @@ fn test_classify_freshness_miss_without_body() {
 }
 
 #[tokio::test]
-async fn exhausted_ladder_errors_when_downstream_cannot_produce() {
+async fn exhausted_ladder_errors_when_degraded_feed_generation_fails() {
     let clock = Arc::new(FixedClock::at(1_000));
     let cache = Arc::new(InMemoryCache::new(clock.clone()));
     let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.fail_conversions = true;
+    // the Degraded Feed rung cannot produce anything either
+    provider.quota_free_outcome = QuotaFreeOutcome::Fail("quota-free generation failed".into());
     let provider = Arc::new(provider);
-    let downstream = FakeDownstream::default();
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
         Arc::new(RecordingSpawner::default()),
-        Arc::new(downstream),
     );
 
     let result = serving
@@ -1266,9 +1267,199 @@ async fn exhausted_ladder_errors_when_downstream_cannot_produce() {
         )
         .await;
 
-    // nothing cached, conversion failed, downstream rungs produced nothing:
-    // the request errors
+    // nothing cached, the conversion failed, the Degraded Feed rung failed:
+    // the request errors — subscribers never receive a silent empty feed
     assert!(result.is_err());
     assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
     assert!(cache.load("k").await.is_none());
+}
+
+#[tokio::test]
+async fn open_breaker_skips_metered_conversion_and_serves_the_degraded_feed() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("k"));
+    provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
+    provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
+    let provider = Arc::new(provider);
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+    // the provider's quota is known to be exhausted until far past the test's
+    // clock
+    cache
+        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000)
+        .await
+        .unwrap();
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+
+    // the metered conversion was preempted: the Degraded Feed rung applied
+    // right away
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
+    assert_eq!(served.freshness, Freshness::FreshlyGenerated);
+    assert!(served.degraded);
+    assert_eq!(served.body, "<atom>degraded</atom>");
+    // the Degraded Feed is cached with its own short fresh ttl
+    assert_eq!(served.max_age_secs, 300);
+    let cached = cache.load("k").await.unwrap();
+    assert!(cached.degraded);
+    assert_eq!(cache.fresh_marker_ttl("k").await, Some(300));
+
+    // a later poll is served by that cached copy, fresh, no new generation
+    let again = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.freshness, Freshness::Fresh);
+    assert!(again.degraded);
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quota_exhausted_conversion_opens_the_breaker_and_degrades() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("k"));
+    provider.quota_exhausted_conversions = true;
+    provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
+    provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
+    let provider = Arc::new(provider);
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+
+    // the conversion failed with quota exhaustion: the Degraded Feed rung
+    // applied
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
+    assert!(served.degraded);
+    assert_eq!(served.freshness, Freshness::FreshlyGenerated);
+    // the breaker opened for the provider, holding until its next reset
+    let now = DateTime::<Utc>::from_timestamp(clock.unix_now(), 0).unwrap();
+    assert_eq!(
+        cache.breaker_reset(FAKE_BREAKER_KEY).await,
+        Some(next_quota_reset(now).timestamp())
+    );
+}
+
+#[tokio::test]
+async fn non_quota_conversion_failure_still_attempts_the_degraded_rung() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("k"));
+    provider.fail_conversions = true;
+    provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
+    provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
+    let provider = Arc::new(provider);
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+
+    // a rung is skipped only when it cannot produce a result: the degrade
+    // rung applies on any conversion failure, quota-related or not
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
+    assert!(served.degraded);
+    // a failure that is not quota-related never opens the breaker
+    assert_eq!(cache.breaker_reset(FAKE_BREAKER_KEY).await, None);
+}
+
+#[tokio::test]
+async fn quota_exhaustion_without_a_breaker_key_degrades_without_opening_a_breaker() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("k"));
+    provider.quota_exhausted_conversions = true;
+    // no breaker key: the provider has no metered quota to break
+    provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
+    let provider = Arc::new(provider);
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+
+    // the quota-style failure still falls through to the Degraded Feed rung
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
+    assert!(served.degraded);
+}
+
+#[tokio::test]
+async fn degraded_feed_gets_the_injected_short_fresh_ttl() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, _counters) = FakeProvider::new(Some("k"));
+    provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
+    provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
+    let provider = Arc::new(provider);
+    let policy = ServingPolicy {
+        degraded_fresh_ttl_secs: 123,
+        ..test_policy()
+    };
+    let serving = FeedServing::new(policy, clock.clone(), Arc::new(RecordingSpawner::default()));
+    cache
+        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000)
+        .await
+        .unwrap();
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+
+    // the degraded fresh ttl comes from the injected policy, not a constant
+    assert_eq!(served.max_age_secs, 123);
+    assert_eq!(cache.fresh_marker_ttl("k").await, Some(123));
 }

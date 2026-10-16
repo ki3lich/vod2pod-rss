@@ -1549,8 +1549,13 @@ mod tests {
             "empty media:description must stay an empty Episode description"
         );
         assert!(channel.items[2].description().is_none_or(|d| d.is_empty()));
-        let long = channel.items[1].description().expect("populated description");
-        assert!(long.starts_with("Join @Valkyrae"), "description text survives");
+        let long = channel.items[1]
+            .description()
+            .expect("populated description");
+        assert!(
+            long.starts_with("Join @Valkyrae"),
+            "description text survives"
+        );
         assert!(
             long.contains("Created & Produced by Portal A"),
             "XML entities must be decoded (&amp; → &)"

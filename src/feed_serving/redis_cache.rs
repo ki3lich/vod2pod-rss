@@ -72,4 +72,18 @@ impl FeedCacheStore for RedisFeedCache {
         )
         .await
     }
+
+    async fn quota_breaker_open(&self, breaker_key: &str) -> Option<i64> {
+        let mut con = self.con.clone();
+        crate::feed_cache::quota_breaker_open(&mut con, breaker_key).await
+    }
+
+    async fn open_quota_breaker(
+        &self,
+        breaker_key: &str,
+        reset_epoch_secs: i64,
+    ) -> eyre::Result<()> {
+        let mut con = self.con.clone();
+        crate::feed_cache::open_quota_breaker(&mut con, breaker_key, reset_epoch_secs).await
+    }
 }

@@ -27,6 +27,9 @@ struct MemRecord {
 #[derive(Clone)]
 pub struct InMemoryCache {
     records: Arc<Mutex<HashMap<String, MemRecord>>>,
+    /// Quota Breaker flags, keyed by the provider-owned breaker key and
+    /// carrying the unix time each holds until.
+    breakers: Arc<Mutex<HashMap<String, i64>>>,
     clock: Arc<dyn Clock>,
     quota_usage: Arc<Mutex<i64>>,
 }
@@ -35,6 +38,7 @@ impl InMemoryCache {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             records: Arc::default(),
+            breakers: Arc::default(),
             clock,
             quota_usage: Arc::default(),
         }
@@ -108,6 +112,28 @@ impl FeedCacheStore for InMemoryCache {
             None => Ok(()),
         }
     }
+
+    async fn quota_breaker_open(&self, breaker_key: &str) -> Option<i64> {
+        let breakers = self.breakers.lock().unwrap();
+        let reset = *breakers.get(breaker_key)?;
+        (reset > self.clock.unix_now()).then_some(reset)
+    }
+
+    async fn open_quota_breaker(
+        &self,
+        breaker_key: &str,
+        reset_epoch_secs: i64,
+    ) -> eyre::Result<()> {
+        // mirror the Redis adapter: no breaker into the past
+        if reset_epoch_secs <= self.clock.unix_now() {
+            return Ok(());
+        }
+        self.breakers
+            .lock()
+            .unwrap()
+            .insert(breaker_key.to_string(), reset_epoch_secs);
+        Ok(())
+    }
 }
 
 impl InMemoryCache {
@@ -116,5 +142,13 @@ impl InMemoryCache {
     #[cfg(test)]
     pub async fn total_quota_usage(&self) -> i64 {
         *self.quota_usage.lock().unwrap()
+    }
+
+    /// The unix time the breaker identified by `breaker_key` holds until,
+    /// regardless of the clock; lets tests assert what opening a breaker
+    /// recorded.
+    #[cfg(test)]
+    pub async fn breaker_reset(&self, breaker_key: &str) -> Option<i64> {
+        self.breakers.lock().unwrap().get(breaker_key).copied()
     }
 }
