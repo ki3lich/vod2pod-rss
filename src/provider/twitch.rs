@@ -444,6 +444,44 @@ mod tests {
     use super::*;
     use test_log::test;
 
+    /// Pin Twitch's Episode Guid scheme: the bare video id, deliberately
+    /// different from YouTube's watch-URL scheme. Changing it re-identifies
+    /// every episode for every Twitch subscriber — a new ADR decision.
+    #[test]
+    fn test_episode_guid_is_the_bare_video_id() {
+        let vod: Video = serde_json::from_str(
+            r#"{
+                "id": "1234567890",
+                "user_id": "98765",
+                "user_login": "someuser",
+                "user_name": "SomeUser",
+                "title": "A stream VOD",
+                "description": "",
+                "created_at": "2026-01-15T18:00:00Z",
+                "published_at": "2026-01-15T18:00:00Z",
+                "url": "https://www.twitch.tv/videos/1234567890",
+                "thumbnail_url": "https://example.com/thumb.jpg",
+                "viewable": "public",
+                "view_count": 42,
+                "language": "en",
+                "type": "archive",
+                "duration": "2h30m"
+            }"#,
+        )
+        .unwrap();
+        let items = build_items_from_vods(vec![vod], vec![]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].guid().unwrap().value(),
+            "1234567890",
+            "Twitch guid must stay the bare video id"
+        );
+        assert_eq!(
+            items[0].link().unwrap(),
+            "https://www.twitch.tv/videos/1234567890"
+        );
+    }
+
     #[test(tokio::test)]
     async fn fetch_twitch_channel_requires_api_key() {
         let provider = TwitchProvider;

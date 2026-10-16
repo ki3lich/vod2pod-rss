@@ -28,7 +28,7 @@ use tokio::process::Command;
 
 use crate::{
     configs::{conf, Conf, ConfName},
-    provider,
+    episode_identity, provider,
 };
 
 use super::{GeneratedFeed, MediaProvider};
@@ -529,14 +529,6 @@ async fn fetch_from_api(
     })
 }
 
-/// The watch URL for a video id. Load-bearing as the Episode Guid format:
-/// both the API path and the quota-free atom path emit this exact string as
-/// the item guid (see docs/adr/0002 — the scheme is frozen identity, never
-/// change it without acknowledging a mass duplication in every subscriber).
-fn watch_url_for_video_id(video_id: &str) -> String {
-    format!("https://www.youtube.com/watch?v={video_id}")
-}
-
 macro_rules! get_thumb {
     ($snippet:ident) => {
         $snippet.thumbnails.and_then(|thumbs| {
@@ -665,7 +657,7 @@ fn build_channel_items_from_playlist(
             let title = snippet.title.take().unwrap_or("".to_owned());
             let description = snippet.description.take().unwrap_or("".to_owned());
             let video_id = snippet.resource_id.take()?.video_id?;
-            let url = Url::parse(&watch_url_for_video_id(&video_id)).ok()?;
+            let url = Url::parse(&episode_identity::youtube_episode_guid(&video_id)).ok()?;
 
             let video_infos = videos_infos.get(&video_id).or_else(|| {
                 warn!("no duration found for {:?}", video_id);
@@ -1102,14 +1094,10 @@ fn convert_atom_to_rss(
                     .and_then(|d| Some(d.clone().description?.content)),
             );
             item_builder.link(link.clone());
-            // Episode Guid must be identical to the one the API path emits for
-            // the same video, or podcatchers re-identify every episode whenever
-            // the Degradation Ladder serves this quota-free feed (mass
-            // duplication). The API path guids are the watch URL.
-            let guid = match entry.id.strip_prefix("yt:video:") {
-                Some(video_id) => watch_url_for_video_id(video_id),
-                None => link.clone().unwrap_or_else(|| entry.id.clone()),
-            };
+            let guid = episode_identity::youtube_episode_guid_from_atom(
+                entry.id.as_str(),
+                link.as_deref(),
+            );
             item_builder.guid(Some(GuidBuilder::default().value(guid).build()));
             item_builder.pub_date(
                 entry
@@ -1462,11 +1450,7 @@ mod tests {
         assert!(!probe_state_unchanged(
             &state,
             Some(120),
-            &[
-                "vid1".to_string(),
-                "vid2".to_string(),
-                "vid3".to_string()
-            ],
+            &["vid1".to_string(), "vid2".to_string(), "vid3".to_string()],
             fetched.newest_published_at,
         ));
     }
@@ -1611,6 +1595,32 @@ mod tests {
                 "https://www.youtube.com/watch?v=abc123".to_string(),
                 "https://www.youtube.com/watch?v=def456".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_api_items_use_watch_url_guids() {
+        let items: Vec<PlaylistItem> = vec![PlaylistItem {
+            snippet: Some(api::PlaylistItemSnippet {
+                title: Some("Video One".to_string()),
+                resource_id: Some(api::ResourceId {
+                    video_id: Some("abc123".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let infos: HashMap<String, VideoExtraInfo> = HashMap::from([(
+            "abc123".to_string(),
+            VideoExtraInfo {
+                duration: iso8601_duration::Duration::parse("PT10M").unwrap(),
+            },
+        )]);
+        let rss_items = build_channel_items_from_playlist(items, infos, false);
+        assert_eq!(
+            rss_items[0].guid().unwrap().value(),
+            "https://www.youtube.com/watch?v=abc123"
         );
     }
 

@@ -9,6 +9,7 @@ use rss::Channel;
 use rss::{Enclosure, Item};
 
 use crate::configs::{conf, AudioCodec, Conf, ConfName};
+use crate::episode_identity;
 
 pub fn inject_vod2pod_customizations(
     rss_body: String,
@@ -62,19 +63,12 @@ pub fn inject_vod2pod_customizations(
                     .link()
                     .ok_or(eyre!("not url found in item"))?
                     .to_string();
-                // Enclosure URLs must be stable across serves and identical
-                // for every subscriber of the same episode: the server derives
-                // its ETag from the injected body, and podcatchers tie episode
-                // identity to guid + enclosure. A fresh uuid per serve would
-                // defeat conditional GET and fragment identity. The seed is the
-                // episode guid when present, the source link otherwise — an
-                // item with neither cannot be transcoded at all.
-                let episode_seed = item
-                    .guid()
-                    .map(|g| g.value().to_string())
-                    .unwrap_or(source_link.clone());
+                // Deterministic Enclosure URL: the uuid is derived by the
+                // Episode identity module (docs/adr/0002), so the injected
+                // body — and the ETag the server derives from it — is stable
+                // across serves and identical across subscribers.
                 let generation_uuid =
-                    uuid::Uuid::new_v5(&EPISODE_ENCLOSURE_UUID_NAMESPACE, episode_seed.as_bytes())
+                    episode_identity::enclosure_uuid(item.guid().map(|g| g.value()), &source_link)
                         .to_string();
                 transcode_service_url
                     .query_pairs_mut()
@@ -110,14 +104,6 @@ pub fn inject_vod2pod_customizations(
 pub fn streamable_bytes(duration_secs: u64, bitrate_kbps: u64) -> u64 {
     duration_secs * bitrate_kbps * 1000 / 8
 }
-
-/// Fixed uuid-v5 namespace used to derive the per-episode enclosure uuid from
-/// the episode identifier. NEVER change this value: enclosure urls are part
-/// of episode identity for podcatchers (see CONTEXT.md,
-/// "Deterministic Enclosure URL") and every derived uuid would change,
-/// re-downloading every episode for every subscriber.
-const EPISODE_ENCLOSURE_UUID_NAMESPACE: uuid::Uuid =
-    uuid::uuid!("b3e1c9a0-4f2d-4e8a-9c1b-2d5f6a7b8c9d");
 
 fn get_description(item: &Item) -> String {
     const FOOTER: &str = concat!(
@@ -231,15 +217,16 @@ mod tests {
         );
     }
 
-    /// Pin the derivation itself, not just its stability: the uuid must be
-    /// v5-of(guid) under the compiled-in namespace, so a regression back to a
-    /// random uuid (or a re-keying) fails loudly instead of silently drifting.
+    /// The injected uuid is the Episode identity module's derivation, byte
+    /// for byte: any regression at the injection site (a fresh uuid per
+    /// serve, a different seed) breaks the body's stability and fails here.
+    /// The v5-of(guid) scheme itself is pinned in the identity module.
     #[test]
     fn test_enclosure_uuid_is_v5_of_episode_guid() {
         let channel = inject_default();
-        let expected = uuid::Uuid::new_v5(
-            &EPISODE_ENCLOSURE_UUID_NAMESPACE,
-            b"https://www.youtube.com/watch?v=abc",
+        let expected = episode_identity::enclosure_uuid(
+            Some("https://www.youtube.com/watch?v=abc"),
+            "https://www.youtube.com/watch?v=abc",
         )
         .to_string();
         let url = channel.items[0].enclosure().unwrap().url().to_string();
