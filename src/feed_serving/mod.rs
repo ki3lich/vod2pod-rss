@@ -10,9 +10,9 @@
 //! every rung is exercised hermetically at this interface.
 //!
 //! The module reads no environment configuration: the HTTP adapter reads the
-//! config and injects a [`ServingPolicy`]. Quota exhaustion is still detected
-//! by the inherited string match (the reset rule alongside it) — both are
-//! retyped across the provider seam by the next ticket.
+//! config and injects a [`ServingPolicy`]. Quota exhaustion crosses the
+//! provider seam as the typed `QuotaExhausted` conversion failure; how a
+//! provider recognizes its own quota errors is the provider's concern.
 
 use std::{
     collections::HashMap,
@@ -68,6 +68,16 @@ pub struct ServingPolicy {
     pub degraded_fresh_ttl_secs: u64,
     /// Jitter added on top of the Fresh TTL (see [`FRESH_TTL_JITTER_SECS`]).
     pub fresh_ttl_jitter_secs: u64,
+}
+
+/// The freshness anchoring a stored copy gets: how long the fresh marker
+/// lives (a Fresh TTL — the jittered one after a conversion, the degraded one
+/// after degradation, the remaining Fresh Period after a probe) and how long
+/// the body itself stays servable (the Stale Window).
+#[derive(Clone, Copy, Debug)]
+pub struct FreshnessWindows {
+    pub fresh_ttl_secs: u64,
+    pub stale_window_secs: u64,
 }
 
 /// Source of time for serving decisions. The wall clock in production, a
@@ -138,14 +148,13 @@ pub trait FeedCacheStore: Send + Sync {
     async fn fresh_marker_ttl(&self, canonical_key: &str) -> Option<i64>;
 
     /// Store a Feed (overwriting any previous one) and anchor its freshness:
-    /// the fresh marker gets `fresh_ttl_secs`, the body lives
-    /// `stale_window_secs`.
+    /// the fresh marker lives for the windows' Fresh TTL, the body for the
+    /// windows' Stale Window.
     async fn store(
         &self,
         canonical_key: &str,
         feed: &CachedFeed,
-        fresh_ttl_secs: u64,
-        stale_window_secs: u64,
+        windows: FreshnessWindows,
     ) -> eyre::Result<()>;
 
     /// Record metered units a Feed Conversion consumed, bucketed on the
@@ -154,15 +163,14 @@ pub trait FeedCacheStore: Send + Sync {
     async fn bump_quota_usage(&self, units: u64, day_key: &str) -> eyre::Result<i64>;
 
     /// Re-anchor freshness after a probe answered "unchanged": the fresh
-    /// marker gets `fresh_ttl_secs` (which must not outlive the Fresh
+    /// marker gets the windows' Fresh TTL (which must not outlive the Fresh
     /// Period), the body TTL is re-anchored to the Stale Window. The
     /// generation timestamp is deliberately not touched, so the Fresh Period
     /// still forces a full conversion eventually.
     async fn renew_freshness(
         &self,
         canonical_key: &str,
-        fresh_ttl_secs: u64,
-        stale_window_secs: u64,
+        windows: FreshnessWindows,
     ) -> eyre::Result<()>;
 
     /// The Quota Breaker identified by `breaker_key` while it is open —
@@ -537,8 +545,7 @@ impl FeedServing {
                         if let Err(e) = cache
                             .renew_freshness(
                                 &canonical_key,
-                                remaining_fresh.max(1) as u64,
-                                self.policy.stale_window_secs,
+                                self.freshness_windows(remaining_fresh.max(1) as u64),
                             )
                             .await
                         {
@@ -615,6 +622,32 @@ impl FeedServing {
         })
     }
 
+    /// The freshness anchoring a stored copy gets under this instance's
+    /// policy: the given Fresh TTL (jittered, degraded, or the remaining
+    /// Fresh Period) plus the policy's Stale Window.
+    fn freshness_windows(&self, fresh_ttl_secs: u64) -> FreshnessWindows {
+        FreshnessWindows {
+            fresh_ttl_secs,
+            stale_window_secs: self.policy.stale_window_secs,
+        }
+    }
+
+    /// Store a freshly converted or degraded copy, tolerating a cache
+    /// failure: losing the entry only costs quota, never the response being
+    /// built.
+    async fn store_or_warn(
+        &self,
+        cache: &dyn FeedCacheStore,
+        canonical_key: &str,
+        entry: &CachedFeed,
+        windows: FreshnessWindows,
+    ) {
+        if let Err(e) = cache.store(canonical_key, entry, windows).await {
+            let kind = if entry.degraded { "degraded feed" } else { "feed" };
+            warn!("could not store {kind} {canonical_key} in cache: {e}");
+        }
+    }
+
     /// Rung 2: full Feed Conversion, then store the raw body together with the
     /// Freshness Probe state it was generated from. The stored copy is
     /// re-read so the response metadata reflects what was just cached; when
@@ -639,17 +672,13 @@ impl FeedServing {
             probe_state: generated.probe_state,
             degraded: false,
         };
-        if let Err(e) = cache
-            .store(
-                canonical_key,
-                &entry,
-                self.jittered_fresh_ttl(),
-                self.policy.stale_window_secs,
-            )
-            .await
-        {
-            warn!("could not store feed {canonical_key} in cache: {e}");
-        }
+        self.store_or_warn(
+            cache,
+            canonical_key,
+            &entry,
+            self.freshness_windows(self.jittered_fresh_ttl()),
+        )
+        .await;
 
         if let Some(units) = generated.quota_units {
             self.record_quota_usage(cache, provider, units).await;
@@ -771,17 +800,13 @@ impl FeedServing {
             probe_state: None,
             degraded: true,
         };
-        if let Err(e) = cache
-            .store(
-                canonical_key,
-                &entry,
-                self.policy.degraded_fresh_ttl_secs,
-                self.policy.stale_window_secs,
-            )
-            .await
-        {
-            warn!("could not store degraded feed {canonical_key} in cache: {e}");
-        }
+        self.store_or_warn(
+            cache,
+            canonical_key,
+            &entry,
+            self.freshness_windows(self.policy.degraded_fresh_ttl_secs),
+        )
+        .await;
         Ok(ServedFeed {
             body: entry.body,
             generated_at: entry.generated_at,

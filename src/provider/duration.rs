@@ -2,6 +2,11 @@
 //! turns a `H:MM:SS` (or shorter) string into a [`Duration`], formatting turns
 //! a seconds count into the zero-padded `HH:MM:SS` string Apple's
 //! `itunes:duration` expects.
+//!
+//! The parse → format round-trip normalizes: an upstream part larger than
+//! its natural bound (e.g. Twitch's `90:30`, meaning 90 min 30 s) folds into
+//! the higher unit, so every emitted value is conformant — minutes and
+//! seconds always stay below 60, hours stay unbounded.
 
 use std::time::Duration;
 

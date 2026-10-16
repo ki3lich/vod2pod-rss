@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 
-use super::FeedCacheStore;
+use super::{FeedCacheStore, FreshnessWindows};
 use crate::feed_cache::CachedFeed;
 
 /// Cache adapter backed by Redis. Holds a handle on one multiplexed
@@ -38,16 +38,15 @@ impl FeedCacheStore for RedisFeedCache {
         &self,
         canonical_key: &str,
         feed: &CachedFeed,
-        fresh_ttl_secs: u64,
-        stale_window_secs: u64,
+        windows: FreshnessWindows,
     ) -> eyre::Result<()> {
         let mut con = self.con.clone();
         crate::feed_cache::store(
             &mut con,
             canonical_key,
             feed,
-            fresh_ttl_secs,
-            stale_window_secs,
+            windows.fresh_ttl_secs,
+            windows.stale_window_secs,
         )
         .await
     }
@@ -60,15 +59,14 @@ impl FeedCacheStore for RedisFeedCache {
     async fn renew_freshness(
         &self,
         canonical_key: &str,
-        fresh_ttl_secs: u64,
-        stale_window_secs: u64,
+        windows: FreshnessWindows,
     ) -> eyre::Result<()> {
         let mut con = self.con.clone();
         crate::feed_cache::renew_freshness(
             &mut con,
             canonical_key,
-            fresh_ttl_secs,
-            stale_window_secs,
+            windows.fresh_ttl_secs,
+            windows.stale_window_secs,
         )
         .await
     }

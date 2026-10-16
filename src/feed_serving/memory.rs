@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 
-use super::{Clock, FeedCacheStore};
+use super::{Clock, FeedCacheStore, FreshnessWindows};
 use crate::feed_cache::CachedFeed;
 
 #[derive(Clone)]
@@ -70,8 +70,7 @@ impl FeedCacheStore for InMemoryCache {
         &self,
         canonical_key: &str,
         feed: &CachedFeed,
-        fresh_ttl_secs: u64,
-        stale_window_secs: u64,
+        windows: FreshnessWindows,
     ) -> eyre::Result<()> {
         let now = self.clock.unix_now();
         let mut records = self.records.lock().unwrap();
@@ -79,8 +78,8 @@ impl FeedCacheStore for InMemoryCache {
             canonical_key.to_string(),
             MemRecord {
                 feed: feed.clone(),
-                body_expires_at: now + stale_window_secs as i64,
-                fresh_expires_at: Some(now + fresh_ttl_secs as i64),
+                body_expires_at: now + windows.stale_window_secs as i64,
+                fresh_expires_at: Some(now + windows.fresh_ttl_secs as i64),
             },
         );
         Ok(())
@@ -95,15 +94,14 @@ impl FeedCacheStore for InMemoryCache {
     async fn renew_freshness(
         &self,
         canonical_key: &str,
-        fresh_ttl_secs: u64,
-        stale_window_secs: u64,
+        windows: FreshnessWindows,
     ) -> eyre::Result<()> {
         let now = self.clock.unix_now();
         let mut records = self.records.lock().unwrap();
         match records.get_mut(canonical_key) {
             Some(record) => {
-                record.fresh_expires_at = Some(now + fresh_ttl_secs as i64);
-                record.body_expires_at = now + stale_window_secs as i64;
+                record.fresh_expires_at = Some(now + windows.fresh_ttl_secs as i64);
+                record.body_expires_at = now + windows.stale_window_secs as i64;
                 Ok(())
             }
             // the entry expired between the load and the renewal: behave like

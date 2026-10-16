@@ -76,6 +76,12 @@ fn next_quota_reset(now_utc: DateTime<Utc>) -> DateTime<Utc> {
 /// because the project's daily quota is spent. YouTube's error vocabulary is
 /// the provider's own concern: the rest of the system only ever sees the
 /// typed `QuotaExhausted` conversion failure.
+///
+/// ceiling: detection is exactly as wide as the crate's JSON decoding. A
+/// quota error whose body is not valid JSON arrives as `Error::Failure`,
+/// carrying no structured reason to type against — identifying it would
+/// require matching upstream error text, which the typed seam forbids — so
+/// it degrades without opening the breaker.
 fn is_youtube_quota_error(err: &eyre::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
@@ -331,6 +337,11 @@ fn probe_state_unchanged(
 /// the only place that shape is derived — the pagination requests it and
 /// records it next to the snapshot, and the Freshness Probe re-fetches
 /// exactly what was recorded. Pure function so tests can exercise it.
+///
+/// ceiling: with a zero item budget this derives a probe page of 0 — a
+/// degenerate config whose upstream behavior is not special-cased anywhere
+/// in this module. Mirroring the pagination exactly is the invariant that
+/// matters, and it outranks the degenerate config.
 fn first_page_size(max_fetched_items: usize) -> u64 {
     max_fetched_items.min(50) as u64
 }
@@ -1350,8 +1361,8 @@ mod tests {
         assert_eq!(first_page_size(1), 1);
         assert_eq!(first_page_size(49), 49);
         assert_eq!(first_page_size(50), 50);
-        // degenerate config values mirror the pagination exactly — the API
-        // rejects the request, as it would for the conversion itself
+        // degenerate config values mirror the pagination exactly, leaving
+        // the upstream's handling of it un-special-cased
         assert_eq!(first_page_size(0), 0);
     }
 

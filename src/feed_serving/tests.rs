@@ -14,7 +14,8 @@ use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{
-    FeedCacheStore, FeedServing, Freshness, RevalidationSpawner, RevalidationTask, ServingPolicy,
+    FeedCacheStore, FeedServing, Freshness, FreshnessWindows, RevalidationSpawner,
+    RevalidationTask, ServingPolicy,
 };
 use crate::feed_cache::CachedFeed;
 use crate::provider::{FeedProbeState, GeneratedFeed, MediaProvider, QuotaExhausted};
@@ -295,8 +296,10 @@ async fn seed_with(
                 probe_state,
                 degraded,
             },
-            fresh_ttl_secs,
-            7 * 24 * 3600,
+            FreshnessWindows {
+                fresh_ttl_secs,
+                stale_window_secs: 7 * 24 * 3600,
+            },
         )
         .await
         .unwrap();
