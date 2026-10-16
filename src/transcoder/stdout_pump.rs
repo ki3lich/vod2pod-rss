@@ -142,8 +142,7 @@ pub(super) fn next_pump_decision(
                 // shorter-than-declared stream land on the same error path on
                 // purpose: a broken transfer beats cached zeros.
                 let shortfall = state.expected_bytes_count - state.sent_bytes_count;
-                if shortfall as f64 > state.expected_bytes_count as f64 * MAX_OK_SHORTFALL_RATIO
-                {
+                if shortfall as f64 > state.expected_bytes_count as f64 * MAX_OK_SHORTFALL_RATIO {
                     return (
                         PumpDecision::Fail(std::io::Error::other(format!(
                             "media stream ended prematurely: got {} of {} bytes",
@@ -165,7 +164,9 @@ pub(super) fn next_pump_decision(
                 );
             }
             (
-                PumpDecision::Continue { chunk_len: read_bytes },
+                PumpDecision::Continue {
+                    chunk_len: read_bytes,
+                },
                 PumpState {
                     sent_bytes_count: state.sent_bytes_count + read_bytes,
                     ..state
@@ -296,9 +297,9 @@ fn pump_ffmpeg_stdout<R: Read>(
                             stop_child(&mut child);
                             break;
                         }
-                        other => unreachable!(
-                            "a client-gone observation decides kill, got {other:?}"
-                        ),
+                        other => {
+                            unreachable!("a client-gone observation decides kill, got {other:?}")
+                        }
                     }
                 }
             }
@@ -315,8 +316,7 @@ fn pump_ffmpeg_stdout<R: Read>(
                 let mut padding = padding;
                 while padding > 0 {
                     let chunk = padding.min(BUFFER_SIZE);
-                    _ = tx_stdout
-                        .blocking_send(Ok(Bytes::copy_from_slice(&NULL_BUFF[..chunk])));
+                    _ = tx_stdout.blocking_send(Ok(Bytes::copy_from_slice(&NULL_BUFF[..chunk])));
                     padding -= chunk;
                 }
                 _ = child.wait();
@@ -499,10 +499,7 @@ mod test {
             stream_err.is_none(),
             "stream failed under interruptions interleaved with successful reads: {stream_err:?}"
         );
-        assert_eq!(
-            received, expected,
-            "stream was cut short by interruptions"
-        );
+        assert_eq!(received, expected, "stream was cut short by interruptions");
     }
 
     #[test]
@@ -544,7 +541,13 @@ mod test {
 
         let (tx, mut rx) = channel(100);
         std::thread::spawn(move || {
-            pump_ffmpeg_stdout(ScriptedSource { steps }, spawned_child(), tx, 100, Duration::ZERO);
+            pump_ffmpeg_stdout(
+                ScriptedSource { steps },
+                spawned_child(),
+                tx,
+                100,
+                Duration::ZERO,
+            );
         });
 
         let mut received: Vec<u8> = Vec::new();
@@ -620,7 +623,8 @@ mod test {
     fn stderr_error_line_fails_the_stream() {
         // Any line ffmpeg writes to stderr is a genuine error and fails the
         // stream — there is no severity ranking and no line is ignored.
-        let decision = stderr_read_decision(Ok("Invalid data found when processing input\n".into()));
+        let decision =
+            stderr_read_decision(Ok("Invalid data found when processing input\n".into()));
         match decision {
             StderrDecision::Fail(e) => assert!(
                 e.to_string().contains("Invalid data found"),
@@ -634,10 +638,8 @@ mod test {
     fn stderr_read_failure_fails_and_stops() {
         // Failing to read stderr at all is not an ffmpeg error line, but it
         // is still a failure — and there is nothing left to drain.
-        let read_failure = std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "synthetic stderr fault",
-        );
+        let read_failure =
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic stderr fault");
         assert!(matches!(
             stderr_read_decision(Err(read_failure)),
             StderrDecision::ReadFailed(_)
@@ -650,10 +652,8 @@ mod test {
         // pipe, an I/O fault on ffmpeg's stdout — ends the transfer with
         // that error; there is no retry for it.
         let state = PumpState::start(1000);
-        let broken_pipe = std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "synthetic stdout fault",
-        );
+        let broken_pipe =
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic stdout fault");
 
         let (decision, _) = next_pump_decision(PumpObservation::Read(Err(broken_pipe)), state);
 
@@ -686,7 +686,8 @@ mod test {
             interrupt_streak: 3,
         };
 
-        let (decision, state) = next_pump_decision(PumpObservation::Read(Err(interrupted())), state);
+        let (decision, state) =
+            next_pump_decision(PumpObservation::Read(Err(interrupted())), state);
 
         assert!(
             matches!(decision, PumpDecision::Retry),
