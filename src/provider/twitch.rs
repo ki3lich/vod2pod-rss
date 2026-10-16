@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset};
 use log::{debug, info, warn};
@@ -12,13 +10,15 @@ use rss::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     configs::{conf, Conf, ConfName},
     provider,
 };
 
+use super::duration::{format_duration, parse_duration};
+use super::yt_dlp;
 use super::{GeneratedFeed, MediaProvider};
 
 pub struct TwitchProvider;
@@ -117,7 +117,7 @@ impl MediaProvider for TwitchProvider {
     }
 
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {
-        get_twitch_stream_url(media_url).await
+        yt_dlp::stream_url(media_url, &[]).await
     }
 
     fn domain_whitelist_regexes(&self) -> Vec<Regex> {
@@ -220,37 +220,6 @@ struct StreamsData {
 struct VodsData {
     pub data: Vec<Video>,
     pub pagination: serde_json::Value,
-}
-
-async fn get_twitch_stream_url(url: &Url) -> eyre::Result<Url> {
-    debug!("getting stream_url for twitch video: {}", url);
-    let mut command = tokio::process::Command::new("yt-dlp");
-    command
-        .kill_on_drop(true)
-        .arg("-f")
-        .arg("bestaudio")
-        .arg("--get-url")
-        .arg(url.as_str());
-
-    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
-
-    match output {
-        Ok(Ok(x)) => {
-            let raw_url = std::str::from_utf8(&x.stdout).unwrap_or_default();
-            match Url::from_str(raw_url) {
-                Ok(url) => Ok(url),
-                Err(e) => {
-                    warn!(
-                        "error while parsing stream url:\ninput: {}\nerror: {}",
-                        raw_url, e
-                    );
-                    Err(eyre::eyre!(e))
-                }
-            }
-        }
-        Ok(Err(e)) => Err(eyre::eyre!(e)),
-        Err(_) => Err(eyre::eyre!("yt-dlp timed out after 120s")),
-    }
 }
 
 #[allow(dead_code)]
@@ -399,31 +368,15 @@ fn vod_to_rss_item_converter(vod: Video) -> Item {
     let itunes_item_extension = ITunesItemExtensionBuilder::default()
         .summary(Some(description))
         .duration(Some({
+            // Twitch spells durations "2h30m15s"; normalizing to the
+            // shared H:MM:SS form lets one parser serve every provider.
             let duration_as_string = vod.duration.replace(['h', 'm'], ":").replace('s', "");
-
-            let duration_parts = duration_as_string
-                .split(':')
-                .map(|s| s.parse::<usize>())
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap_or_else(|_e| {
+            match parse_duration(&duration_as_string) {
+                Ok(duration) => format_duration(duration.as_secs()),
+                Err(_) => {
                     warn!(
                         "could not parse duration for twitch stream: {:?}",
                         duration_as_string
-                    );
-                    vec![0]
-                });
-
-            match duration_parts.len() {
-                3 => format!(
-                    "{:02}:{:02}:{:02}",
-                    duration_parts[0], duration_parts[1], duration_parts[2]
-                ),
-                2 => format!("00:{:02}:{:02}", duration_parts[0], duration_parts[1]),
-                1 => format!("00:00:{:02}", duration_parts[0]),
-                _ => {
-                    warn!(
-                        "vod {} has invalid duration {}",
-                        video_id, duration_as_string
                     );
                     String::from("00:00:00")
                 }
@@ -480,6 +433,41 @@ mod tests {
             items[0].link().unwrap(),
             "https://www.twitch.tv/videos/1234567890"
         );
+    }
+
+    /// Characterize the itunes:duration Twitch produces from the API's
+    /// "2h30m15s" notation: the shared duration helpers must keep rendering
+    /// it as zero-padded HH:MM:SS.
+    #[test]
+    fn test_vod_duration_is_formatted_hh_mm_ss() {
+        for (duration, expected) in [("2h30m15s", "02:30:15"), ("45m30s", "00:45:30")] {
+            let vod: Video = serde_json::from_str(&format!(
+                r#"{{
+                    "id": "1234567890",
+                    "user_id": "98765",
+                    "user_login": "someuser",
+                    "user_name": "SomeUser",
+                    "title": "A stream VOD",
+                    "description": "",
+                    "created_at": "2026-01-15T18:00:00Z",
+                    "published_at": "2026-01-15T18:00:00Z",
+                    "url": "https://www.twitch.tv/videos/1234567890",
+                    "thumbnail_url": "https://example.com/thumb.jpg",
+                    "viewable": "public",
+                    "view_count": 42,
+                    "language": "en",
+                    "type": "archive",
+                    "duration": "{duration}"
+                }}"#
+            ))
+            .unwrap();
+            let items = build_items_from_vods(vec![vod], vec![]);
+            assert_eq!(
+                items[0].itunes_ext().unwrap().duration().unwrap(),
+                expected,
+                "{duration} must keep rendering as the itunes:duration {expected}"
+            );
+        }
     }
 
     #[test(tokio::test)]

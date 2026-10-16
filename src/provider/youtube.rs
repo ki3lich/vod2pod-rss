@@ -10,7 +10,7 @@ use google_youtube3::{
 };
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -24,13 +24,14 @@ use rss::{
     extension::itunes::{ITunesChannelExtensionBuilder, ITunesItemExtensionBuilder},
     Channel, ChannelBuilder, GuidBuilder, ImageBuilder, Item, ItemBuilder,
 };
-use tokio::process::Command;
 
 use crate::{
     configs::{conf, Conf, ConfName},
     episode_identity, provider,
 };
 
+use super::duration::{format_duration, parse_duration};
+use super::yt_dlp;
 use super::{GeneratedFeed, MediaProvider};
 
 pub struct YoutubeProvider;
@@ -693,12 +694,7 @@ fn build_channel_items_from_playlist(
                 .summary(Some(description))
                 // Apple ignores plain <author>; episodes need itunes:author
                 .author(snippet.channel_title.take())
-                .duration(Some({
-                    let hours = video_infos.duration.hour;
-                    let minutes = video_infos.duration.minute;
-                    let seconds = video_infos.duration.second;
-                    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-                }))
+                .duration(Some(format_duration(duration_seconds)))
                 .image(get_thumb!(snippet).and_then(|t| t.url))
                 .build();
             item_builder.itunes_ext(Some(itunes_item_extension));
@@ -894,42 +890,9 @@ async fn build_yt_stream_url_cache() -> AsyncRedisCache<Url, Url> {
     create = r##" build_yt_stream_url_cache().await "##
 )]
 async fn get_youtube_stream_url(url: &Url) -> eyre::Result<Url> {
-    debug!("getting stream_url for yt video: {}", url);
     let extra_args: Vec<String> =
         serde_json::from_str(conf().get(ConfName::YoutubeYtDlpExtraArgs)?.as_str()).map_err(|_| eyre!(r#"failed to parse YOUTUBE_YT_DLP_GET_URL_EXTRA_ARGS allowed syntax is ["arg1#", "arg2", "arg3", ...]"#))?;
-    let mut command = tokio::process::Command::new("yt-dlp");
-    command
-        .kill_on_drop(true)
-        .arg("-f")
-        .arg("bestaudio")
-        .arg("--get-url")
-        .arg(url.as_str());
-
-    for arg in extra_args {
-        command.arg(arg);
-    }
-
-    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
-
-    match output {
-        Ok(Ok(x)) => {
-            let raw_url = std::str::from_utf8(&x.stdout).unwrap_or_default();
-            match Url::from_str(raw_url) {
-                Ok(url) => Ok(url),
-                Err(e) => {
-                    warn!(
-                        "error while parsing stream url using yt-dlp:\nerror: {}\nyt-dlp stdout: {}\nyt-dlp stderr: {}",
-                        e,
-                        raw_url,
-                        std::str::from_utf8(&x.stderr).unwrap_or_default()
-                    );
-                    Err(eyre::eyre!(e))
-                }
-            }
-        }
-        Ok(Err(e)) => Err(eyre::eyre!(e)),
-        Err(_) => Err(eyre::eyre!("yt-dlp timed out after 120s")),
-    }
+    yt_dlp::stream_url(url, &extra_args).await
 }
 
 /// Best-effort eviction of the cached googlevideo stream URL for `watch_url`.
@@ -1007,17 +970,15 @@ async fn feed_url_for_yt_channel(url: &Url) -> eyre::Result<Url> {
 )]
 async fn find_yt_channel_url_with_c_id(url: &Url) -> eyre::Result<Url> {
     info!("conversion not in cache, using yt-dlp for conversion...");
-    let mut command = Command::new("yt-dlp");
-    command
-        .kill_on_drop(true)
-        .arg("--playlist-items")
-        .arg("0")
-        .arg("-O")
-        .arg("playlist:channel_url")
-        .arg(url.to_string());
-
-    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
-    let output = output.map_err(|_| eyre::eyre!("yt-dlp timed out after 120s"))??;
+    let output = yt_dlp::run(&[
+        "--playlist-items",
+        "0",
+        "-O",
+        "playlist:channel_url",
+        url.as_str(),
+    ])
+    .await
+    .map_err(eyre::Error::new)?;
     let conversion = std::str::from_utf8(&output.stdout);
     let feed_url = match conversion {
         Ok(feed_url) => feed_url,
@@ -1116,9 +1077,7 @@ fn convert_atom_to_rss(
                     .and_then(|m| m.thumbnails.first())
                     .map(|t| t.clone().image.uri),
             );
-            let duration = duration_seconds
-                .map(|a| format!("{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60));
-            itunes_item_builder.duration(duration);
+            itunes_item_builder.duration(duration_seconds.map(|a| format_duration(a as u64)));
             item_builder.itunes_ext(Some(itunes_item_builder.build()));
             Some(item_builder.build())
         })
@@ -1146,57 +1105,34 @@ fn convert_atom_to_rss(
 async fn get_youtube_video_duration_with_ytdlp(url: &Url) -> eyre::Result<Option<usize>> {
     debug!("getting duration for yt video: {}", url);
 
-    let mut command = Command::new("yt-dlp");
-    command
-        .kill_on_drop(true)
-        .arg("--get-duration")
-        .arg(url.to_string());
-
-    let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
-
-    match output {
-        Ok(Ok(x)) => {
-            let duration_str = std::str::from_utf8(&x.stdout).unwrap().trim().to_string();
-            Ok(Some(
-                parse_duration(&duration_str)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .try_into()
-                    .unwrap(),
-            ))
+    let output = match yt_dlp::run(&["--get-duration", url.as_str()]).await {
+        Ok(output) => output,
+        Err(yt_dlp::YtDlpError::Timeout) => {
+            warn!(
+                "yt-dlp duration fetch timed out after {}s",
+                yt_dlp::TIMEOUT.as_secs()
+            );
+            return Ok(None);
         }
-        Err(_) => {
-            warn!("yt-dlp duration fetch timed out after 120s");
-            Ok(None)
-        }
-        Ok(Err(_)) => {
+        Err(yt_dlp::YtDlpError::Spawn(_)) => {
             warn!("could not parse youtube video duration");
-            Ok(None)
+            return Ok(None);
         }
-    }
+    };
+
+    let duration_str = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    Ok(Some(
+        parse_duration(&duration_str)
+            .unwrap_or_default()
+            .as_secs()
+            .try_into()
+            .unwrap(),
+    ))
 }
 
-fn parse_duration(duration_str: &str) -> Result<Duration, String> {
-    let duration_parts: Vec<&str> = duration_str.split(':').rev().collect();
-
-    let seconds = match duration_parts.first() {
-        Some(sec_str) => sec_str.parse().map_err(|_| "Invalid format".to_string())?,
-        None => 0,
-    };
-
-    let minutes = match duration_parts.get(1) {
-        Some(min_str) => min_str.parse().map_err(|_| "Invalid format".to_string())?,
-        None => 0,
-    };
-
-    let hours = match duration_parts.get(2) {
-        Some(hour_str) => hour_str.parse().map_err(|_| "Invalid format".to_string())?,
-        None => 0,
-    };
-
-    let duration_secs = hours * 3600 + minutes * 60 + seconds;
-    Ok(Duration::from_secs(duration_secs))
-}
 #[cfg(test)]
 mod tests {
     use super::*;

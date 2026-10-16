@@ -1,9 +1,11 @@
+pub(crate) mod duration;
 mod generic;
 #[macro_use]
 mod macros;
 mod peertube;
 mod twitch;
 mod youtube;
+mod yt_dlp;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

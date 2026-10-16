@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use eyre::eyre;
 use log::debug;
@@ -10,6 +9,7 @@ use rss::{Enclosure, Item};
 
 use crate::configs::{conf, AudioCodec, Conf, ConfName};
 use crate::episode_identity;
+use crate::provider::duration::parse_duration;
 
 pub fn inject_vod2pod_customizations(
     rss_body: String,
@@ -123,28 +123,6 @@ fn get_description(item: &Item) -> String {
         url, img
     );
     format!("{}{}{}", description, original_link, FOOTER)
-}
-
-fn parse_duration(duration_str: &str) -> Result<Duration, String> {
-    let duration_parts: Vec<&str> = duration_str.split(':').rev().collect();
-
-    let seconds = match duration_parts.first() {
-        Some(sec_str) => sec_str.parse().map_err(|_| "Invalid format".to_string())?,
-        None => 0,
-    };
-
-    let minutes = match duration_parts.get(1) {
-        Some(min_str) => min_str.parse().map_err(|_| "Invalid format".to_string())?,
-        None => 0,
-    };
-
-    let hours = match duration_parts.get(2) {
-        Some(hour_str) => hour_str.parse().map_err(|_| "Invalid format".to_string())?,
-        None => 0,
-    };
-
-    let duration_secs = hours * 3600 + minutes * 60 + seconds;
-    Ok(Duration::from_secs(duration_secs))
 }
 
 #[cfg(test)]
