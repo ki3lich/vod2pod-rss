@@ -1,8 +1,10 @@
-//! Redis storage of cached Feeds: the record layout, the fresh markers and
-//! the quota breaker. The serving policy and the Degradation Ladder live in
-//! the Feed Serving module (`feed_serving`); this module is the storage
-//! mechanics its Redis adapter delegates to, plus the client-facing ETag and
-//! HTTP-date helpers the web tier uses.
+//! Redis storage of cached Feeds: the record layout, the fresh markers, the
+//! Quota Breaker records and the usage estimate buckets. Generic storage
+//! mechanics only: no provider names, no provider error strings, no reset
+//! timezones — those facts live behind the provider seam. The serving policy
+//! and the Degradation Ladder live in the Feed Serving module
+//! (`feed_serving`); this module is the storage mechanics its Redis adapter
+//! delegates to.
 //!
 //! Domain terms live in CONTEXT.md; the rationale of the serving policy is in
 //! docs/adr/0001-serve-stale-and-degrade-instead-of-failing.md.
@@ -10,8 +12,6 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, TimeZone, Utc};
-use chrono_tz::America::Los_Angeles;
 use log::warn;
 
 use crate::provider::FeedProbeState;
@@ -19,9 +19,6 @@ use crate::provider::FeedProbeState;
 pub const REDIS_FEED_PREFIX: &str = "vod2pod:feed:";
 pub const REDIS_FRESH_PREFIX: &str = "vod2pod:fresh:";
 pub const REDIS_QUOTA_BREAKER_PREFIX: &str = "vod2pod:quota_breaker:";
-/// Quota breaker key of the YouTube provider (the only one with a metered
-/// quota today).
-pub const YT_QUOTA_BREAKER_KEY: &str = "vod2pod:quota_breaker:youtube";
 pub const REDIS_QUOTA_USAGE_PREFIX: &str = "vod2pod:quota_used:";
 
 pub fn feed_key(canonical_id: &str) -> String {
@@ -30,85 +27,6 @@ pub fn feed_key(canonical_id: &str) -> String {
 
 pub fn fresh_key(canonical_id: &str) -> String {
     format!("{REDIS_FRESH_PREFIX}{canonical_id}")
-}
-
-/// FNV-1a 64 bit: tiny and stable across processes and releases. Only used
-/// for change detection (ETags), never for anything security related.
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in data {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// ETag of a feed body: unquoted hex of the FNV-1a 64 hash.
-pub fn etag_of(body: &str) -> String {
-    format!("{:016x}", fnv1a64(body.as_bytes()))
-}
-
-/// RFC 7232 `If-None-Match` matching against our unquoted-hex etag. Handles
-/// quoted values, weak validators (`W/`), comma separated lists and `*`.
-pub fn etag_matches(if_none_match: &str, etag: &str) -> bool {
-    if_none_match.split(',').any(|candidate| {
-        let candidate = candidate.trim();
-        if candidate == "*" {
-            return true;
-        }
-        let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
-        candidate.trim_matches('"') == etag
-    })
-}
-
-/// The moment YouTube's daily quota resets: midnight America/Los_Angeles.
-/// Pure function so tests can exercise it.
-pub fn next_quota_reset(now_utc: DateTime<Utc>) -> DateTime<Utc> {
-    let pt_now = now_utc.with_timezone(&Los_Angeles);
-    let next_day = pt_now.date_naive() + chrono::Duration::days(1);
-    let midnight = next_day
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight of any date exists");
-    match Los_Angeles.from_local_datetime(&midnight) {
-        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-            dt.with_timezone(&Utc)
-        }
-        // midnight is never skipped by US DST transitions; if that ever
-        // changes, fall back to a conservative fixed PST offset (resets early
-        // rather than late)
-        chrono::LocalResult::None => {
-            let approx = midnight - chrono::Duration::hours(8);
-            DateTime::<Utc>::from_naive_utc_and_offset(approx, Utc)
-        }
-    }
-}
-
-/// Whether the upstream error is YouTube quota exhaustion. Pure function so
-/// tests can exercise it.
-pub fn is_quota_exceeded(err: &eyre::Error) -> bool {
-    format!("{err:#}").contains("quotaExceeded")
-}
-
-/// RFC 7231 IMF-fixdate ("Sun, 21 Sep 2026 04:27:35 GMT") for a unix
-/// timestamp, used in `Last-Modified` responses. Pure function so tests can
-/// exercise it.
-pub fn http_date(epoch_secs: i64) -> String {
-    match DateTime::<Utc>::from_timestamp(epoch_secs, 0) {
-        Some(dt) => dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-        None => String::new(),
-    }
-}
-
-/// Whether an `If-Modified-Since` HTTP-date is at or after `epoch_secs`
-/// (meaning: the client already has this version, a 304 is appropriate).
-/// Unparseable dates are treated as "client has nothing" (serve 200).
-/// Pure function so tests can exercise it.
-pub fn http_date_at_or_after(if_modified_since: &str, epoch_secs: i64) -> bool {
-    // RFC 7231 IMF-fixdate always ends in a literal " GMT", which is UTC
-    match chrono::NaiveDateTime::parse_from_str(if_modified_since, "%a, %d %b %Y %H:%M:%S GMT") {
-        Ok(parsed) => parsed.and_utc().timestamp() >= epoch_secs,
-        Err(_) => false,
-    }
 }
 
 /// Current unix time in seconds.
@@ -296,122 +214,27 @@ pub async fn open_quota_breaker(
     Ok(())
 }
 
-/// Add `units` to the daily quota usage estimate (keyed by pacific-time date,
-/// like YouTube's reset) and return the running total. Best effort: a redis
-/// failure only loses the estimate, never the feed.
+/// Add `units` to the quota usage estimate bucket `day_key` (the
+/// provider-owned day this usage is counted on) and return the running
+/// total. Best effort: a redis failure only loses the estimate, never the
+/// feed.
 pub async fn bump_quota_usage(
     con: &mut redis::aio::MultiplexedConnection,
+    day_key: &str,
     units: u64,
 ) -> eyre::Result<i64> {
-    let day = Utc::now().with_timezone(&Los_Angeles).format("%F");
-    let key = format!("{REDIS_QUOTA_USAGE_PREFIX}{day}");
+    let key = format!("{REDIS_QUOTA_USAGE_PREFIX}{day_key}");
     let total: i64 = redis::cmd("INCRBY")
         .arg(&key)
         .arg(units as i64)
         .query_async(con)
         .await?;
     // keep the counter around for 48h so the running total survives a bit of
-    // clock skew around midnight pacific
+    // clock skew around the usage-day boundary
     redis::cmd("EXPIRE")
         .arg(&key)
         .arg(48 * 3600)
         .query_async::<()>(con)
         .await?;
     Ok(total)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_log::test;
-
-    #[test]
-    fn test_etag_of_is_deterministic_and_change_sensitive() {
-        let a = etag_of("<rss>feed v1</rss>");
-        assert_eq!(a, etag_of("<rss>feed v1</rss>"));
-        assert_ne!(a, etag_of("<rss>feed v2</rss>"));
-        assert_eq!(a.len(), 16);
-    }
-
-    #[test]
-    fn test_etag_matches_rfc7232_forms() {
-        let etag = etag_of("body");
-        assert!(etag_matches(&format!("\"{etag}\""), &etag));
-        assert!(etag_matches(&etag, &etag));
-        assert!(etag_matches(&format!("W/\"{etag}\""), &etag));
-        assert!(etag_matches(&format!("\"other\", \"{etag}\""), &etag));
-        assert!(etag_matches(&format!("\"other\" ,\"{etag}\" "), &etag));
-        assert!(etag_matches("*", &etag));
-        assert!(!etag_matches("\"other\"", &etag));
-        assert!(!etag_matches("", &etag));
-    }
-
-    #[test]
-    fn test_next_quota_reset_is_next_pacific_midnight() {
-        // 2026-09-21T04:27Z is 2026-09-20 21:27 PDT (UTC-7): reset is
-        // 2026-09-21 00:00 PDT == 07:00Z
-        let now = DateTime::parse_from_rfc3339("2026-09-21T04:27:35Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let expected = DateTime::parse_from_rfc3339("2026-09-21T07:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(next_quota_reset(now), expected);
-    }
-
-    #[test]
-    fn test_next_quota_reset_during_pst_winter() {
-        // 2026-01-15T08:00Z is exactly midnight PST (UTC-8): reset is the
-        // NEXT midnight, 2026-01-16 08:00Z
-        let now = DateTime::parse_from_rfc3339("2026-01-15T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let expected = DateTime::parse_from_rfc3339("2026-01-16T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(next_quota_reset(now), expected);
-    }
-
-    #[test]
-    fn test_next_quota_reset_day_before_dst_start() {
-        // DST starts 2026-03-08 at 02:00; midnight of 2026-03-08 is still PST
-        let now = DateTime::parse_from_rfc3339("2026-03-07T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let expected = DateTime::parse_from_rfc3339("2026-03-08T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(next_quota_reset(now), expected);
-    }
-
-    #[test]
-    fn test_is_quota_exceeded_matches_real_error_shape() {
-        let err = eyre::eyre!(
-            "Bad Request: {{\"error\":{{\"code\":403,\"errors\":[{{\"domain\":\"youtube.quota\",\"reason\":\"quotaExceeded\"}}]}}}}"
-        );
-        assert!(is_quota_exceeded(&err));
-
-        let wrapped = eyre::eyre!("Bad Request: quotaExceeded").wrap_err("could not generate feed");
-        assert!(is_quota_exceeded(&wrapped));
-
-        let other = eyre::eyre!("playlist not found");
-        assert!(!is_quota_exceeded(&other));
-    }
-
-    #[test]
-    fn test_http_date_roundtrip_and_comparison() {
-        let date = http_date(1_789_964_855);
-        assert_eq!(date, "Mon, 21 Sep 2026 04:27:35 GMT");
-        // a client whose copy is as new as ours gets a 304
-        assert!(http_date_at_or_after(&date, 1_789_964_855));
-        // a client with an older copy must get a 200
-        assert!(!http_date_at_or_after(&date, 1_789_964_856));
-        assert!(http_date_at_or_after(&date, 1_789_964_854));
-    }
-
-    #[test]
-    fn test_http_date_at_or_after_rejects_garbage() {
-        assert!(!http_date_at_or_after("not a date", 0));
-        assert!(!http_date_at_or_after("", 0));
-    }
 }

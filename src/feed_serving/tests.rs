@@ -16,8 +16,8 @@ use url::Url;
 use super::{
     FeedCacheStore, FeedServing, Freshness, RevalidationSpawner, RevalidationTask, ServingPolicy,
 };
-use crate::feed_cache::{next_quota_reset, CachedFeed};
-use crate::provider::{FeedProbeState, GeneratedFeed, MediaProvider};
+use crate::feed_cache::CachedFeed;
+use crate::provider::{FeedProbeState, GeneratedFeed, MediaProvider, QuotaExhausted};
 
 use super::memory::InMemoryCache;
 use super::Clock;
@@ -89,8 +89,8 @@ struct FakeProvider {
     counters: Arc<Counters>,
     conversion_delay: Duration,
     fail_conversions: bool,
-    /// Conversion failures carrying YouTube's quotaExceeded marker, so the
-    /// module's inherited string match classifies them as quota exhaustion.
+    /// Conversion failures carrying the typed `QuotaExhausted` case, so the
+    /// module classifies them as quota exhaustion by type.
     quota_exhausted_conversions: bool,
     /// Scripted probe answer: `Some(unchanged)` answers the probe, `None`
     /// reports the probe unsupported (revalidation then converts).
@@ -129,9 +129,9 @@ impl MediaProvider for FakeProvider {
         self.counters.conversions.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.conversion_delay).await;
         if self.quota_exhausted_conversions {
-            return Err(eyre::eyre!(
-                "Bad Request: {{\"error\":{{\"code\":403,\"errors\":[{{\"domain\":\"youtube.quota\",\"reason\":\"quotaExceeded\"}}]}}}}"
-            ));
+            return Err(eyre::Report::new(QuotaExhausted::new(eyre::eyre!(
+                "upstream rejected the call: quota spent"
+            ))));
         }
         if self.fail_conversions {
             return Err(eyre::eyre!("conversion failed"));
@@ -170,6 +170,17 @@ impl MediaProvider for FakeProvider {
 
     fn quota_breaker_key(&self) -> Option<String> {
         self.quota_breaker_key.clone()
+    }
+
+    fn next_quota_reset(&self, now_utc: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        // the fake's own reset policy: one hour after now
+        self.quota_breaker_key
+            .as_ref()
+            .map(|_| now_utc + chrono::Duration::hours(1))
+    }
+
+    fn quota_usage_day(&self, _now_utc: DateTime<Utc>) -> Option<String> {
+        Some("fake-usage-day".to_string())
     }
 
     async fn canonical_feed_id(&self, _channel_url: &Url) -> Option<String> {
@@ -1107,11 +1118,12 @@ async fn revalidation_quota_exhaustion_opens_the_breaker() {
     spawner.run_pending().await;
 
     // the quota exhaustion opened the breaker, holding until the provider's
-    // next reset after the fixed clock's now
+    // own reset answer (the fake's policy: one hour after the fixed clock's
+    // now)
     let now = DateTime::<Utc>::from_timestamp(clock.unix_now(), 0).unwrap();
     assert_eq!(
         cache.breaker_reset(FAKE_BREAKER_KEY).await,
-        Some(next_quota_reset(now).timestamp())
+        Some((now + chrono::Duration::hours(1)).timestamp())
     );
     // the background produced no Degraded Feed: there is no client to serve
     assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 0);
@@ -1361,11 +1373,12 @@ async fn quota_exhausted_conversion_opens_the_breaker_and_degrades() {
     assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
     assert!(served.degraded);
     assert_eq!(served.freshness, Freshness::FreshlyGenerated);
-    // the breaker opened for the provider, holding until its next reset
+    // the breaker opened for the provider, holding until its own reset
+    // answer (the fake's policy: one hour after now)
     let now = DateTime::<Utc>::from_timestamp(clock.unix_now(), 0).unwrap();
     assert_eq!(
         cache.breaker_reset(FAKE_BREAKER_KEY).await,
-        Some(next_quota_reset(now).timestamp())
+        Some((now + chrono::Duration::hours(1)).timestamp())
     );
 }
 

@@ -6,6 +6,7 @@ mod twitch;
 mod youtube;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use log::debug;
 use regex::Regex;
 use reqwest::Url;
@@ -55,6 +56,34 @@ pub struct GeneratedFeed {
     /// Estimated metered API units consumed producing this feed (~1 unit per
     /// API call for YouTube). `None` when the provider is not metered.
     pub quota_units: Option<u64>,
+}
+
+/// A Feed Conversion failed because the provider's metered quota is
+/// exhausted: further metered calls fail until the quota resets. The
+/// Degradation Ladder opens the Quota Breaker on this typed case instead of
+/// reading upstream error text; the upstream failure is preserved as the
+/// source for diagnosis.
+#[derive(Debug)]
+pub struct QuotaExhausted {
+    upstream: eyre::Report,
+}
+
+impl QuotaExhausted {
+    pub fn new(upstream: eyre::Report) -> Self {
+        Self { upstream }
+    }
+}
+
+impl std::fmt::Display for QuotaExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider quota exhausted: {}", self.upstream)
+    }
+}
+
+impl std::error::Error for QuotaExhausted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.upstream.as_ref())
+    }
 }
 
 /// Providers are shared across concurrent requests (the Feed Serving module
@@ -111,6 +140,24 @@ pub trait MediaProvider: Send + Sync {
     /// their conversions are never skipped and never fall back. The default
     /// reports "no quota".
     fn quota_breaker_key(&self) -> Option<String> {
+        None
+    }
+
+    /// When this provider's metered quota next resets, given the current
+    /// time: the Quota Breaker holds until then. `None` when the provider
+    /// has no metered quota. The default reports "no quota".
+    ///
+    /// Contract: a provider reporting a `quota_breaker_key` must answer this
+    /// too, otherwise the breaker can never be scheduled.
+    fn next_quota_reset(&self, _now_utc: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        None
+    }
+
+    /// The day bucket this provider's metered usage is currently counted on
+    /// (YouTube: the Pacific-time date, matching its midnight-Pacific
+    /// reset). `None` when the provider has no metered quota; its usage is
+    /// then not recorded. The default reports "no quota".
+    fn quota_usage_day(&self, _now_utc: DateTime<Utc>) -> Option<String> {
         None
     }
 

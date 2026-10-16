@@ -29,8 +29,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use url::Url;
 
 use crate::{
-    feed_cache::{is_quota_exceeded, next_quota_reset, CachedFeed},
-    provider::MediaProvider,
+    feed_cache::CachedFeed,
+    provider::{MediaProvider, QuotaExhausted},
 };
 
 /// Seconds of jitter added on top of the Fresh TTL so that many feeds polled
@@ -148,9 +148,10 @@ pub trait FeedCacheStore: Send + Sync {
         stale_window_secs: u64,
     ) -> eyre::Result<()>;
 
-    /// Record metered units a Feed Conversion consumed (best-effort usage
-    /// estimate; a failure only loses the estimate, never the feed).
-    async fn bump_quota_usage(&self, units: u64) -> eyre::Result<i64>;
+    /// Record metered units a Feed Conversion consumed, bucketed on the
+    /// provider-owned usage day `day_key` (best-effort usage estimate; a
+    /// failure only loses the estimate, never the feed).
+    async fn bump_quota_usage(&self, units: u64, day_key: &str) -> eyre::Result<i64>;
 
     /// Re-anchor freshness after a probe answered "unchanged": the fresh
     /// marker gets `fresh_ttl_secs` (which must not outlive the Fresh
@@ -529,9 +530,7 @@ impl FeedServing {
                         info!(
                             "feed {canonical_key} unchanged upstream, renewing freshness after probe"
                         );
-                        if let Err(e) = cache.bump_quota_usage(1).await {
-                            warn!("could not record quota usage estimate: {e}");
-                        }
+                        self.record_quota_usage(&*cache, &*provider, 1).await;
                         // the fresh marker must not outlive the Fresh Period
                         let remaining_fresh = (self.policy.max_fresh_period_secs as i64 - age)
                             .min(self.policy.fresh_ttl_secs as i64);
@@ -653,10 +652,7 @@ impl FeedServing {
         }
 
         if let Some(units) = generated.quota_units {
-            match cache.bump_quota_usage(units).await {
-                Ok(total) => info!("quota: ~{total} units consumed today (estimate)"),
-                Err(e) => warn!("could not record quota usage estimate: {e}"),
-            }
+            self.record_quota_usage(cache, provider, units).await;
         }
         debug!(
             "feed conversion for {canonical_key} took {} seconds",
@@ -696,23 +692,28 @@ impl FeedServing {
         }
     }
 
-    /// Open the provider's Quota Breaker (until its next reset — midnight
-    /// pacific for YouTube) when the error means the quota is exhausted, so
-    /// no request pays the failing-call cost until then. Returns whether the
-    /// error was classified as quota exhaustion (the inherited upstream
-    /// string match, retyped by the next ticket).
+    /// The module's current time as a `DateTime`, when the clock is sane.
+    fn now_utc(&self) -> Option<DateTime<Utc>> {
+        DateTime::<Utc>::from_timestamp(self.clock.unix_now(), 0)
+    }
+
+    /// Open the provider's Quota Breaker when the conversion failure carries the
+    /// typed `QuotaExhausted` case, holding until the reset time the provider
+    /// itself answers. No request pays the failing-call cost until then.
+    /// Returns whether the error was classified as quota exhaustion.
     async fn open_breaker_if_quota_exhausted(
         &self,
         cache: &dyn FeedCacheStore,
         provider: &dyn MediaProvider,
         err: &eyre::Error,
     ) -> bool {
-        if !is_quota_exceeded(err) {
+        if !err.chain().any(|cause| cause.is::<QuotaExhausted>()) {
             return false;
         }
         if let Some(key) = provider.quota_breaker_key() {
-            let reset =
-                DateTime::<Utc>::from_timestamp(self.clock.unix_now(), 0).map(next_quota_reset);
+            let reset = self
+                .now_utc()
+                .and_then(|now| provider.next_quota_reset(now));
             match reset {
                 Some(reset) => match cache.open_quota_breaker(&key, reset.timestamp()).await {
                     Ok(()) => warn!("quota breaker {key} open until {}", reset.to_rfc3339()),
@@ -724,6 +725,25 @@ impl FeedServing {
             }
         }
         true
+    }
+
+    /// Record metered units on the provider's usage day (best-effort
+    /// estimate; the provider owns the day bucket, the cache stores it).
+    async fn record_quota_usage(
+        &self,
+        cache: &dyn FeedCacheStore,
+        provider: &dyn MediaProvider,
+        units: u64,
+    ) {
+        let day = self.now_utc().and_then(|now| provider.quota_usage_day(now));
+        let Some(day) = day else {
+            debug!("provider reports no usage day, quota estimate not recorded");
+            return;
+        };
+        match cache.bump_quota_usage(units, &day).await {
+            Ok(total) => info!("quota: ~{total} units consumed today (estimate)"),
+            Err(e) => warn!("could not record quota usage estimate: {e}"),
+        }
     }
 
     /// The Degraded Feed rung: produce a feed without consuming metered

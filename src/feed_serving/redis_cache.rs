@@ -52,9 +52,9 @@ impl FeedCacheStore for RedisFeedCache {
         .await
     }
 
-    async fn bump_quota_usage(&self, units: u64) -> eyre::Result<i64> {
+    async fn bump_quota_usage(&self, units: u64, day_key: &str) -> eyre::Result<i64> {
         let mut con = self.con.clone();
-        crate::feed_cache::bump_quota_usage(&mut con, units).await
+        crate::feed_cache::bump_quota_usage(&mut con, day_key, units).await
     }
 
     async fn renew_freshness(

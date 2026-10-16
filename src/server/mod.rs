@@ -10,12 +10,13 @@ use url::Url;
 
 use crate::{
     configs::{conf, conf_u64, Conf, ConfName},
-    feed_cache,
     feed_serving::{self, FeedServing, ServedFeed, ServingPolicy},
     provider::{self, MediaProvider},
     rss_transcodizer,
     transcoder::{FfmpegParameters, Transcoder},
 };
+
+mod headers;
 
 pub fn spawn_server(listener: TcpListener) -> eyre::Result<Server> {
     let root = conf().get(ConfName::SubfolderPath).unwrap();
@@ -223,20 +224,20 @@ fn conditional_response(
     generated_at: i64,
     max_age_secs: i64,
 ) -> HttpResponse {
-    let etag = feed_cache::etag_of(&body);
+    let etag = headers::etag_of(&body);
     let cache_control = format!("public, max-age={max_age_secs}");
 
     // RFC 7232: If-None-Match takes precedence over If-Modified-Since
     let client_has_current = headers
         .get(http::header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        .map(|if_none_match| feed_cache::etag_matches(if_none_match, &etag))
+        .map(|if_none_match| headers::etag_matches(if_none_match, &etag))
         .unwrap_or_else(|| {
             headers
                 .get(http::header::IF_MODIFIED_SINCE)
                 .and_then(|value| value.to_str().ok())
                 .map(|if_modified_since| {
-                    feed_cache::http_date_at_or_after(if_modified_since, generated_at)
+                    headers::http_date_at_or_after(if_modified_since, generated_at)
                 })
                 .unwrap_or(false)
         });
@@ -255,7 +256,7 @@ fn conditional_response(
         .insert_header((http::header::CACHE_CONTROL, cache_control))
         .insert_header((
             http::header::LAST_MODIFIED,
-            feed_cache::http_date(generated_at),
+            headers::http_date(generated_at),
         ))
         .body(body)
 }
@@ -477,15 +478,15 @@ mod tests {
     #[test]
     fn test_conditional_response_serves_304_on_if_none_match() {
         let body = "<rss>feed body</rss>";
-        let etag = feed_cache::etag_of(body);
+        let etag = headers::etag_of(body);
 
-        let mut headers = http::header::HeaderMap::new();
-        headers.insert(
+        let mut req_headers = http::header::HeaderMap::new();
+        req_headers.insert(
             http::header::IF_NONE_MATCH,
             http::header::HeaderValue::from_str(&format!("\"{etag}\"")).unwrap(),
         );
 
-        let response = conditional_response(&headers, body.to_string(), 1_758_424_055, 3600);
+        let response = conditional_response(&req_headers, body.to_string(), 1_758_424_055, 3600);
 
         assert_eq!(response.status(), http::StatusCode::NOT_MODIFIED);
         assert_eq!(
@@ -521,14 +522,14 @@ mod tests {
                 .headers()
                 .get(http::header::ETAG)
                 .and_then(|v| v.to_str().ok()),
-            Some(format!("\"{}\"", feed_cache::etag_of(body)).as_str())
+            Some(format!("\"{}\"", headers::etag_of(body)).as_str())
         );
         assert_eq!(
             response
                 .headers()
                 .get(http::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok()),
-            Some(feed_cache::http_date(1_758_424_055).as_str())
+            Some(headers::http_date(1_758_424_055).as_str())
         );
     }
 
@@ -536,14 +537,14 @@ mod tests {
     fn test_conditional_response_304_on_if_modified_since() {
         let generated_at = 1_758_424_055;
 
-        let mut headers = http::header::HeaderMap::new();
-        headers.insert(
+        let mut req_headers = http::header::HeaderMap::new();
+        req_headers.insert(
             http::header::IF_MODIFIED_SINCE,
-            http::header::HeaderValue::from_str(&feed_cache::http_date(generated_at)).unwrap(),
+            http::header::HeaderValue::from_str(&headers::http_date(generated_at)).unwrap(),
         );
 
         let response = conditional_response(
-            &headers,
+            &req_headers,
             "<rss>feed body</rss>".to_string(),
             generated_at,
             3600,
@@ -565,7 +566,7 @@ mod tests {
         );
         headers.insert(
             http::header::IF_MODIFIED_SINCE,
-            http::header::HeaderValue::from_str(&feed_cache::http_date(generated_at)).unwrap(),
+            http::header::HeaderValue::from_str(&headers::http_date(generated_at)).unwrap(),
         );
 
         let response = conditional_response(

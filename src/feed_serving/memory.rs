@@ -86,7 +86,7 @@ impl FeedCacheStore for InMemoryCache {
         Ok(())
     }
 
-    async fn bump_quota_usage(&self, units: u64) -> eyre::Result<i64> {
+    async fn bump_quota_usage(&self, units: u64, _day_key: &str) -> eyre::Result<i64> {
         let mut total = self.quota_usage.lock().unwrap();
         *total += units as i64;
         Ok(*total)

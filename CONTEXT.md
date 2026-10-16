@@ -78,6 +78,12 @@ disagree, one of them is wrong — fix it before moving on.
 - **Quota Breaker**: a shared, persistent flag that records "provider quota is
   known to be exhausted until time T". While open, no metered API call is
   attempted at all; requests fall through the Degradation Ladder instead.
+- **Quota exhaustion (typed)**: a Feed Conversion failure the provider itself
+  classifies and reports as a typed case. The ladder opens the Quota Breaker
+  on this case by type, never by reading upstream error text.
+- **Usage day**: the provider-owned day bucket metered usage is counted on
+  (for YouTube: the Pacific-time date, matching its reset). The cache stores
+  opaque buckets.
 - **Degradation Ladder**: the fixed order of attempts when serving a Feed:
   Fresh cache → Stale cache → Feed Conversion → Degraded Feed → error. The
   Degraded rung applies when the Feed Conversion fails — quota exhaustion
