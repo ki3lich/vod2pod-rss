@@ -1,9 +1,10 @@
+mod stdout_pump;
+
+use self::stdout_pump::{spawn_pump_threads, ChannelBytes};
 use std::error::Error;
-use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::process::Command;
 use std::process::Stdio;
-use std::thread::sleep;
 use std::time::Duration;
 
 /// Guard to ensure child process is waited on when dropped
@@ -32,8 +33,7 @@ impl DerefMut for ChildGuard {
 use actix_web::web::Bytes;
 use futures::Future;
 use genawaiter::sync::{Co, Gen};
-use log::info;
-use log::{debug, error, warn};
+use log::{debug, info, warn};
 use reqwest::Url;
 use serde::Serialize;
 use tokio::sync::mpsc::channel;
@@ -110,163 +110,6 @@ async fn preflight_stream_reachable(url: &Url, connect_timeout: Duration) -> eyr
     })
     .await;
     interpret_preflight_connect(outcome)
-}
-
-/// One item yielded to the client: a chunk of transcoded audio, or the error
-/// that ends the transfer.
-type ChannelBytes = Result<Bytes, std::io::Error>;
-
-/// Consecutive `Interrupted` reads tolerated on the transcoded stdout before
-/// the transfer is failed. The budget is per *consecutive* streak: any
-/// successful read restarts it (see [`pump_ffmpeg_stdout`]), so transient
-/// interruptions spread across a long transcode never accumulate into a
-/// failure — only a sustained outage exhausts it.
-const MAX_CONSECUTIVE_READ_INTERRUPTS: u32 = 10;
-
-/// How long to wait before retrying an `Interrupted` stdout read.
-const READ_INTERRUPT_BACKOFF: Duration = Duration::from_secs(1);
-
-/// Forward ffmpeg's transcoded stdout to the client channel.
-///
-/// Runs on its own thread (blocking reads): reads `out` in chunks and
-/// `blocking_send`s each chunk to the client, enforcing `expected_bytes_count`
-/// — truncating ffmpeg's overproduction, padding small undershoots with NUL
-/// bytes, and failing the transfer when the input dies far short of the
-/// declared length (the shortfall threshold in the body).
-///
-/// A read failing with `ErrorKind::Interrupted` (a signal arrived mid-syscall)
-/// is retried after `interrupt_backoff`. The retry budget is consecutive:
-/// `streak` counts interruptions since the last successful read and any
-/// successful read resets it, so isolated transient interruptions across a
-/// long transcode never exhaust it — only a sustained outage does.
-fn pump_ffmpeg_stdout<R: Read>(
-    mut out: R,
-    mut child: ChildGuard,
-    tx_stdout: Sender<ChannelBytes>,
-    expected_bytes_count: usize,
-    interrupt_backoff: Duration,
-) {
-    const BUFFER_SIZE: usize = 16384;
-    let mut buff: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-    let mut streak: u32 = 0;
-    let mut sent_bytes_count: usize = 0;
-    loop {
-        match out.read(&mut buff) {
-            Ok(read_bytes) => {
-                // Any successful read restarts the interruption budget: only
-                // *consecutive* interruptions may exhaust it, so isolated
-                // transient interruptions across a long transcode can never
-                // accumulate into a failure.
-                streak = 0;
-
-                if sent_bytes_count + read_bytes > expected_bytes_count {
-                    //partial request is fulfilled we only need to send the remaining data
-                    let bytes_remaining = expected_bytes_count - sent_bytes_count;
-                    _ = tx_stdout
-                        .blocking_send(Ok(Bytes::copy_from_slice(&buff[..bytes_remaining])));
-                    info!("transcoded everything in partial request");
-                    _ = child.kill();
-                    _ = child.wait();
-                    break;
-                }
-
-                if read_bytes == 0 {
-                    // An input that dies early is indistinguishable from a
-                    // finished one at the stdout level: both close the pipe,
-                    // and ffmpeg exits 0 with an empty stderr. Only the byte
-                    // shortfall tells them apart. Within MAX_OK_SHORTFALL_RATIO
-                    // the EOF is a finished, slightly-shorter-than-declared
-                    // stream (encoder overhead, duration rounding — a
-                    // fraction of a percent in production) and keeps the
-                    // historical padding; beyond it the upstream ended
-                    // prematurely, and padding would yield a full-length 200
-                    // of mostly NUL bytes that podcatchers cache and then
-                    // fail to play — fail the stream instead so the client
-                    // sees a broken transfer and retries later. Tail ranges
-                    // mapping past the real end of a shorter-than-declared
-                    // stream land on the same error path on purpose: a
-                    // broken transfer beats cached zeros. See
-                    // `transcode_stream_errors_when_input_ends_far_short_of_expected`
-                    // for the incident that motivated the threshold.
-                    const MAX_OK_SHORTFALL_RATIO: f64 = 0.1;
-                    let shortfall = expected_bytes_count - sent_bytes_count;
-                    if shortfall as f64 > expected_bytes_count as f64 * MAX_OK_SHORTFALL_RATIO {
-                        error!(
-                            "input stream ended after {sent_bytes_count} of {expected_bytes_count} expected bytes; not padding the shortfall"
-                        );
-                        _ = tx_stdout.blocking_send(Err(std::io::Error::other(format!(
-                            "media stream ended prematurely: got {sent_bytes_count} of {expected_bytes_count} bytes"
-                        ))));
-                        _ = child.wait();
-                        break;
-                    }
-                    info!("transcoded everything");
-                    //pad end of stream with 00000000 bytes if client expects more data to be sent
-                    const NULL_BUFF: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-                    debug!(
-                        "sending {} bytes of padding",
-                        expected_bytes_count - sent_bytes_count
-                    );
-                    while sent_bytes_count < expected_bytes_count {
-                        let padding_bytes = expected_bytes_count - sent_bytes_count;
-                        if padding_bytes >= BUFFER_SIZE {
-                            _ = tx_stdout.blocking_send(Ok(Bytes::copy_from_slice(&NULL_BUFF)));
-                            sent_bytes_count += BUFFER_SIZE;
-                        } else {
-                            _ = tx_stdout.blocking_send(Ok(Bytes::copy_from_slice(
-                                &NULL_BUFF[..padding_bytes],
-                            )));
-                            sent_bytes_count += padding_bytes;
-                        }
-                    }
-                    _ = child.wait();
-                    break;
-                }
-
-                let send_res =
-                    tx_stdout.blocking_send(Ok(Bytes::copy_from_slice(&buff[..read_bytes])));
-
-                if let Err(e) = send_res {
-                    debug!("{}", e);
-                    info!("connection to client dropped, stopping transcode");
-                    _ = child.kill();
-                    _ = child.wait();
-                    break;
-                };
-                sent_bytes_count += read_bytes;
-            }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::Interrupted => {
-                    if streak >= MAX_CONSECUTIVE_READ_INTERRUPTS {
-                        error!("read was interrupted too many times");
-                        fail_transfer(&tx_stdout, &mut child, e);
-                        break;
-                    }
-                    warn!("read was interrupted, retrying in {interrupt_backoff:?}");
-                    sleep(interrupt_backoff);
-                    streak += 1;
-                }
-                _ => {
-                    // Fatal like an exhausted budget: the terminating error is
-                    // out; reading on could only produce items after it.
-                    fail_transfer(&tx_stdout, &mut child, e);
-                    break;
-                }
-            },
-        }
-    }
-}
-
-/// Surface `e` to the client as the transfer's terminating error, then stop
-/// ffmpeg and the pump: the transfer is over, and reading on could only
-/// produce items after the error the client already saw.
-fn fail_transfer(tx_stdout: &Sender<ChannelBytes>, child: &mut ChildGuard, e: std::io::Error) {
-    if let Err(err) = tx_stdout.blocking_send(Err(e)) {
-        error!("unexpected error occurred:");
-        error!("{}", err);
-    }
-    _ = child.kill();
-    _ = child.wait();
 }
 
 impl Transcoder {
@@ -388,46 +231,16 @@ impl Transcoder {
                     .expect("failed to run commnad"),
             );
 
-            let mut err = child.stderr.take().expect("failed to open stderr");
-            let out = child.stdout.take().expect("failed to open stdout");
+            let stderr = child.stderr.take().expect("failed to open stderr");
+            let stdout = child.stdout.take().expect("failed to open stdout");
 
             let channel_size: usize = 100;
             let (tx, mut rx): (Sender<ChannelBytes>, Receiver<ChannelBytes>) =
                 channel(channel_size);
 
-            let tx_stdout = tx.clone();
-            let tx_stderr = tx;
-
-            //stderr thread
-            std::thread::spawn(move || loop {
-                let mut buf = String::new();
-                match err.read_to_string(&mut buf) {
-                    Ok(0) => {
-                        debug!("ffmpeg stderr closed");
-                        break;
-                    }
-                    Ok(_) => {
-                        error!("{}", buf);
-                        let _ = tx_stderr.blocking_send(Err(std::io::Error::other(buf)));
-                    }
-                    Err(e) => {
-                        error!("failed to read from stderr: {}", e);
-                        let _ = tx_stderr.blocking_send(Err(std::io::Error::other(e)));
-                        break;
-                    }
-                }
-            });
-
-            //stdout thread
-            std::thread::spawn(move || {
-                pump_ffmpeg_stdout(
-                    out,
-                    child,
-                    tx_stdout,
-                    expected_bytes_count,
-                    READ_INTERRUPT_BACKOFF,
-                )
-            });
+            // Both pump threads are thin executors of the decision functions
+            // in `stdout_pump`.
+            spawn_pump_threads(child, stdout, stderr, tx, expected_bytes_count);
 
             info!("streaming to client");
             while let Some(x) = rx.recv().await {
@@ -767,114 +580,6 @@ mod test {
         );
         assert_eq!(ok_bytes, expected_bytes_count);
     }
-
-    /// A byte source whose read outcomes are scripted in advance, so the
-    /// stdout pump can be driven through interruption/success sequences
-    /// deterministically — no signals, no pipes, no real ffmpeg.
-    struct ScriptedSource {
-        steps: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
-    }
-
-    impl Read for ScriptedSource {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            match self.steps.pop_front() {
-                Some(Ok(data)) => {
-                    let n = data.len().min(buf.len());
-                    buf[..n].copy_from_slice(&data[..n]);
-                    Ok(n)
-                }
-                Some(Err(e)) => Err(e),
-                // Script exhausted: the source is done.
-                None => Ok(0),
-            }
-        }
-    }
-
-    fn interrupted() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "synthetic read interruption",
-        )
-    }
-
-    #[test]
-    fn interruptions_interleaved_with_reads_do_not_exhaust_retry_budget() {
-        // The retry budget is consecutive, not cumulative: any successful read
-        // restarts it, so a long transcode survives arbitrarily many isolated
-        // interruptions. A counter that never resets treats each interruption
-        // as draining one shared lifetime budget, and enough of them over a
-        // long transcode kill an otherwise healthy stream.
-        const CHUNK_LEN: usize = 100;
-        // Far more interruptions than the budget tolerates in a row.
-        const INTERLEAVED_INTERRUPTIONS: usize = 15;
-        let mut steps = std::collections::VecDeque::new();
-        for _ in 0..INTERLEAVED_INTERRUPTIONS {
-            steps.push_back(Err(interrupted()));
-            steps.push_back(Ok(vec![0xAA; CHUNK_LEN]));
-        }
-        steps.push_back(Ok(Vec::new())); // clean EOF
-        let expected_bytes_count = INTERLEAVED_INTERRUPTIONS * CHUNK_LEN;
-
-        let (tx, mut rx) = channel(100);
-        let child = ChildGuard(Command::new("true").spawn().unwrap());
-        std::thread::spawn(move || {
-            pump_ffmpeg_stdout(
-                ScriptedSource { steps },
-                child,
-                tx,
-                expected_bytes_count,
-                Duration::ZERO,
-            );
-        });
-
-        // Mirror the real consumer: stop at the first error — that is where
-        // a budget exhaustion would end the transfer.
-        let mut received = 0usize;
-        let mut stream_err = None;
-        while let Some(item) = rx.blocking_recv() {
-            match item {
-                Ok(bytes) => received += bytes.len(),
-                Err(e) => {
-                    stream_err = Some(e);
-                    break;
-                }
-            }
-        }
-
-        assert!(
-            stream_err.is_none(),
-            "stream failed under interruptions interleaved with successful reads: {stream_err:?}"
-        );
-        assert_eq!(
-            received, expected_bytes_count,
-            "stream was cut short by interruptions"
-        );
-    }
-
-    #[test]
-    fn consecutive_interruptions_beyond_retry_budget_fail_the_stream() {
-        // The other half of the contract: a sustained outage — interruptions
-        // back to back, never a successful read in between — must still fail
-        // the transfer instead of retrying forever. The reset-on-success
-        // repair must not turn the budget into a no-op.
-        // One interruption beyond the tolerated streak exhausts the budget.
-        let steps: std::collections::VecDeque<_> = (0..MAX_CONSECUTIVE_READ_INTERRUPTS + 1)
-            .map(|_| Err(interrupted()))
-            .collect();
-
-        let (tx, mut rx) = channel(100);
-        let child = ChildGuard(Command::new("true").spawn().unwrap());
-        std::thread::spawn(move || {
-            pump_ffmpeg_stdout(ScriptedSource { steps }, child, tx, 1000, Duration::ZERO);
-        });
-
-        match rx.blocking_recv().expect("stream ended without any item") {
-            Ok(_) => panic!("stream delivered data through a sustained interruption outage"),
-            Err(e) => info!("stream failed as expected: {e}"),
-        }
-        assert!(
-            rx.blocking_recv().is_none(),
-            "pump kept producing after failing the transfer"
-        );
-    }
 }
+
+
