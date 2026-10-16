@@ -8,10 +8,6 @@ services:
     #(is normal to se this conteiner as stopped soon after deploy)
       # Set your YouTube API key
       - YT_API_KEY=${YT_API_KEY:-}
-      # Set your Twitch secret
-      - TWITCH_SECRET=${TWITCH_SECRET:-}
-      # Set your Twitch client ID
-      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID:-}
 
   vod2pod:
     extends: api_keys

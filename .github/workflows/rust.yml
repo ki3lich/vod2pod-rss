@@ -10,8 +10,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   YT_API_KEY: ${{ secrets.YT_API_KEY }}
-  TWITCH_SECRET: ${{ secrets.TWITCH_SECRET }}
-  TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
 
 jobs:
   check-secret:
@@ -23,7 +21,7 @@ jobs:
         id: my-key-check
         shell: bash
         run: |
-          if [ "${{ secrets.TWITCH_CLIENT_ID }}" != '' ]; then
+          if [ "${{ secrets.YT_API_KEY }}" != '' ]; then
             echo "defined=true" >> $GITHUB_OUTPUT;
           else
             echo "defined=false" >> $GITHUB_OUTPUT;

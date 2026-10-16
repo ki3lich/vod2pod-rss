@@ -3,7 +3,6 @@ mod generic;
 #[macro_use]
 mod macros;
 mod peertube;
-mod twitch;
 mod youtube;
 mod yt_dlp;
 
@@ -17,8 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::configs::ConfName;
 use crate::provider::{
-    generic::GenericProvider, peertube::PeerTubeProvider, twitch::TwitchProvider,
-    youtube::YoutubeProvider,
+    generic::GenericProvider, peertube::PeerTubeProvider, youtube::YoutubeProvider,
 };
 
 // to add a new provider just add it here (the provider should implement the MediaProvider trait)
@@ -28,7 +26,6 @@ generate_static_dispatcher!(
     Provider
     for
     YoutubeProvider,
-    TwitchProvider,
     PeerTubeProvider
     ; fallback GenericProvider,
 );
@@ -369,7 +366,8 @@ mod dispatch_warning_tests {
     #[test]
     fn host_match_ignores_scheme_path_and_port() {
         let youtube = Regex::new(r"^(https://)?youtube\.com/").unwrap();
-        let twitch = Regex::new(r"^https?://(.*\.)?twitch\.tv/").unwrap();
+        let youtube_subdomain = Regex::new(r"^(https://)?.*\.youtube\.com/").unwrap();
+        let optional_subdomain = Regex::new(r"^https?://(.*\.)?example\.com/").unwrap();
 
         // the scheme the regex anchors on is not the scheme the url carries
         assert!(host_matches_domain(
@@ -382,8 +380,14 @@ mod dispatch_warning_tests {
             &Url::parse("http://youtube.com:8443/watch?v=x").unwrap()
         ));
         assert!(host_matches_domain(
-            &twitch,
-            &Url::parse("http://twitch.tv/somechannel").unwrap()
+            &youtube_subdomain,
+            &Url::parse("http://www.youtube.com/somechannel").unwrap()
+        ));
+        // a whitelist regex may make its subdomain group optional; a bare
+        // host must still host-match it
+        assert!(host_matches_domain(
+            &optional_subdomain,
+            &Url::parse("http://example.com/feed").unwrap()
         ));
         // a host merely containing the domain is not owned by it
         assert!(!host_matches_domain(

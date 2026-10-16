@@ -106,37 +106,6 @@ async fn fetch_yt_feed_by_playlist_url_ok_requires_api_key() {
     }
 }
 
-#[actix_rt::test]
-async fn fetch_twitch_feed_by_channel_url_ok_requires_api_key() {
-    let address = spawn_app();
-    let client = reqwest::Client::new();
-
-    let response = client
-        .get(format!("{}/transcodize_rss", address))
-        .query(&[("url", "https://www.twitch.tv/twitch")])
-        .send()
-        .await
-        .expect("Failed to execute request.");
-
-    println!("status: {:?}", response.status());
-
-    if !response.status().is_success() {
-        println!("response body: {:?}", response.text().await);
-        panic!("response status is not success");
-    }
-
-    let raw_rss_body = response.text().await.expect("failed to get response text");
-    let feed = rss::Channel::read_from(raw_rss_body.as_bytes()).expect("failed to parse feed");
-    println!("{:?}", feed);
-    assert!(!feed.items.is_empty());
-    assert!(feed.image().is_some());
-    for item in feed.items() {
-        assert!(item.link().is_some());
-        assert!(item.itunes_ext().is_some());
-        assert!(item.itunes_ext().unwrap().image().is_some());
-    }
-}
-
 fn check_youtube_feed(feed: Channel) {
     assert_eq!("Mattia Di Eleuterio", feed.title());
     assert_eq!(

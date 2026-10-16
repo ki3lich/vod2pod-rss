@@ -42,8 +42,6 @@ pub enum ConfName {
     YoutubeApiKey,
     YoutubeMaxResults,
     YoutubeFilterShorts,
-    TwitchClientId,
-    TwitchSecretKey,
     TranscodingEnabled,
     SubfolderPath,
     ValidUrlDomains,
@@ -84,24 +82,6 @@ impl Conf for EnvConf {
             ConfName::Mp3Bitrate => {
                 Ok(std::env::var("MP3_BITRATE").unwrap_or_else(|_| "192".to_string()))
             }
-            ConfName::TwitchClientId => std::env::var("TWITCH_CLIENT_ID")
-                .map_err(|e| eyre::eyre!(e))
-                .and_then(|s| {
-                    if s.is_empty() {
-                        Err(eyre::eyre!("no TwitchClientId api key"))
-                    } else {
-                        Ok(s)
-                    }
-                }),
-            ConfName::TwitchSecretKey => std::env::var("TWITCH_SECRET")
-                .map_err(|e| eyre::eyre!(e))
-                .and_then(|s| {
-                    if s.is_empty() {
-                        Err(eyre::eyre!("no TwitchSecretKey api key"))
-                    } else {
-                        Ok(s)
-                    }
-                }),
             ConfName::YoutubeApiKey => std::env::var("YT_API_KEY")
                 .map_err(|e| eyre::eyre!(e))
                 .and_then(|s| {

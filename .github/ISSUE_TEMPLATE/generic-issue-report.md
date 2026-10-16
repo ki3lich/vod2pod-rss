@@ -9,7 +9,6 @@ assignees: ''
 
 app version: X.X.X
 
-- [ ] twitch api key set
 - [ ] youtube api key set
 
 ______

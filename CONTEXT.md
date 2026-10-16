@@ -13,7 +13,7 @@ disagree, one of them is wrong — fix it before moving on.
 - **Feed Conversion**: the act of producing a Feed from a Source URL by talking
   to the upstream provider (e.g. the YouTube Data API). Costs metered provider
   resources (for YouTube: API quota units).
-- **Provider**: the per-platform strategy (YouTube, Twitch, PeerTube, Generic)
+- **Provider**: the per-platform strategy (YouTube, PeerTube, Generic)
   that knows how to convert Source URLs of its platform.
 - **Transcoding**: converting a source media stream to a podcatcher-friendly
   audio stream on demand. Independent of Feed Conversion.
@@ -103,7 +103,7 @@ disagree, one of them is wrong — fix it before moving on.
   is the body's clean end, and the received count is the truth.
 - **Direct Media Source**: a provider whose resolved Stream URL is the media
   bytes themselves (YouTube's googlevideo URL) — the only kind a Source
-  Stage can fetch. Manifest-based providers (Twitch HLS, PeerTube's
+  Stage can fetch. Manifest-based providers (PeerTube's
   streaming playlists) resolve to playlists and are never staged, whatever
   the kill switch says; the provider declares this (`streams_direct_media`).
 - **Staging Kill Switch**: the `STAGE_SOURCES` config, default on — staged

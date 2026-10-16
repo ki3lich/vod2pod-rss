@@ -220,7 +220,7 @@ impl ProviderStreamUrlResolver {
 
     /// Whether this resolver stages its sources: the kill switch open *and*
     /// a provider whose Stream URL is a direct media source — a
-    /// manifest-based source (Twitch HLS, PeerTube playlists) can never be
+    /// manifest-based source (PeerTube playlists) can never be
     /// routed into staging, whatever the switch says. The one predicate both
     /// [`Self::check_stage`] (which stage runs) and [`Self::stage_gate`]
     /// (whether a slot is held) decide on.
@@ -327,7 +327,8 @@ mod test {
     /// Provider fake scripting `get_stream_url` answers in order and
     /// recording evictions — the cached yt-dlp rung without yt-dlp or Redis.
     /// `direct_media` is the provider's staging declaration: YouTube-like
-    /// (googlevideo bytes) when true, manifest-based (Twitch HLS) when false.
+    /// (googlevideo bytes) when true, manifest-based (PeerTube playlists)
+    /// when false.
     struct ScriptedProvider {
         resolutions: Mutex<Vec<eyre::Result<Url>>>,
         direct_media: bool,
@@ -340,8 +341,8 @@ mod test {
             Self::with_direct_media(resolutions, true)
         }
 
-        /// A manifest-based (Twitch-like) provider fake: its resolved URL is
-        /// a playlist, never stageable bytes.
+        /// A manifest-based (PeerTube-like) provider fake: its resolved URL
+        /// is a playlist, never stageable bytes.
         fn manifest(resolutions: Vec<eyre::Result<Url>>) -> (Self, Arc<ProviderLog>) {
             Self::with_direct_media(resolutions, false)
         }
@@ -567,12 +568,12 @@ mod test {
 
     #[tokio::test]
     async fn manifest_provider_never_routes_to_staging_regardless_of_switch() {
-        // A manifest-based provider (Twitch HLS) resolves to a playlist, not
+        // A manifest-based provider (PeerTube) resolves to a playlist, not
         // bytes — the pipeline must keep it on the legacy path even with the
         // kill switch on. The staging stage is scripted empty, so the test
         // panics if the pipeline even consults it.
-        let media = Url::parse("https://www.twitch.tv/videos/123456").unwrap();
-        let resolved = Url::parse("https://vod-secure.twitch.tv/manifest.m3u8").unwrap();
+        let media = Url::parse("https://framatube.org/videos/watch/abc123").unwrap();
+        let resolved = Url::parse("https://framatube.org/static/hls/abc.m3u8").unwrap();
         let (provider, log) = ScriptedProvider::manifest(vec![Ok(resolved.clone())]);
         let preflight = Arc::new(ScriptedCheck::new(vec![Ok(None)]));
         let stager = Arc::new(ScriptedCheck::new(Vec::new()));

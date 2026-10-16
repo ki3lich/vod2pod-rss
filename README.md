@@ -1,6 +1,6 @@
 # vod2pod-rss [![tests](https://github.com/madiele/vod2pod-rss/actions/workflows/rust.yml/badge.svg)](https://github.com/madiele/vod2pod-rss/actions/workflows/rust.yml) [![stable image](https://github.com/madiele/vod2pod-rss/actions/workflows/docker-image.yml/badge.svg?branch=stable)](https://github.com/madiele/vod2pod-rss/actions/workflows/docker-image.yml) [![beta image](https://github.com/madiele/vod2pod-rss/actions/workflows/docker-image-beta.yml/badge.svg)](https://github.com/madiele/vod2pod-rss/actions/workflows/docker-image-beta.yml)
 
-Converts a YouTube or Twitch channel into a full blown audio podcast feed.
+Converts a YouTube or PeerTube channel into a full blown audio podcast feed.
 
 <a label="example of it working with podcast addict" href="https://user-images.githubusercontent.com/4585690/231301791-2f838fb3-4f6e-4382-bac4-c968bfe98c08.png"><img src="https://user-images.githubusercontent.com/4585690/231301791-2f838fb3-4f6e-4382-bac4-c968bfe98c08.png" align="right" height="350" ></a>
 
@@ -23,9 +23,8 @@ Converts a YouTube or Twitch channel into a full blown audio podcast feed.
   - In the web page that opens paste the channel you want to convert to podcast and copy the generated link.
 - Optionally goto : http://myserver.com/transcodize_rss?url=channel_url
   - An RSS will be generated.
-  - Replace `channel_url` with the URL of the YouTube or Twitch channel you want to convert into a podcast.
+  - Replace `channel_url` with the URL of the YouTube channel you want to convert into a podcast.
     - YouTube: `http://myserver.com/transcodize_rss?url=https://www.youtube.com/c/channelname`
-    - Twitch: `http://myserver.com/transcodize_rss?url=https://www.twitch.tv/channelname`
     - RSS/atom feed: `http://myserver.com/transcodize_rss?url=https://feeds.simplecast.com/aU_RzZ7j`
       - Add the domain to the whitelist. See configurations [below](#configurations)
 
@@ -33,7 +32,6 @@ Converts a YouTube or Twitch channel into a full blown audio podcast feed.
 - find a tutorial on how to add an rss feed to your favorite podcast app
 
 # Optional API Access
-- Twitch: Get your SECRET and CLIENT ID <https://dev.twitch.tv/console>
 - YouTube: Enable more than 15 items in the RSS feed, channel avatar
   - API key <https://developers.google.com/youtube/v3/getting-started>
   - Enable API Access <https://console.cloud.google.com/>
@@ -84,8 +82,6 @@ To switch open the compose docker-compose.yml and edit the vod2pod image section
 ### Optional API Keys
 - `YT_API_KEY`: Set your YouTube API key (works without but the feed is limited to 15)
   - e.g. YT_API_KEY=AIzaSyBTCCEOHm
-- `TWITCH_SECRET`: Set your Twitch secret
-- `TWITCH_CLIENT_ID`: Set your Twitch client ID
 
 Note: These can also be set using Docker [.env files](https://docs.docker.com/compose/environment-variables/env-file/) 
 
@@ -109,7 +105,7 @@ Note: These can also be set using Docker [.env files](https://docs.docker.com/co
 - `TRANSCODE`: Set to "false" to disable transcoding, usefull if you only need the feeds (default: "true")
 - `MP3_BITRATE`: Set the bitrate of the trascoded stream to your client (default: "192")
 - `SUBFOLDER`: Set the the root path of the app, useful for reverse proxies (default: "/")
-- `VALID_URL_DOMAINS`: (optional) Set a comma separated list of domain urls that are allowed to be converted into RSS  (defaults to YouTube and Twitch urls)
+- `VALID_URL_DOMAINS`: (optional) Set a comma separated list of extra domain urls the Generic Provider may convert into RSS, on top of the domains of the built-in providers (YouTube, PeerTube); by default no extra domain is allowed
 - `CACHE_TTL`: (optional) Set the time to live of the cache in seconds, default is 3600 seconds (1 hour)
 - `STALE_MAX_AGE`: (optional) The Stale Window: how long a cached feed keeps being served when the provider cannot be reached (e.g. YouTube quota exhausted), in seconds. Default is 604800 (7 days)
 - `MAX_FRESH_PERIOD`: (optional) Upper bound on how long freshness probes may keep a cached feed "fresh" without a full regeneration, in seconds. Default is 86400 (24 hours)
@@ -181,9 +177,8 @@ startup when they are selected).
 
 # Honorable Mentions
 
-These projects were fundamental for the success of vod2pod-rss, originally they handled the feed generation for youtube and twitch, now this is all done by vod2pod-rss internally so they are not used anymore, but were still helpful to get vod2pod-rss up and running fast.
+These projects were fundamental for the success of vod2pod-rss, originally they handled the feed generation for youtube, now this is all done by vod2pod-rss internally so they are not used anymore, but were still helpful to get vod2pod-rss up and running fast.
 * Youtube support was possible thanks to the cool [podtube fork project by amckee](https://github.com/amckee/PodTube) consider dropping him a star.
-* Twitch support was possible thanks to [my fork](https://github.com/madiele/TwitchToPodcastRSS) of [lzeke0's TwitchRSS](https://github.com/lzeke0/TwitchRSS) drop a star to him too!
 
 ## Donations
 

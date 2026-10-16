@@ -4,7 +4,7 @@
 //! `itunes:duration` expects.
 //!
 //! The parse → format round-trip normalizes: an upstream part larger than
-//! its natural bound (e.g. Twitch's `90:30`, meaning 90 min 30 s) folds into
+//! its natural bound (e.g. `90:30`, meaning 90 min 30 s) folds into
 //! the higher unit, so every emitted value is conformant — minutes and
 //! seconds always stay below 60, hours stay unbounded.
 
