@@ -198,13 +198,19 @@ impl MediaProvider for YoutubeProvider {
         _channel_url: &Url,
         state: &provider::FeedProbeState,
     ) -> eyre::Result<bool> {
-        let api_key = conf().get(ConfName::YoutubeApiKey)?;
+        // the probe fetches the exact page shape the conversion's pagination
+        // recorded with its snapshot; state checks come before the config read
+        // so a state without the recorded shape errors without touching the API
         let probe_target = state
             .probe_target
             .as_deref()
             .ok_or_else(|| eyre!("probe state has no probe target"))?;
+        let page_size = state
+            .probe_page_size
+            .ok_or_else(|| eyre!("probe state has no probe page size"))?;
 
-        let page = fetch_probe_page(probe_target, &api_key).await?;
+        let api_key = conf().get(ConfName::YoutubeApiKey)?;
+        let page = fetch_probe_page(probe_target, page_size, &api_key).await?;
         info!("quota: ~1 unit consumed probing freshness of playlist {probe_target}");
         Ok(probe_state_unchanged(
             state,
@@ -285,6 +291,27 @@ fn build_source_fingerprint(total_results: Option<i32>, first_page_ids: &[String
     )
 }
 
+/// The Freshness Probe state a Feed Conversion captures from the pagination's
+/// own fetch: the first page's snapshot plus the exact page shape it was
+/// captured from, as one record. A probe re-fetching the recorded shape
+/// re-derives the snapshot the conversion saw; deriving the shape anywhere
+/// else would let a pagination change silently turn every probe "changed".
+/// Pure function so tests can exercise it.
+fn probe_state_from_fetch(
+    playlist_fetch: &PlaylistFetch,
+    probe_target: &str,
+) -> provider::FeedProbeState {
+    provider::FeedProbeState {
+        newest_published_at: playlist_fetch.newest_published_at,
+        source_fingerprint: Some(build_source_fingerprint(
+            playlist_fetch.total_results,
+            &playlist_fetch.first_page_ids,
+        )),
+        probe_target: Some(probe_target.to_string()),
+        probe_page_size: Some(playlist_fetch.first_page_size),
+    }
+}
+
 /// Whether upstream still matches the state captured at Feed Conversion time.
 /// Pure function so tests can exercise it.
 fn probe_state_unchanged(
@@ -298,11 +325,13 @@ fn probe_state_unchanged(
         && state.newest_published_at == newest_published_at
 }
 
-/// Page size a probe must fetch so its fingerprint is derived from the same
-/// page shape a full conversion captures first. Pure function so tests can
-/// exercise it.
-fn probe_page_size(max_fetched_items: usize) -> u64 {
-    max_fetched_items.clamp(1, 50) as u64
+/// The page shape the conversion's pagination requests for its first page:
+/// as much of the configured item budget as one API page can hold. This is
+/// the only place that shape is derived — the pagination requests it and
+/// records it next to the snapshot, and the Freshness Probe re-fetches
+/// exactly what was recorded. Pure function so tests can exercise it.
+fn first_page_size(max_fetched_items: usize) -> u64 {
+    max_fetched_items.min(50) as u64
 }
 
 /// The state a Freshness Probe observes with a single playlistItems.list call.
@@ -312,21 +341,19 @@ struct ProbePage {
     newest_published_at: Option<i64>,
 }
 
-/// One ~1 quota unit call: first page of the playlist in position order plus
+/// One ~1 quota unit call: the playlist's first page in position order plus
 /// the playlist's total item count. Everything a probe needs to compare
 /// against the state captured at Feed Conversion time.
 ///
-/// The page size matches the one a full conversion would fetch first
-/// (min(YOUTUBE_MAX_RESULTS, 50)), so the fingerprint and the newest
-/// publication timestamp are derived from the same page shape the conversion
-/// captured; a mismatch here would make every probe report "changed".
-async fn fetch_probe_page(playlist_id: &str, api_key: &str) -> eyre::Result<ProbePage> {
-    let max_fetched_items: usize = conf()
-        .get(ConfName::YoutubeMaxResults)
-        .unwrap_or_else(|_| "300".to_string())
-        .parse()
-        .unwrap_or(300);
-    let page_size = probe_page_size(max_fetched_items);
+/// The page size is not derived here: it is the shape the conversion's
+/// pagination recorded next to its snapshot (`FeedProbeState::probe_page_size`),
+/// so a probe's fingerprint is always derived from a page of the same shape
+/// the conversion captured.
+async fn fetch_probe_page(
+    playlist_id: &str,
+    page_size: u64,
+    api_key: &str,
+) -> eyre::Result<ProbePage> {
     let hub = get_youtube_hub();
     let response = hub
         .playlist_items()
@@ -480,6 +507,8 @@ async fn fetch_from_api(
     let max_fetched_items: usize = conf().get(ConfName::YoutubeMaxResults).unwrap().parse()?;
     let fetched = fetch_playlist_items(&upload_playlist, &api_key, max_fetched_items).await?;
 
+    let probe_state = probe_state_from_fetch(&fetched, &probe_target);
+
     let (duration_map, video_batches) = create_duration_url_map(&fetched.items, &api_key).await?;
 
     let rss_items = build_channel_items_from_playlist(fetched.items, duration_map, filter_shorts);
@@ -491,15 +520,6 @@ async fn fetch_from_api(
         "quota: ~{} units consumed for full feed conversion of playlist {}",
         api_requests, probe_target
     );
-
-    let probe_state = provider::FeedProbeState {
-        newest_published_at: fetched.newest_published_at,
-        source_fingerprint: Some(build_source_fingerprint(
-            fetched.total_results,
-            &fetched.first_page_ids,
-        )),
-        probe_target: Some(probe_target),
-    };
 
     Ok(ApiFetch {
         channel: rss_channel,
@@ -701,8 +721,9 @@ fn build_channel_items_from_playlist(
 ///
 /// `total_results`, `first_page_ids` and `newest_published_at` are all derived
 /// from the first page *in playlist position order* (before any sorting or
-/// short filtering) so that a probe can re-derive them the exact same way and
-/// compare like with like.
+/// short filtering), and `first_page_size` is the maxResults that page was
+/// requested with, so a probe re-fetching the recorded shape re-derives them
+/// the exact same way and compares like with like.
 struct PlaylistFetch {
     items: Vec<PlaylistItem>,
     /// pageInfo.totalResults of the first page: total items in the playlist
@@ -712,6 +733,10 @@ struct PlaylistFetch {
     first_page_ids: Vec<String>,
     /// Newest publication timestamp (unix seconds) within the first page.
     newest_published_at: Option<i64>,
+    /// The maxResults the first page was requested with — the page shape the
+    /// snapshot fields above were captured from, recorded so the Freshness
+    /// Probe re-fetches exactly it instead of re-deriving it.
+    first_page_size: u64,
     /// How many playlistItems.list requests this fetch made (~1 quota unit each).
     api_requests: usize,
 }
@@ -729,13 +754,20 @@ async fn fetch_playlist_items(
     let mut total_results: Option<i32> = None;
     let mut first_page_ids: Vec<String> = Vec::new();
     let mut newest_published_at: Option<i64> = None;
+    // derived once: page 0 is requested at this shape and the shape is
+    // recorded with its snapshot for the Freshness Probe to re-fetch
+    let first_page_size = first_page_size(max_fetched_items);
     debug!("fetching items from playlist {}", playlist_id);
     loop {
-        let remaining_items = max_fetched_items - fetched_playlist_items.len();
-        let items_to_fetch = if remaining_items > 50 {
-            50
+        let items_to_fetch = if request_count == 0 {
+            first_page_size as usize
         } else {
-            remaining_items
+            let remaining_items = max_fetched_items - fetched_playlist_items.len();
+            if remaining_items > 50 {
+                50
+            } else {
+                remaining_items
+            }
         };
 
         let mut playlist_items_request = hub
@@ -784,6 +816,7 @@ async fn fetch_playlist_items(
         total_results,
         first_page_ids,
         newest_published_at,
+        first_page_size,
         // +1 because request_count counts the pagination steps after the first call
         api_requests: request_count + 1,
     })
@@ -1309,6 +1342,7 @@ mod tests {
                 &["vid1".to_string(), "vid2".to_string()],
             )),
             probe_target: Some("PLxyz".to_string()),
+            probe_page_size: Some(50),
         };
 
         assert!(probe_state_unchanged(
@@ -1328,6 +1362,7 @@ mod tests {
                 &["vid1".to_string(), "vid2".to_string()],
             )),
             probe_target: Some("PLxyz".to_string()),
+            probe_page_size: Some(50),
         };
 
         // a new video appended at the end of the playlist
@@ -1362,6 +1397,19 @@ mod tests {
     }
 
     #[test]
+    fn test_probe_state_without_recorded_page_size_still_loads() {
+        // cache entries stored before the page shape was recorded must still
+        // deserialize; their probe cannot fetch a trusted shape and falls
+        // through to a full conversion, which re-captures it
+        let state: provider::FeedProbeState = serde_json::from_str(
+            r#"{"newest_published_at":1700000000,"source_fingerprint":"120|vid1","probe_target":"PLxyz"}"#,
+        )
+        .unwrap();
+        assert_eq!(state.probe_page_size, None);
+        assert_eq!(state.probe_target, Some("PLxyz".to_string()));
+    }
+
+    #[test]
     fn test_build_source_fingerprint_is_order_sensitive() {
         let a = build_source_fingerprint(Some(2), &["vid1".to_string(), "vid2".to_string()]);
         let b = build_source_fingerprint(Some(2), &["vid2".to_string(), "vid1".to_string()]);
@@ -1369,17 +1417,77 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_page_size_matches_conversion_first_page() {
+    fn test_first_page_size_is_the_shape_probes_refetch() {
         // default config: full page
-        assert_eq!(probe_page_size(300), 50);
-        // small YOUTUBE_MAX_RESULTS: the probe must fetch exactly what a
-        // conversion would, or every probe would report "changed"
-        assert_eq!(probe_page_size(13), 13);
-        assert_eq!(probe_page_size(1), 1);
-        assert_eq!(probe_page_size(49), 49);
-        assert_eq!(probe_page_size(50), 50);
-        // degenerate config values still produce a valid page size
-        assert_eq!(probe_page_size(0), 1);
+        assert_eq!(first_page_size(300), 50);
+        // small YOUTUBE_MAX_RESULTS: the conversion's first page and the
+        // probe's re-fetch are the same shape by construction
+        assert_eq!(first_page_size(13), 13);
+        assert_eq!(first_page_size(1), 1);
+        assert_eq!(first_page_size(49), 49);
+        assert_eq!(first_page_size(50), 50);
+        // degenerate config values mirror the pagination exactly — the API
+        // rejects the request, as it would for the conversion itself
+        assert_eq!(first_page_size(0), 0);
+    }
+
+    #[test]
+    fn test_probe_fetches_the_page_shape_the_conversion_captured() {
+        // the conversion's pagination records the shape of the very page the
+        // snapshot was captured from, as one record ...
+        let fetched = PlaylistFetch {
+            items: vec![],
+            total_results: Some(120),
+            first_page_ids: vec!["vid1".to_string(), "vid2".to_string()],
+            newest_published_at: Some(1_700_000_000),
+            // a shape the default-config derivation (300-item budget -> 50)
+            // would not produce, so a re-derived value cannot masquerade as
+            // the recorded one
+            first_page_size: 13,
+            api_requests: 1,
+        };
+        let state = probe_state_from_fetch(&fetched, "PLxyz");
+
+        // ... and the page the probe fetches is that record, nothing else
+        assert_eq!(state.probe_page_size, Some(13));
+
+        // a page re-fetched at the recorded shape re-derives the snapshot and
+        // answers "unchanged"; a page of any other shape does not match
+        assert!(probe_state_unchanged(
+            &state,
+            fetched.total_results,
+            &fetched.first_page_ids,
+            fetched.newest_published_at,
+        ));
+        assert!(!probe_state_unchanged(
+            &state,
+            Some(120),
+            &[
+                "vid1".to_string(),
+                "vid2".to_string(),
+                "vid3".to_string()
+            ],
+            fetched.newest_published_at,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_probe_without_recorded_page_size_fails_into_full_conversion() {
+        // a state captured before the shape was recorded cannot be probed
+        // trustworthily; the ladder falls through to a full conversion, which
+        // re-captures the shape. No API key is read: the check comes first.
+        let state = provider::FeedProbeState {
+            probe_target: Some("PLxyz".to_string()),
+            ..Default::default()
+        };
+        let err = YoutubeProvider
+            .probe_feed_freshness(
+                &Url::parse("https://www.youtube.com/playlist?list=PLxyz").unwrap(),
+                &state,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("probe page size"));
     }
 
     #[test]

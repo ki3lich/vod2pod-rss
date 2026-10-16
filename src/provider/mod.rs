@@ -45,6 +45,11 @@ pub struct FeedProbeState {
     /// playlist id whose items feed the rss). `None` when the provider cannot
     /// probe.
     pub probe_target: Option<String>,
+    /// Provider-defined shape of the page the snapshot above was captured
+    /// from, which the probe must re-fetch to compare like with like (for
+    /// YouTube: the playlistItems page size the conversion's pagination
+    /// requested for its first page). `None` when the provider cannot probe.
+    pub probe_page_size: Option<u64>,
 }
 
 /// The result of a Feed Conversion: the feed itself plus the probe state
