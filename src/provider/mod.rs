@@ -7,7 +7,7 @@ mod youtube;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use log::debug;
+use log::{debug, warn};
 use regex::Regex;
 use reqwest::Url;
 use rss::extension::itunes::ITunesChannelExtensionBuilder;
@@ -20,14 +20,34 @@ use crate::provider::{
 };
 
 // to add a new provider just add it here (the provider should implement the MediaProvider trait)
+// every listed provider is dispatched to by its own url regexes; the fallback
+// one is the catch-all every unmatched url ends up at
 generate_static_dispatcher!(
     Provider
     for
     YoutubeProvider,
     TwitchProvider,
-    PeerTubeProvider,
-    GenericProvider,
+    PeerTubeProvider
+    ; fallback GenericProvider,
 );
+
+/// True when `regex` matches a minimal url built from `url`'s host: the host
+/// itself sits in the regex's domain set, whatever scheme, path or query the
+/// full Source URL carries. Both schemes are tried because provider regexes
+/// may anchor on either; the explicit port is dropped because domain
+/// ownership is a host-level fact.
+///
+/// ceiling: heuristic — a whitelist regex anchored on a path prefix (e.g.
+/// `^https://x.com/watch`) cannot match the minimal url and would silently
+/// disable the warning for that provider; revisit if a provider ships one.
+fn host_matches_domain(regex: &Regex, url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    ["http", "https"]
+        .iter()
+        .any(|scheme| regex.is_match(&format!("{scheme}://{host}/")))
+}
 
 /// Provider-specific state captured at Feed Conversion time and stored next to
 /// the cached feed, so a Freshness Probe can later compare upstream state
@@ -278,5 +298,136 @@ mod tests {
         assert_eq!(itunes.explicit.as_deref(), Some("false"));
         assert_eq!(itunes.block.as_deref(), Some("Yes"));
         assert_eq!(itunes.r#type.as_deref(), Some("episodic"));
+    }
+}
+
+/// Pins the dispatch fallthrough warning (issue #164): a Source URL whose
+/// host belongs to a specific provider's domain whitelist but whose full form
+/// misses that provider's url regexes falls through to the Generic Provider —
+/// loudly. Genuinely generic urls and normally dispatched urls stay silent.
+///
+/// The log records are captured through a process-global logger installed
+/// once; assertions filter on the url embedded in the message, so concurrent
+/// tests cannot collide.
+#[cfg(test)]
+mod dispatch_warning_tests {
+    use super::*;
+    use log::{Level, LevelFilter};
+    use std::sync::{Mutex, Once, OnceLock};
+
+    static RECORDS: OnceLock<Mutex<Vec<(Level, String)>>> = OnceLock::new();
+    static INSTALL: Once = Once::new();
+
+    struct CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, record: &log::Record) {
+            RECORDS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn capture_logs() {
+        INSTALL.call_once(|| {
+            let _ = log::set_boxed_logger(Box::new(CapturingLogger));
+            log::set_max_level(LevelFilter::Warn);
+        });
+    }
+
+    fn warned_about(needle: &str) -> bool {
+        RECORDS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(level, message)| *level == Level::Warn && message.contains(needle))
+    }
+
+    #[test]
+    fn host_match_ignores_scheme_path_and_port() {
+        let youtube = Regex::new(r"^(https://)?youtube\.com/").unwrap();
+        let twitch = Regex::new(r"^https?://(.*\.)?twitch\.tv/").unwrap();
+
+        // the scheme the regex anchors on is not the scheme the url carries
+        assert!(host_matches_domain(
+            &youtube,
+            &Url::parse("http://youtube.com/playlist?list=abc").unwrap()
+        ));
+        // path, query and explicit port do not affect domain ownership
+        assert!(host_matches_domain(
+            &youtube,
+            &Url::parse("http://youtube.com:8443/watch?v=x").unwrap()
+        ));
+        assert!(host_matches_domain(
+            &twitch,
+            &Url::parse("http://twitch.tv/somechannel").unwrap()
+        ));
+        // a host merely containing the domain is not owned by it
+        assert!(!host_matches_domain(
+            &youtube,
+            &Url::parse("https://notyoutube.com/feed").unwrap()
+        ));
+    }
+
+    #[test]
+    fn provider_host_url_that_misses_provider_regexes_warns_and_falls_through() {
+        capture_logs();
+        // http scheme: YoutubeProvider's regexes anchor on https, so the
+        // full url misses them even though the host is youtube.com
+        let url = Url::parse("http://youtube.com/playlist?list=abc").unwrap();
+
+        let provider = from(&url);
+
+        assert!(
+            matches!(provider, Provider::GenericProvider(_)),
+            "provider-hosted url that misses its provider's regexes must fall through to the Generic Provider"
+        );
+        assert!(
+            warned_about("http://youtube.com/playlist?list=abc"),
+            "expected a warning naming the probable regex miss for the provider-hosted url"
+        );
+    }
+
+    #[test]
+    fn generic_url_falls_through_silently() {
+        capture_logs();
+        let url = Url::parse("https://example.com/feed.rss").unwrap();
+
+        let provider = from(&url);
+
+        assert!(
+            matches!(provider, Provider::GenericProvider(_)),
+            "a genuinely generic url must fall through to the Generic Provider"
+        );
+        assert!(
+            !warned_about("https://example.com/feed.rss"),
+            "a genuinely generic url must fall through without a warning"
+        );
+    }
+
+    #[test]
+    fn provider_regex_match_dispatches_without_warning() {
+        capture_logs();
+        let url = Url::parse("https://www.youtube.com/playlist?list=abc").unwrap();
+
+        let provider = from(&url);
+
+        assert!(
+            matches!(provider, Provider::YoutubeProvider(_)),
+            "a url matching the provider's regexes must dispatch to that provider"
+        );
+        assert!(
+            !warned_about("https://www.youtube.com/playlist?list=abc"),
+            "a normally dispatched url must not trigger the fallthrough warning"
+        );
     }
 }
