@@ -1,11 +1,12 @@
 mod stdout_pump;
+mod stream_url;
 
 use self::stdout_pump::{spawn_pump_threads, ChannelBytes};
+use self::stream_url::{ProviderStreamUrlResolver, StreamUrlResolver};
 use std::error::Error;
 use std::ops::{Deref, DerefMut};
 use std::process::Command;
 use std::process::Stdio;
-use std::time::Duration;
 
 /// Guard to ensure child process is waited on when dropped
 struct ChildGuard(std::process::Child);
@@ -33,16 +34,14 @@ impl DerefMut for ChildGuard {
 use actix_web::web::Bytes;
 use futures::Future;
 use genawaiter::sync::{Co, Gen};
-use log::{debug, info, warn};
+use log::{debug, info};
 use reqwest::Url;
 use serde::Serialize;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 
-use crate::configs::{conf, AudioCodec, Conf, ConfName};
-use crate::provider;
-use crate::provider::MediaProvider;
+use crate::configs::AudioCodec;
 
 #[derive(Serialize)]
 pub struct FfmpegParameters {
@@ -67,87 +66,25 @@ pub struct Transcoder {
     expected_bytes_count: usize,
 }
 
-/// Decide a preflight verdict from a `tokio::time::timeout(TcpStream::connect(...))`
-/// outcome.
-///
-/// Only a *timeout* is treated as a failure. It is the exact symptom of a CDN
-/// edge node that resolves in DNS but silently drops TCP SYNs: ffmpeg would
-/// otherwise burn the kernel's ~127s SYN-retry budget before returning
-/// `ETIMEDOUT`. DNS errors and connection-refused are left for ffmpeg to
-/// handle, because ffmpeg fails on those quickly — there is no long hang to
-/// avoid, and failing the preflight on them would only add false negatives.
-fn interpret_preflight_connect(
-    outcome: Result<Result<(), std::io::Error>, tokio::time::error::Elapsed>,
-) -> eyre::Result<()> {
-    match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_fast_failure)) => Ok(()),
-        Err(_timed_out) => Err(eyre::eyre!(
-            "media source unreachable: timed out connecting to stream url"
-        )),
-    }
-}
-
-/// Open a TCP connection to the resolved stream URL's `host:port` with a short
-/// timeout, returning the verdict via [`interpret_preflight_connect`].
-///
-/// `connect_timeout` is the maximum time to wait for the TCP handshake. The
-/// caller (the server) already wraps `Transcoder::new` in its own
-/// `FfmpegTimeoutSeconds` timeout, so this preflight only needs to beat ffmpeg's
-/// ~127s `ETIMEDOUT`, not the whole transcode.
-async fn preflight_stream_reachable(url: &Url, connect_timeout: Duration) -> eyre::Result<()> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| eyre::eyre!("stream url has no host: {url}"))?;
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| eyre::eyre!("stream url has no known port: {url}"))?;
-
-    let outcome = tokio::time::timeout(connect_timeout, async {
-        tokio::net::TcpStream::connect((host, port))
-            .await
-            .map(|_| ())
-    })
-    .await;
-    interpret_preflight_connect(outcome)
-}
-
 impl Transcoder {
+    /// Production entry point: wires the real resolution pipeline behind the
+    /// [`StreamUrlResolver`] seam — the provider the media URL dispatches to
+    /// (cached yt-dlp resolution on the YouTube rung) plus the TCP preflight
+    /// with its configured timeout — then builds the transcoder from what it
+    /// resolves.
     pub async fn new(ffmpeg_paramenters: &FfmpegParameters) -> eyre::Result<Self> {
-        let provider = provider::from(&ffmpeg_paramenters.url);
+        let resolver = ProviderStreamUrlResolver::for_media_url(&ffmpeg_paramenters.url);
+        Self::with_resolver(ffmpeg_paramenters, &resolver).await
+    }
 
-        // Resolve the (possibly cached) stream URL. For YouTube this runs yt-dlp
-        // and reads/writes the Redis cache; for the generic provider it is a
-        // no-op clone.
-        let stream_url = provider.get_stream_url(&ffmpeg_paramenters.url).await?;
-
-        // Preflight: a CDN edge that drops SYNs makes ffmpeg hang ~127s before
-        // ETIMEDOUT. Fail fast instead, and evict the cached stream URL so the
-        // next request re-resolves (the upstream edge may have rotated).
-        let preflight_timeout = Duration::from_secs(
-            conf()
-                .get(ConfName::PreflightTimeoutSeconds)
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3),
-        );
-        if let Err(e) = preflight_stream_reachable(&stream_url, preflight_timeout).await {
-            warn!(
-                "preflight reachability check failed for {stream_url}; \
-                 evicting cached stream url for {} and failing fast: {e}",
-                ffmpeg_paramenters.url
-            );
-            // Best-effort: a Redis failure must not mask the original preflight
-            // error. No fast local unit-test seam exists for this eviction path
-            // — it is bound to the real provider selected by `provider::from`
-            // (which dispatches by URL) and to a live Redis — so it is exercised
-            // only end-to-end. The pure verdict logic above (`interpret_preflight_connect`)
-            // is unit-tested.
-            let _ = provider
-                .evict_stream_url_cache(&ffmpeg_paramenters.url)
-                .await;
-            return Err(e);
-        }
+    /// Builds the transcoder from the stream URL resolved behind the
+    /// [`StreamUrlResolver`] seam — the injection point tests use to drive
+    /// resolution with fakes.
+    async fn with_resolver(
+        ffmpeg_paramenters: &FfmpegParameters,
+        resolver: &dyn StreamUrlResolver,
+    ) -> eyre::Result<Self> {
+        let stream_url = resolver.resolve(&ffmpeg_paramenters.url).await?;
 
         let ffmpeg_command = Self::get_ffmpeg_command(&FfmpegParameters {
             seek_time: ffmpeg_paramenters.seek_time,
@@ -260,6 +197,7 @@ impl Transcoder {
 #[cfg(test)]
 mod test {
     use super::*;
+    use async_trait::async_trait;
     use log::info;
 
     #[test]
@@ -351,55 +289,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn preflight_connect_connected_is_ok() {
-        assert!(interpret_preflight_connect(Ok(Ok(()))).is_ok());
-    }
-
-    #[test]
-    fn preflight_connect_fast_failure_is_ok() {
-        // DNS errors and connection-refused are fast: leave them to ffmpeg (no
-        // long hang to avoid) and let the transcode proceed.
-        let fast = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
-        assert!(interpret_preflight_connect(Ok(Err(fast))).is_ok());
-    }
-
-    #[tokio::test]
-    async fn preflight_connect_timeout_is_err() {
-        // A SYN-dropping endpoint never completes the handshake. A connect that
-        // never resolves, timed out, reproduces the exact outcome ffmpeg would
-        // otherwise hang ~127s on. Deterministic: no real blackhole required.
-        let never = std::future::pending::<std::io::Result<()>>();
-        let outcome = tokio::time::timeout(Duration::from_millis(20), never).await;
-        assert!(interpret_preflight_connect(outcome).is_err());
-    }
-
-    #[tokio::test]
-    async fn preflight_reachable_local_listener_is_ok() {
-        // A listening port completes the TCP handshake via the kernel backlog,
-        // even without a user-space accept().
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = Url::parse(&format!("http://127.0.0.1:{port}/x.mp3")).unwrap();
-        assert!(preflight_stream_reachable(&url, Duration::from_secs(2))
-            .await
-            .is_ok());
-        drop(listener);
-    }
-
-    #[tokio::test]
-    async fn preflight_refused_local_port_is_ok() {
-        // A closed local port refuses instantly — fast — so ffmpeg handles it
-        // quickly; the preflight must NOT turn it into a failure.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener); // free the port -> subsequent connect is refused
-        let url = Url::parse(&format!("http://127.0.0.1:{port}/x.mp3")).unwrap();
-        assert!(preflight_stream_reachable(&url, Duration::from_secs(2))
-            .await
-            .is_ok());
-    }
-
     #[tokio::test]
     async fn transcoder_new_passes_preflight_for_reachable() {
         // End-to-end through resolution + preflight. Uses the generic provider,
@@ -422,6 +311,48 @@ mod test {
             "expected preflight to pass for a listening local port, got {transcoder:?}"
         );
         drop(listener);
+    }
+
+    /// Resolver fake handing back one fixed stream URL.
+    struct FixedResolver(Url);
+
+    #[async_trait]
+    impl StreamUrlResolver for FixedResolver {
+        async fn resolve(&self, _media_url: &Url) -> eyre::Result<Url> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn with_resolver_builds_command_from_resolved_stream_url() {
+        // The transcoder consumes the seam: ffmpeg's `-i` is the *resolved*
+        // stream URL the resolver handed over, not the media URL being
+        // transcoded.
+        let resolved = Url::parse("https://resolved.example.com/audio.mp3").unwrap();
+        let params = FfmpegParameters {
+            seek_time: 0.0,
+            url: Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap(),
+            audio_codec: AudioCodec::MP3,
+            bitrate_kbit: 128,
+            max_rate_kbit: 3840,
+            expected_bytes_count: 100,
+            timeout_in_seconds: 300,
+        };
+
+        let transcoder = Transcoder::with_resolver(&params, &FixedResolver(resolved.clone()))
+            .await
+            .expect("resolution via the fake must succeed");
+
+        let args: Vec<String> = transcoder
+            .ffmpeg_command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let input = args
+            .iter()
+            .position(|a| a == "-i")
+            .expect("ffmpeg command carries an input");
+        assert_eq!(args[input + 1], resolved.as_str());
     }
 
     #[test]
@@ -517,8 +448,6 @@ mod test {
         // encoder undershoot of the declared length is a finished, slightly
         // short stream — not a dead one — and must keep the historical padding
         // behavior, completing the transfer with the full declared length.
-        // Unique dir per test: the two ffmpeg pin tests run concurrently and must
-        // not share (and one of them delete) the other's fixture.
         let fixture_dir =
             std::env::temp_dir().join(format!("vod2pod-test-pad-{}", std::process::id()));
         std::fs::create_dir_all(&fixture_dir).unwrap();
@@ -587,5 +516,3 @@ mod test {
         assert_eq!(ok_bytes, expected_bytes_count);
     }
 }
-
-
