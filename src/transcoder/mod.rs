@@ -440,7 +440,10 @@ mod test {
         // Deterministic: a local 2s fixture "ends" in well under a second while
         // the declared length claims ~15x more audio. No network involved (the
         // `file` protocol is in ffmpeg's whitelist).
-        let fixture_dir = std::env::temp_dir().join(format!("vod2pod-test-{}", std::process::id()));
+        // Unique dir per test: the two ffmpeg pin tests run concurrently and must
+        // not share (and one of them delete) the other's fixture.
+        let fixture_dir =
+            std::env::temp_dir().join(format!("vod2pod-test-shortfall-{}", std::process::id()));
         std::fs::create_dir_all(&fixture_dir).unwrap();
         let fixture = fixture_dir.join("short.mp3");
         let generated = Command::new("ffmpeg")
@@ -514,7 +517,10 @@ mod test {
         // encoder undershoot of the declared length is a finished, slightly
         // short stream — not a dead one — and must keep the historical padding
         // behavior, completing the transfer with the full declared length.
-        let fixture_dir = std::env::temp_dir().join(format!("vod2pod-test-{}", std::process::id()));
+        // Unique dir per test: the two ffmpeg pin tests run concurrently and must
+        // not share (and one of them delete) the other's fixture.
+        let fixture_dir =
+            std::env::temp_dir().join(format!("vod2pod-test-pad-{}", std::process::id()));
         std::fs::create_dir_all(&fixture_dir).unwrap();
         let fixture = fixture_dir.join("short.mp3");
         let generated = Command::new("ffmpeg")
