@@ -1,18 +1,18 @@
-//! Feed cache mechanics: canonical feed keys, freshness classification,
-//! stale-while-revalidate plumbing, client-facing ETags and the quota breaker.
+//! Redis storage of cached Feeds: the record layout, the fresh markers and
+//! the quota breaker. The serving policy and the Degradation Ladder live in
+//! the Feed Serving module (`feed_serving`); this module is the storage
+//! mechanics its Redis adapter delegates to, plus the client-facing ETag and
+//! HTTP-date helpers the web tier uses.
 //!
 //! Domain terms live in CONTEXT.md; the rationale of the serving policy is in
 //! docs/adr/0001-serve-stale-and-degrade-instead-of-failing.md.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::America::Los_Angeles;
 use log::warn;
-use tokio::sync::{Mutex, OwnedMutexGuard};
-use url::Url;
 
 use crate::provider::FeedProbeState;
 
@@ -23,10 +23,6 @@ pub const REDIS_QUOTA_BREAKER_PREFIX: &str = "vod2pod:quota_breaker:";
 /// quota today).
 pub const YT_QUOTA_BREAKER_KEY: &str = "vod2pod:quota_breaker:youtube";
 pub const REDIS_QUOTA_USAGE_PREFIX: &str = "vod2pod:quota_used:";
-
-/// Seconds of jitter added on top of the Fresh TTL so that many feeds polled
-/// by the same podcatcher do not all expire (and regenerate) at the same time.
-pub const FRESH_TTL_JITTER_SECS: u64 = 300;
 
 pub fn feed_key(canonical_id: &str) -> String {
     format!("{REDIS_FEED_PREFIX}{canonical_id}")
@@ -63,93 +59,6 @@ pub fn etag_matches(if_none_match: &str, etag: &str) -> bool {
         let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
         candidate.trim_matches('"') == etag
     })
-}
-
-/// Server-layer normalization used as Canonical Feed Key when the provider
-/// cannot give a better identity: lowercase host without `www.`/`m.`
-/// prefixes, default ports elided, query pairs sorted, fragment and trailing
-/// slash dropped. Two Source URLs of the same feed must normalize to the same
-/// string.
-pub fn canonicalize_url(url: &Url) -> String {
-    let host = url.host_str().unwrap_or_default().to_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
-    let host = host.strip_prefix("m.").unwrap_or(host);
-
-    let port = match url.port() {
-        Some(port) => format!(":{port}"),
-        None => String::new(),
-    };
-
-    let path = url.path();
-    let path = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
-
-    let mut pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    pairs.sort();
-    let query = pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    if query.is_empty() {
-        format!("{}://{}{}{}", url.scheme(), host, port, path)
-    } else {
-        format!("{}://{}{}{}?{}", url.scheme(), host, port, path, query)
-    }
-}
-
-/// What the server should do with a cached feed right now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServeDecision {
-    /// Fresh copy: serve as-is, nothing upstream is contacted.
-    Fresh,
-    /// Stale copy (inside the Stale Window): serve it and revalidate in the
-    /// background.
-    Stale,
-    /// No usable cached copy: a Feed Conversion is needed.
-    Miss,
-}
-
-/// Freshness classification of a cache entry. A copy counts as Fresh only
-/// while the fresh marker lives AND the copy is younger than the Fresh
-/// Period (the bound on how long probes may keep renewing it). Beyond that,
-/// but inside the Stale Window, it is served stale. Pure function so tests
-/// can exercise it.
-pub fn classify_freshness(
-    has_body: bool,
-    fresh_marker: bool,
-    generated_at: i64,
-    now: i64,
-    max_fresh_period_secs: i64,
-    stale_window_secs: i64,
-) -> ServeDecision {
-    if !has_body {
-        return ServeDecision::Miss;
-    }
-    let age = now - generated_at;
-    if fresh_marker && age <= max_fresh_period_secs {
-        ServeDecision::Fresh
-    } else if age < stale_window_secs {
-        ServeDecision::Stale
-    } else {
-        ServeDecision::Miss
-    }
-}
-
-/// Fresh TTL with the shared-no-expiry-moment jitter applied.
-pub fn jittered_ttl(base_secs: u64) -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    base_secs + u64::from(nanos) % FRESH_TTL_JITTER_SECS
 }
 
 /// The moment YouTube's daily quota resets: midnight America/Los_Angeles.
@@ -259,26 +168,6 @@ pub async fn load(
         degraded: map.get("degraded").map(|v| v == "1").unwrap_or(false),
         body: body.clone(),
     })
-}
-
-/// The result of reading the cache for a Canonical Feed Key: the entry (when
-/// one is cached and inside the Stale Window) plus the remaining seconds of
-/// its fresh marker (`None` when expired or unreadable).
-#[derive(Debug)]
-pub struct Lookup {
-    pub entry: Option<CachedFeed>,
-    pub fresh_marker_ttl: Option<i64>,
-}
-
-/// Convenience read used by the server: the cached feed plus the remaining
-/// seconds of its fresh marker.
-pub async fn lookup(con: &mut redis::aio::MultiplexedConnection, canonical_id: &str) -> Lookup {
-    let entry = load(con, canonical_id).await;
-    let fresh_marker_ttl = fresh_marker_ttl(con, canonical_id).await;
-    Lookup {
-        entry,
-        fresh_marker_ttl,
-    }
 }
 
 /// Store a feed (overwriting any previous one) and mark it fresh.
@@ -431,112 +320,10 @@ pub async fn bump_quota_usage(
     Ok(total)
 }
 
-/// One regeneration slot per Canonical Feed Key, process-local. Concurrent
-/// requests for the same feed share one upstream pass instead of stampeding
-/// the provider API.
-static REGENERATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Above this many tracked feeds the idle locks are dropped: they only exist
-/// to coalesce in-flight conversions, and live holders keep their Arc alive
-/// through the coalescing window. Worst case after a clear is a duplicated
-/// upstream pass per feed, which the cache absorbs.
-const MAX_TRACKED_REGENERATION_LOCKS: usize = 4096;
-
-async fn regeneration_lock(canonical_id: &str) -> Arc<Mutex<()>> {
-    let mut locks = REGENERATION_LOCKS.lock().await;
-    if locks.len() > MAX_TRACKED_REGENERATION_LOCKS {
-        locks.clear();
-    }
-    locks.entry(canonical_id.to_string()).or_default().clone()
-}
-
-/// Wait for any in-flight regeneration of this feed, then hold its slot.
-/// Callers MUST re-read the cache after acquiring: the previous holder may
-/// have refreshed the entry in the meantime.
-pub async fn begin_regeneration(canonical_id: &str) -> OwnedMutexGuard<()> {
-    regeneration_lock(canonical_id).await.lock_owned().await
-}
-
-/// Non-blocking variant for background revalidation: `None` means another
-/// regeneration is already running for this feed, so there is nothing to do.
-pub async fn try_begin_regeneration(canonical_id: &str) -> Option<OwnedMutexGuard<()>> {
-    regeneration_lock(canonical_id).await.try_lock_owned().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_log::test;
-
-    fn url(s: &str) -> Url {
-        Url::parse(s).unwrap()
-    }
-
-    #[test]
-    fn test_canonicalize_url_merges_host_spelling_variants() {
-        let expected = canonicalize_url(&url("https://youtube.com/playlist?list=PLabc"));
-        assert_eq!(
-            expected,
-            canonicalize_url(&url("https://www.youtube.com/playlist?list=PLabc"))
-        );
-        assert_eq!(
-            expected,
-            canonicalize_url(&url("https://m.youtube.com/playlist?list=PLabc"))
-        );
-        assert_eq!(
-            expected,
-            canonicalize_url(&url("https://WWW.YOUTUBE.COM/playlist?list=PLabc"))
-        );
-        assert_eq!(
-            expected,
-            canonicalize_url(&url("https://youtube.com/playlist?list=PLabc#fragment"))
-        );
-        assert_eq!(
-            expected,
-            canonicalize_url(&url("https://youtube.com:443/playlist?list=PLabc"))
-        );
-    }
-
-    #[test]
-    fn test_canonicalize_url_sorts_query_pairs() {
-        assert_eq!(
-            canonicalize_url(&url("https://youtube.com/playlist?list=PLabc&foo=1")),
-            canonicalize_url(&url("https://youtube.com/playlist?foo=1&list=PLabc"))
-        );
-    }
-
-    #[test]
-    fn test_canonicalize_url_keeps_distinct_feeds_distinct() {
-        let a = canonicalize_url(&url("https://youtube.com/playlist?list=PLabc"));
-        let b = canonicalize_url(&url("https://youtube.com/playlist?list=PLxyz"));
-        assert_ne!(a, b);
-        // http vs https stay distinct
-        assert_ne!(
-            canonicalize_url(&url("http://youtube.com/playlist?list=PLabc")),
-            a
-        );
-    }
-
-    #[test]
-    fn test_canonicalize_url_handles_no_query_and_trailing_slash() {
-        assert_eq!(
-            canonicalize_url(&url("https://example.com/feed/")),
-            "https://example.com/feed"
-        );
-        assert_eq!(
-            canonicalize_url(&url("https://example.com")),
-            "https://example.com/"
-        );
-    }
-
-    #[test]
-    fn test_canonicalize_url_keeps_non_default_ports() {
-        assert_eq!(
-            canonicalize_url(&url("https://example.com:8443/feed")),
-            "https://example.com:8443/feed"
-        );
-    }
 
     #[test]
     fn test_etag_of_is_deterministic_and_change_sensitive() {
@@ -557,63 +344,6 @@ mod tests {
         assert!(etag_matches("*", &etag));
         assert!(!etag_matches("\"other\"", &etag));
         assert!(!etag_matches("", &etag));
-    }
-
-    #[test]
-    fn test_classify_freshness_fresh_within_period() {
-        assert_eq!(
-            classify_freshness(true, true, 1_000, 1_500, 600, 7 * 24 * 3600),
-            ServeDecision::Fresh
-        );
-    }
-
-    #[test]
-    fn test_classify_freshness_stale_when_marker_expired_but_in_window() {
-        assert_eq!(
-            classify_freshness(true, false, 1_000, 2_000, 600, 7 * 24 * 3600),
-            ServeDecision::Stale
-        );
-    }
-
-    #[test]
-    fn test_classify_freshness_stale_when_fresh_period_exceeded() {
-        // fresh marker alive but the copy is older than the fresh period:
-        // probes may not renew forever, force revalidation
-        assert_eq!(
-            classify_freshness(true, true, 1_000, 1_000 + 600, 599, 7 * 24 * 3600),
-            ServeDecision::Stale
-        );
-    }
-
-    #[test]
-    fn test_classify_freshness_miss_beyond_stale_window() {
-        assert_eq!(
-            classify_freshness(
-                true,
-                false,
-                1_000,
-                1_000 + 7 * 24 * 3600,
-                600,
-                7 * 24 * 3600
-            ),
-            ServeDecision::Miss
-        );
-    }
-
-    #[test]
-    fn test_classify_freshness_miss_without_body() {
-        assert_eq!(
-            classify_freshness(false, true, 1_000, 1_100, 600, 7 * 24 * 3600),
-            ServeDecision::Miss
-        );
-    }
-
-    #[test]
-    fn test_jittered_ttl_stays_within_bounds() {
-        for _ in 0..50 {
-            let ttl = jittered_ttl(3600);
-            assert!((3600..3900).contains(&ttl));
-        }
     }
 
     #[test]

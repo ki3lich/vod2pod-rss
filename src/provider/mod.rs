@@ -57,8 +57,11 @@ pub struct GeneratedFeed {
     pub quota_units: Option<u64>,
 }
 
+/// Providers are shared across concurrent requests (the Feed Serving module
+/// hands `&dyn MediaProvider` through async seams), so every implementation
+/// must be `Send + Sync`.
 #[async_trait]
-pub trait MediaProvider {
+pub trait MediaProvider: Send + Sync {
     /// Given a channel will generate the full RRS feed
     ///
     /// # Arguments

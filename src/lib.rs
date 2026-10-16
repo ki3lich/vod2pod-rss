@@ -2,6 +2,7 @@ use configs::{conf, Conf, ConfName};
 
 pub mod configs;
 pub mod feed_cache;
+pub mod feed_serving;
 pub mod provider;
 pub mod rss_transcodizer;
 pub mod server;
