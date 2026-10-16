@@ -5,16 +5,18 @@
 
 use std::sync::{
     atomic::{AtomicI64, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
 use async_trait::async_trait;
 use url::Url;
 
-use super::{FeedCacheStore, FeedServing, Freshness, ServingPolicy};
+use super::{
+    FeedCacheStore, FeedServing, Freshness, RevalidationSpawner, RevalidationTask, ServingPolicy,
+};
 use crate::feed_cache::CachedFeed;
-use crate::provider::{GeneratedFeed, MediaProvider};
+use crate::provider::{FeedProbeState, GeneratedFeed, MediaProvider};
 
 use super::memory::InMemoryCache;
 use super::Clock;
@@ -56,27 +58,41 @@ impl Clock for FixedClock {
     }
 }
 
-/// Provider fake whose conversions are counted and can be slowed down (to
-/// make coalescing observable) or failed (to reach the ladder tail).
+/// Conversion and probe counters shared between the test and its provider
+/// fake.
+#[derive(Default)]
+struct Counters {
+    conversions: AtomicUsize,
+    probes: AtomicUsize,
+}
+
+/// Provider fake whose conversions and probes are counted; conversions can
+/// be slowed down (to make coalescing observable) or failed (to reach the
+/// ladder tail), and the probe outcome is scripted.
 struct FakeProvider {
     canonical_id: Option<String>,
-    conversions: Arc<AtomicUsize>,
+    counters: Arc<Counters>,
     conversion_delay: Duration,
     fail_conversions: bool,
+    /// Scripted probe answer: `Some(unchanged)` answers the probe, `None`
+    /// reports the probe unsupported (revalidation then converts).
+    probe_unchanged: Option<bool>,
 }
 
 impl FakeProvider {
-    /// Returns the fake and the counter its conversions are counted in.
-    fn new(canonical_id: Option<&str>) -> (Self, Arc<AtomicUsize>) {
-        let conversions = Arc::new(AtomicUsize::new(0));
+    /// Returns the fake and the counters its conversions and probes are
+    /// counted in.
+    fn new(canonical_id: Option<&str>) -> (Self, Arc<Counters>) {
+        let counters: Arc<Counters> = Arc::default();
         (
             Self {
                 canonical_id: canonical_id.map(str::to_string),
-                conversions: conversions.clone(),
+                counters: counters.clone(),
                 conversion_delay: Duration::ZERO,
                 fail_conversions: false,
+                probe_unchanged: None,
             },
-            conversions,
+            counters,
         )
     }
 }
@@ -84,7 +100,7 @@ impl FakeProvider {
 #[async_trait]
 impl MediaProvider for FakeProvider {
     async fn generate_rss_feed(&self, channel_url: Url) -> eyre::Result<GeneratedFeed> {
-        self.conversions.fetch_add(1, Ordering::SeqCst);
+        self.counters.conversions.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.conversion_delay).await;
         if self.fail_conversions {
             return Err(eyre::eyre!("conversion failed"));
@@ -94,6 +110,18 @@ impl MediaProvider for FakeProvider {
             probe_state: None,
             quota_units: None,
         })
+    }
+
+    async fn probe_feed_freshness(
+        &self,
+        _channel_url: &Url,
+        _state: &FeedProbeState,
+    ) -> eyre::Result<bool> {
+        self.counters.probes.fetch_add(1, Ordering::SeqCst);
+        match self.probe_unchanged {
+            Some(unchanged) => Ok(unchanged),
+            None => Err(eyre::eyre!("probe not supported by the fake provider")),
+        }
     }
 
     async fn canonical_feed_id(&self, _channel_url: &Url) -> Option<String> {
@@ -109,11 +137,60 @@ impl MediaProvider for FakeProvider {
     }
 }
 
+/// Spawner fake that records every revalidation request — its Canonical Feed
+/// Key included — and keeps the task, so tests can assert the request count
+/// and target, and drive the revalidation inline (`run_pending`) instead of
+/// racing a real runtime.
+#[derive(Default)]
+struct RecordingSpawner {
+    requests: AtomicUsize,
+    pending: Mutex<Vec<(String, RevalidationTask)>>,
+}
+
+impl RecordingSpawner {
+    /// Revalidation requests recorded so far.
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    /// The Canonical Feed Keys of the recorded requests, in request order.
+    fn keys(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Drive every recorded revalidation to completion, in request order.
+    async fn run_pending(&self) {
+        let tasks: Vec<(String, RevalidationTask)> =
+            std::mem::take(&mut *self.pending.lock().unwrap());
+        for (_, task) in tasks {
+            task.await;
+        }
+    }
+}
+
+impl RevalidationSpawner for RecordingSpawner {
+    fn spawn(&self, canonical_key: &str, task: RevalidationTask) {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.pending
+            .lock()
+            .unwrap()
+            .push((canonical_key.to_string(), task));
+    }
+}
+
 /// Downstream rungs that never apply: the module converts on every miss.
-/// Counts how often the module consulted the ladder tail.
+/// Counts how often the module consulted the ladder tail, can be scripted to
+/// preempt metered revalidation work, and records revalidation failures.
 #[derive(Default)]
 struct FakeDownstream {
     consulted: AtomicUsize,
+    preempts: bool,
+    failed_revalidations: AtomicUsize,
 }
 
 #[async_trait]
@@ -137,6 +214,20 @@ impl super::DownstreamRungs for FakeDownstream {
     ) -> Option<super::ServedFeed> {
         self.consulted.fetch_add(1, Ordering::SeqCst);
         None
+    }
+
+    async fn blocks_metered_revalidation(&self, _provider: &dyn MediaProvider) -> bool {
+        self.preempts
+    }
+
+    async fn on_revalidation_failed(
+        &self,
+        _source_url: &Url,
+        _provider: &dyn MediaProvider,
+        _canonical_key: &str,
+        _err: &eyre::Error,
+    ) {
+        self.failed_revalidations.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -163,6 +254,20 @@ async fn seed(
     body: &str,
     fresh_ttl_secs: u64,
 ) {
+    seed_with(cache, key, clock, body, fresh_ttl_secs, None, false).await;
+}
+
+/// Seed with an explicit probe state and degraded flag, as a conversion (or
+/// the degraded rung) would have stored it.
+async fn seed_with(
+    cache: &InMemoryCache,
+    key: &str,
+    clock: &FixedClock,
+    body: &str,
+    fresh_ttl_secs: u64,
+    probe_state: Option<FeedProbeState>,
+    degraded: bool,
+) {
     let generated_at = clock.unix_now() - 10;
     cache
         .store(
@@ -170,8 +275,8 @@ async fn seed(
             &CachedFeed {
                 body: body.to_string(),
                 generated_at,
-                probe_state: None,
-                degraded: false,
+                probe_state,
+                degraded,
             },
             fresh_ttl_secs,
             7 * 24 * 3600,
@@ -184,18 +289,24 @@ async fn seed(
 async fn fresh_hit_serves_cached_body_with_freshness_metadata() {
     // the conversion happened at t=990; the poll arrives 10s later
     let clock = Arc::new(FixedClock::at(990));
-    let cache = InMemoryCache::new(clock.clone());
-    let (provider, conversions) = FakeProvider::new(Some("k"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("k"));
+    let provider = Arc::new(provider);
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
-        Box::new(FakeDownstream::default()),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
     );
     seed(&cache, "k", &clock, "<rss>cached</rss>", 3600).await;
     clock.advance_secs(10);
 
     let served = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -206,25 +317,31 @@ async fn fresh_hit_serves_cached_body_with_freshness_metadata() {
     // max-age is the remaining fresh-marker ttl
     assert_eq!(served.max_age_secs, 3600 - 10);
     assert_eq!(served.canonical_key, "k");
-    assert_eq!(conversions.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn stale_hit_serves_within_stale_window_honoring_stale_serve_max_age() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (provider, conversions) = FakeProvider::new(Some("k"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("k"));
+    let provider = Arc::new(provider);
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
-        Box::new(FakeDownstream::default()),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
     );
     seed(&cache, "k", &clock, "<rss>cached</rss>", 3600).await;
     // the fresh marker (1h) is gone, the copy (7d window) is not
     clock.advance_secs(3600 + 1);
 
     let served = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -232,18 +349,20 @@ async fn stale_hit_serves_within_stale_window_honoring_stale_serve_max_age() {
     assert_eq!(served.body, "<rss>cached</rss>");
     // stale copies tell the client to come back soon
     assert_eq!(served.max_age_secs, 60);
-    assert_eq!(conversions.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn fresh_period_expiry_serves_stale_even_with_live_marker() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (provider, conversions) = FakeProvider::new(Some("k"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("k"));
+    let provider = Arc::new(provider);
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
-        Box::new(FakeDownstream::default()),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
     );
     // marker outlives the fresh period on purpose
     seed(&cache, "k", &clock, "<rss>cached</rss>", 100_000).await;
@@ -251,7 +370,11 @@ async fn fresh_period_expiry_serves_stale_even_with_live_marker() {
     clock.advance_secs(24 * 3600 + 1);
 
     let served = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -259,19 +382,29 @@ async fn fresh_period_expiry_serves_stale_even_with_live_marker() {
     // is stale even with a live marker
     assert_eq!(served.freshness, Freshness::Stale);
     assert_eq!(served.max_age_secs, 60);
-    assert_eq!(conversions.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn miss_converts_stores_and_serves() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (provider, conversions) = FakeProvider::new(Some("k"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("k"));
+    let provider = Arc::new(provider);
     let downstream = FakeDownstream::default();
-    let serving = FeedServing::new(test_policy(), clock.clone(), Box::new(downstream));
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(downstream),
+    );
 
     let served = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -280,7 +413,7 @@ async fn miss_converts_stores_and_serves() {
     assert_eq!(served.generated_at, 1_000);
     // the fresh marker was just set, so its remaining ttl is the full one
     assert_eq!(served.max_age_secs, 3600);
-    assert_eq!(conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
 
     // the conversion result went through the cache adapter
     let stored = cache.load("k").await.expect("conversion must be stored");
@@ -290,19 +423,24 @@ async fn miss_converts_stores_and_serves() {
 
     // a second poll now hits the fresh copy instead of converting again
     let again = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(again.freshness, Freshness::Fresh);
     assert_eq!(again.body, served.body);
-    assert_eq!(conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn injected_policy_governs_the_windows() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (provider, conversions) = FakeProvider::new(Some("k"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("k"));
+    let provider = Arc::new(provider);
     let policy = ServingPolicy {
         fresh_ttl_secs: 50,
         stale_window_secs: 100,
@@ -310,17 +448,30 @@ async fn injected_policy_governs_the_windows() {
         stale_serve_max_age_secs: 7,
         fresh_ttl_jitter_secs: 0,
     };
-    let serving = FeedServing::new(policy, clock.clone(), Box::new(FakeDownstream::default()));
+    let serving = FeedServing::new(
+        policy,
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
+    );
 
     let generated = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(generated.freshness, Freshness::FreshlyGenerated);
 
     // fresh ttl comes from the injected policy
     let fresh = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(fresh.freshness, Freshness::Fresh);
@@ -330,7 +481,11 @@ async fn injected_policy_governs_the_windows() {
     // injected stale-serve max-age
     clock.advance_secs(60);
     let stale = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(stale.freshness, Freshness::Stale);
@@ -339,18 +494,23 @@ async fn injected_policy_governs_the_windows() {
     // past the stale window: miss, a new conversion happens
     clock.advance_secs(50);
     let regenerated = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(regenerated.freshness, Freshness::FreshlyGenerated);
-    assert_eq!(conversions.load(Ordering::SeqCst), 2);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn injected_fresh_ttl_jitter_spreads_expiry() {
     let clock = Arc::new(FixedClock::with_nanos(1_000, 250));
-    let cache = InMemoryCache::new(clock.clone());
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
     let (provider, _) = FakeProvider::new(Some("k"));
+    let provider = Arc::new(provider);
     let policy = ServingPolicy {
         fresh_ttl_secs: 100,
         stale_window_secs: 100_000,
@@ -358,16 +518,29 @@ async fn injected_fresh_ttl_jitter_spreads_expiry() {
         stale_serve_max_age_secs: 60,
         fresh_ttl_jitter_secs: 100,
     };
-    let serving = FeedServing::new(policy, clock.clone(), Box::new(FakeDownstream::default()));
+    let serving = FeedServing::new(
+        policy,
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
+    );
 
     serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
 
     // 100 + (250 nanos % 100 jitter) = 150
     let fresh = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(fresh.max_age_secs, 150);
@@ -376,16 +549,22 @@ async fn injected_fresh_ttl_jitter_spreads_expiry() {
 #[tokio::test]
 async fn provider_canonical_key_shares_entry_freshness_and_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (provider, conversions) = FakeProvider::new(Some("yt:playlist:PLabc"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("yt:playlist:PLabc"));
+    let provider = Arc::new(provider);
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
-        Box::new(FakeDownstream::default()),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
     );
 
     let first = serving
-        .serve(&cache, &url("https://a.example/one"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://a.example/one"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(first.freshness, Freshness::FreshlyGenerated);
@@ -393,33 +572,39 @@ async fn provider_canonical_key_shares_entry_freshness_and_conversion() {
     // a different Source URL, same provider identity: one cache entry, one
     // conversion, freshness shared
     let second = serving
-        .serve(&cache, &url("https://b.example/two"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://b.example/two"),
+            provider.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(second.freshness, Freshness::Fresh);
     assert_eq!(second.body, first.body);
     assert_eq!(second.canonical_key, first.canonical_key);
-    assert_eq!(conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn normalized_url_canonical_key_shares_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
     // provider cannot determine an identity: the module falls back to
     // Source URL normalization
-    let (provider, conversions) = FakeProvider::new(None);
+    let (provider, counters) = FakeProvider::new(None);
+    let provider = Arc::new(provider);
     let serving = FeedServing::new(
         test_policy(),
         clock.clone(),
-        Box::new(FakeDownstream::default()),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
     );
 
     let first = serving
         .serve(
-            &cache,
+            cache.clone(),
             &url("https://youtube.com/playlist?list=PLa"),
-            &provider,
+            provider.clone(),
         )
         .await
         .unwrap();
@@ -429,27 +614,29 @@ async fn normalized_url_canonical_key_shares_conversion() {
     // key
     let second = serving
         .serve(
-            &cache,
+            cache.clone(),
             &url("https://WWW.YOUTUBE.com/playlist?list=PLa"),
-            &provider,
+            provider.clone(),
         )
         .await
         .unwrap();
     assert_eq!(second.freshness, Freshness::Fresh);
     assert_eq!(second.body, first.body);
-    assert_eq!(conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn concurrent_misses_coalesce_into_one_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (mut provider, conversions) = FakeProvider::new(Some("coalesce"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("coalesce"));
     provider.conversion_delay = Duration::from_millis(300);
+    let provider = Arc::new(provider);
     let serving = Arc::new(FeedServing::new(
         test_policy(),
         clock.clone(),
-        Box::new(FakeDownstream::default()),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(FakeDownstream::default()),
     ));
 
     // two concurrent polls for the same feed: the second caller waits for
@@ -458,14 +645,486 @@ async fn concurrent_misses_coalesce_into_one_conversion() {
     let url_a = url("https://example.com/one");
     let url_b = url("https://example.com/two");
     let (a, b) = tokio::join!(
-        serving.serve(&cache, &url_a, &provider),
-        serving.serve(&cache, &url_b, &provider),
+        serving.serve(cache.clone(), &url_a, provider.clone()),
+        serving.serve(cache.clone(), &url_b, provider.clone()),
     );
 
     let a = a.unwrap();
     let b = b.unwrap();
     assert_eq!(a.body, b.body);
-    assert_eq!(conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+}
+
+// --- stale-while-revalidate: the module schedules and runs revalidation ---
+
+#[tokio::test]
+async fn stale_hit_records_one_revalidation_request_per_hit_and_fresh_none() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (provider, counters) = FakeProvider::new(Some("req-per-hit"));
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    seed(&cache, "req-per-hit", &clock, "<rss>cached</rss>", 3600).await;
+
+    // a fresh hit schedules nothing
+    let fresh = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.freshness, Freshness::Fresh);
+    assert_eq!(spawner.requests(), 0);
+
+    // every stale hit schedules exactly one revalidation request
+    clock.advance_secs(3600 + 1);
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+    assert_eq!(spawner.requests(), 1);
+
+    let again = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.freshness, Freshness::Stale);
+    // both requests target this feed's Canonical Feed Key
+    assert_eq!(
+        spawner.keys(),
+        vec!["req-per-hit".to_string(), "req-per-hit".to_string()]
+    );
+    // serving from cache never converts
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn revalidation_probes_and_renews_freshness_without_conversion() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("probe-renews"));
+    provider.probe_unchanged = Some(true);
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    // the fresh marker (10s) dies before the body does: the poll serves
+    // stale, the copy is still young enough to be probeable
+    seed_with(
+        &cache,
+        "probe-renews",
+        &clock,
+        "<rss>cached</rss>",
+        10,
+        Some(FeedProbeState::default()),
+        false,
+    )
+    .await;
+    clock.advance_secs(20);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+    assert_eq!(spawner.requests(), 1);
+
+    spawner.run_pending().await;
+
+    // the probe answered "unchanged": freshness renewed, no Feed Conversion,
+    // the probe's ~1 quota unit recorded
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
+    assert_eq!(cache.total_quota_usage().await, 1);
+    assert_eq!(cache.fresh_marker_ttl("probe-renews").await, Some(3600));
+
+    // the next poll is served fresh again
+    let renewed = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renewed.freshness, Freshness::Fresh);
+}
+
+#[tokio::test]
+async fn probe_changed_falls_through_to_full_conversion() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("probe-changed"));
+    provider.probe_unchanged = Some(false);
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    seed_with(
+        &cache,
+        "probe-changed",
+        &clock,
+        "<rss>cached</rss>",
+        10,
+        Some(FeedProbeState::default()),
+        false,
+    )
+    .await;
+    clock.advance_secs(20);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+
+    // the conversion result replaced the stale copy and is served fresh
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.freshness, Freshness::Fresh);
+    assert_eq!(served.body, "<rss>converted https://example.com/feed</rss>");
+}
+
+#[tokio::test]
+async fn probe_failure_falls_through_to_full_conversion() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    // probe_unchanged = None: the fake reports the probe unsupported (Err)
+    let (provider, counters) = FakeProvider::new(Some("probe-failure"));
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    seed_with(
+        &cache,
+        "probe-failure",
+        &clock,
+        "<rss>cached</rss>",
+        10,
+        Some(FeedProbeState::default()),
+        false,
+    )
+    .await;
+    clock.advance_secs(20);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.freshness, Freshness::Fresh);
+    assert_eq!(served.body, "<rss>converted https://example.com/feed</rss>");
+}
+
+#[tokio::test]
+async fn feed_past_fresh_period_is_never_probed_and_converts_fully() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("past-period"));
+    // the probe would answer "unchanged": if it ran, the copy would be
+    // renewed instead of converted
+    provider.probe_unchanged = Some(true);
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    // marker outlives the fresh period on purpose; the copy is one second
+    // past it
+    seed_with(
+        &cache,
+        "past-period",
+        &clock,
+        "<rss>cached</rss>",
+        100_000,
+        Some(FeedProbeState::default()),
+        false,
+    )
+    .await;
+    clock.advance_secs(24 * 3600 + 1);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    // past the Fresh Period probes may not renew: full conversion
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn degraded_feed_is_never_probed_and_converts_fully() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("degraded"));
+    provider.probe_unchanged = Some(true);
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    // degraded copies must be replaced by a real conversion as soon as
+    // possible, never renewed by a probe
+    seed_with(
+        &cache,
+        "degraded",
+        &clock,
+        "<rss>degraded</rss>",
+        10,
+        Some(FeedProbeState::default()),
+        true,
+    )
+    .await;
+    clock.advance_secs(20);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.body, "<rss>converted https://example.com/feed</rss>");
+    assert!(!served.degraded);
+}
+
+#[tokio::test]
+async fn revalidation_coalesces_when_one_is_already_in_flight() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("coalesce-reval"));
+    provider.probe_unchanged = Some(true);
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        Arc::new(FakeDownstream::default()),
+    );
+    seed_with(
+        &cache,
+        "coalesce-reval",
+        &clock,
+        "<rss>cached</rss>",
+        10,
+        Some(FeedProbeState::default()),
+        false,
+    )
+    .await;
+    clock.advance_secs(20);
+
+    // another regeneration of this feed already holds the slot: the
+    // recorded revalidation finds it in flight and skips entirely
+    let _slot = super::begin_regeneration("coalesce-reval").await;
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+    assert_eq!(spawner.requests(), 1);
+
+    spawner.run_pending().await;
+
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn revalidation_is_skipped_while_the_tail_preempts_metered_work() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("tail-preempts"));
+    provider.probe_unchanged = Some(true);
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let downstream = Arc::new(FakeDownstream {
+        preempts: true,
+        ..Default::default()
+    });
+    let serving = FeedServing::new(test_policy(), clock.clone(), spawner.clone(), downstream);
+    seed_with(
+        &cache,
+        "tail-preempts",
+        &clock,
+        "<rss>cached</rss>",
+        10,
+        Some(FeedProbeState::default()),
+        false,
+    )
+    .await;
+    clock.advance_secs(20);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    // the Quota Breaker is open: no metered work, the stale body keeps
+    // serving untouched
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.body, "<rss>cached</rss>");
+}
+
+#[tokio::test]
+async fn revalidation_failure_keeps_the_stale_body_and_reaches_the_tail() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("reval-failure"));
+    provider.fail_conversions = true;
+    let provider = Arc::new(provider);
+    let spawner = Arc::new(RecordingSpawner::default());
+    let downstream = Arc::new(FakeDownstream::default());
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        spawner.clone(),
+        downstream.clone(),
+    );
+    seed(&cache, "reval-failure", &clock, "<rss>cached</rss>", 3600).await;
+    clock.advance_secs(3600 + 1);
+
+    let stale = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.freshness, Freshness::Stale);
+
+    spawner.run_pending().await;
+
+    // the conversion failure reached the ladder tail...
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(downstream.failed_revalidations.load(Ordering::SeqCst), 1);
+    // ...and the stale body was kept on purpose: clients keep being served
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.freshness, Freshness::Stale);
+    assert_eq!(served.body, "<rss>cached</rss>");
 }
 
 // --- pure-function pins (moved with their functions from feed_cache) ---
@@ -587,19 +1246,29 @@ fn test_classify_freshness_miss_without_body() {
 #[tokio::test]
 async fn exhausted_ladder_errors_when_downstream_cannot_produce() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = InMemoryCache::new(clock.clone());
-    let (mut provider, conversions) = FakeProvider::new(Some("k"));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.fail_conversions = true;
+    let provider = Arc::new(provider);
     let downstream = FakeDownstream::default();
-    let serving = FeedServing::new(test_policy(), clock.clone(), Box::new(downstream));
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+        Arc::new(downstream),
+    );
 
     let result = serving
-        .serve(&cache, &url("https://example.com/feed"), &provider)
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
         .await;
 
     // nothing cached, conversion failed, downstream rungs produced nothing:
     // the request errors
     assert!(result.is_err());
-    assert_eq!(conversions.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
     assert!(cache.load("k").await.is_none());
 }

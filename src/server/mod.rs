@@ -105,7 +105,7 @@ async fn transcodize_rss(
         Err(e) => return HttpResponse::BadRequest().body(e.to_string()),
     };
 
-    let provider = provider::from(&parsed_url);
+    let provider = Arc::new(provider::from(&parsed_url));
 
     if !provider
         .domain_whitelist_regexes()
@@ -121,27 +121,27 @@ async fn transcodize_rss(
         return HttpResponse::InternalServerError().finish();
     };
 
-    // the Feed Serving module owns the Degradation Ladder; the adapter reads
-    // the policy numbers from config and injects them at construction (the
-    // module itself reads no environment configuration)
-    let cache = feed_serving::RedisFeedCache::new(redis.clone());
+    // the Feed Serving module owns the Degradation Ladder, stale-while-
+    // revalidate included; the adapter reads the policy numbers from config
+    // and injects them at construction (the module itself reads no
+    // environment configuration)
+    let cache = Arc::new(feed_serving::RedisFeedCache::new(redis.clone()));
     let serving = FeedServing::new(
         serving_policy(),
         Arc::new(feed_serving::WallClock),
-        Box::new(QuotaFreeDegrade::new(redis)),
+        Arc::new(feed_serving::ActixSpawner),
+        Arc::new(QuotaFreeDegrade::new(redis)),
     );
 
-    match serving.serve(&cache, &parsed_url, &provider).await {
+    match serving.serve(cache, &parsed_url, provider).await {
         Ok(served) => {
             match served.freshness {
                 feed_serving::Freshness::Fresh => {
                     info!("serving cached rss feed for {parsed_url}");
                 }
+                // the module scheduled the revalidation itself
                 feed_serving::Freshness::Stale => {
-                    info!("serving stale rss feed for {parsed_url}, revalidating in background");
-                    // ceiling: stale-while-revalidate spawn stays in the
-                    // adapter until revalidation joins the module (issue #156)
-                    spawn_revalidation(parsed_url.clone(), served.canonical_key.clone());
+                    info!("serving stale rss feed for {parsed_url}");
                 }
                 // the module logs the conversion itself
                 feed_serving::Freshness::FreshlyGenerated => {}
@@ -284,6 +284,32 @@ impl QuotaFreeDegrade {
         Self { redis }
     }
 
+    /// The provider's Quota Breaker state: `Some(reset-at, unix seconds)`
+    /// while metered calls to this provider must not be made.
+    async fn breaker_open(&self, provider: &dyn MediaProvider) -> Option<i64> {
+        let mut con = self.redis.clone();
+        match provider.quota_breaker_key().as_deref() {
+            Some(key) => feed_cache::quota_breaker_open(&mut con, key).await,
+            None => None,
+        }
+    }
+
+    /// Open the provider's Quota Breaker (until its next reset) when the
+    /// error means the quota is exhausted.
+    async fn open_breaker_if_quota_exhausted(
+        &self,
+        provider: &dyn MediaProvider,
+        err: &eyre::Error,
+    ) {
+        if !feed_cache::is_quota_exceeded(err) {
+            return;
+        }
+        if let Some(key) = provider.quota_breaker_key() {
+            let mut con = self.redis.clone();
+            open_quota_breaker(&mut con, &key).await;
+        }
+    }
+
     /// Degradation Ladder rung: produce a feed without metered API usage (the
     /// youtube public atom feed) and cache it as a Degraded Feed. Used when
     /// the Feed Conversion failed (quota exhaustion included) and no cached
@@ -345,18 +371,14 @@ impl DownstreamRungs for QuotaFreeDegrade {
     ) -> Option<ServedFeed> {
         // Quota Breaker: when THIS provider's quota is known to be exhausted,
         // metered calls are skipped entirely and the ladder degrades right away
-        let mut con = self.redis.clone();
-        let breaker_open = match provider.quota_breaker_key().as_deref() {
-            Some(key) => feed_cache::quota_breaker_open(&mut con, key).await,
-            None => None,
-        };
-        if let Some(reset) = breaker_open {
+        if let Some(reset) = self.breaker_open(provider).await {
             info!(
                 "quota breaker open until {}, degrading to quota-free generation for {source_url}",
                 DateTime::<Utc>::from_timestamp(reset, 0)
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_default()
             );
+            let mut con = self.redis.clone();
             return self
                 .degrade(provider, source_url, canonical_key, &mut con)
                 .await;
@@ -371,23 +393,38 @@ impl DownstreamRungs for QuotaFreeDegrade {
         canonical_key: &str,
         err: eyre::Error,
     ) -> Option<ServedFeed> {
-        let quota_exhausted = feed_cache::is_quota_exceeded(&err);
-        if quota_exhausted {
+        if feed_cache::is_quota_exceeded(&err) {
             error!("provider quota exhausted for {source_url}:\n{err}");
         } else {
             error!("could not generate rss feed for {source_url}:\n{err}");
         }
+        self.open_breaker_if_quota_exhausted(provider, &err).await;
         let mut con = self.redis.clone();
-        if quota_exhausted {
-            if let Some(key) = provider.quota_breaker_key() {
-                open_quota_breaker(&mut con, &key).await;
-            }
-        }
         // Degradation Ladder rung 2: quota-free generation, on any conversion
         // failure (quota exhaustion included); the fallback itself failing
         // surfaces the error to the client
         self.degrade(provider, source_url, canonical_key, &mut con)
             .await
+    }
+
+    async fn blocks_metered_revalidation(&self, provider: &dyn MediaProvider) -> bool {
+        self.breaker_open(provider).await.is_some()
+    }
+
+    async fn on_revalidation_failed(
+        &self,
+        _source_url: &Url,
+        provider: &dyn MediaProvider,
+        canonical_key: &str,
+        err: &eyre::Error,
+    ) {
+        if feed_cache::is_quota_exceeded(err) {
+            warn!("provider quota exhausted during background revalidation of {canonical_key}");
+            self.open_breaker_if_quota_exhausted(provider, err).await;
+        } else {
+            error!("background revalidation of {canonical_key} failed:\n{err}");
+        }
+        // the stale body is kept on purpose, it keeps serving clients
     }
 }
 
@@ -402,124 +439,6 @@ async fn open_quota_breaker(con: &mut redis::aio::MultiplexedConnection, breaker
         ),
         Err(e) => warn!("could not persist quota breaker: {e}"),
     }
-}
-
-/// Background revalidation only invokes the module's conversion rung; it
-/// never reaches the ladder tail, so the module gets this inert downstream.
-struct NoDownstreamRungs;
-
-#[async_trait]
-impl DownstreamRungs for NoDownstreamRungs {
-    async fn before_conversion(
-        &self,
-        _source_url: &Url,
-        _provider: &dyn MediaProvider,
-        _canonical_key: &str,
-    ) -> Option<ServedFeed> {
-        None
-    }
-
-    async fn on_conversion_failed(
-        &self,
-        _source_url: &Url,
-        _provider: &dyn MediaProvider,
-        _canonical_key: &str,
-        _err: eyre::Error,
-    ) -> Option<ServedFeed> {
-        None
-    }
-}
-
-/// Background revalidation of a stale feed (stale-while-revalidate): probe
-/// first (~1 quota unit), full conversion only when needed. Failures keep the
-/// stale body cached so clients keep being served.
-async fn background_revalidate(source_url: Url, canonical_id: String) {
-    let Some(_regen_slot) = feed_serving::try_begin_regeneration(&canonical_id).await else {
-        debug!("revalidation of {canonical_id} already in flight, skipping");
-        return;
-    };
-    let Ok(mut redis) = crate::get_redis_client().await else {
-        warn!("could not get redis client for background revalidation of {canonical_id}");
-        return;
-    };
-
-    let provider = provider::from(&source_url);
-    let breaker_open = match provider.quota_breaker_key().as_deref() {
-        Some(key) => feed_cache::quota_breaker_open(&mut redis, key).await,
-        None => None,
-    };
-    if breaker_open.is_some() {
-        info!("quota breaker open, skipping background revalidation of {canonical_id}");
-        return;
-    }
-
-    let Some(cached) = feed_cache::load(&mut redis, &canonical_id).await else {
-        return;
-    };
-
-    let age = feed_cache::unix_now() - cached.generated_at;
-    // probes may only renew a feed while it is within the Fresh Period;
-    // degraded feeds are never probed, they must be replaced by a real
-    // conversion as soon as possible
-    let probeable = age < max_fresh_period_secs() as i64 && !cached.degraded;
-
-    if probeable {
-        if let Some(state) = cached.probe_state.clone() {
-            match provider.probe_feed_freshness(&source_url, &state).await {
-                Ok(true) => {
-                    info!("feed {canonical_id} unchanged upstream, renewing freshness after probe");
-                    if let Err(e) = feed_cache::bump_quota_usage(&mut redis, 1).await {
-                        warn!("could not record quota usage estimate: {e}");
-                    }
-                    // the fresh marker must not outlive the Fresh Period
-                    let remaining_fresh =
-                        (max_fresh_period_secs() as i64 - age).min(fresh_ttl_secs() as i64);
-                    if let Err(e) = feed_cache::renew_freshness(
-                        &mut redis,
-                        &canonical_id,
-                        remaining_fresh.max(1) as u64,
-                        stale_max_age_secs(),
-                    )
-                    .await
-                    {
-                        warn!("could not renew freshness of {canonical_id}: {e}");
-                    }
-                    return;
-                }
-                Ok(false) => info!("feed {canonical_id} changed upstream, regenerating"),
-                Err(e) => warn!("freshness probe failed for {canonical_id} ({e}), regenerating"),
-            }
-        }
-    } else if age >= max_fresh_period_secs() as i64 {
-        info!("feed {canonical_id} reached the fresh period limit, regenerating fully");
-    }
-
-    // ceiling: revalidation lives in the adapter and drives the module's
-    // conversion rung directly until it becomes a module rung (issue #156)
-    let serving = FeedServing::new(
-        serving_policy(),
-        Arc::new(feed_serving::WallClock),
-        Box::new(NoDownstreamRungs),
-    );
-    let cache = feed_serving::RedisFeedCache::new(redis.clone());
-    if let Err(e) = serving
-        .convert_and_store(&cache, &canonical_id, &source_url, &provider)
-        .await
-    {
-        if feed_cache::is_quota_exceeded(&e) {
-            warn!("provider quota exhausted during background revalidation of {canonical_id}");
-            if let Some(key) = provider.quota_breaker_key() {
-                open_quota_breaker(&mut redis, &key).await;
-            }
-        } else {
-            error!("background revalidation of {canonical_id} failed:\n{e}");
-        }
-        // the stale body is kept on purpose, it keeps serving clients
-    }
-}
-
-fn spawn_revalidation(source_url: Url, canonical_id: String) {
-    actix_rt::spawn(background_revalidate(source_url, canonical_id));
 }
 
 #[derive(Deserialize)]

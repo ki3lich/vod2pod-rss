@@ -87,4 +87,34 @@ impl FeedCacheStore for InMemoryCache {
         *total += units as i64;
         Ok(*total)
     }
+
+    async fn renew_freshness(
+        &self,
+        canonical_key: &str,
+        fresh_ttl_secs: u64,
+        stale_window_secs: u64,
+    ) -> eyre::Result<()> {
+        let now = self.clock.unix_now();
+        let mut records = self.records.lock().unwrap();
+        match records.get_mut(canonical_key) {
+            Some(record) => {
+                record.fresh_expires_at = Some(now + fresh_ttl_secs as i64);
+                record.body_expires_at = now + stale_window_secs as i64;
+                Ok(())
+            }
+            // the entry expired between the load and the renewal: behave like
+            // Redis, which re-anchors the marker anyway (a marker without a
+            // body classifies as a miss)
+            None => Ok(()),
+        }
+    }
+}
+
+impl InMemoryCache {
+    /// Total quota usage recorded so far; lets tests observe the probe's
+    /// ~1-unit cost.
+    #[cfg(test)]
+    pub async fn total_quota_usage(&self) -> i64 {
+        *self.quota_usage.lock().unwrap()
+    }
 }

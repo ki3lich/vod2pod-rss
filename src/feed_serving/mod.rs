@@ -1,21 +1,25 @@
 //! The Feed Serving module: the single seam for serving a Feed. It owns the
 //! served rungs of the Degradation Ladder (docs/adr/0001) — Fresh hit, Stale
-//! hit, Feed Conversion — plus the serving policy numbers, Canonical Feed Key
-//! derivation and stale-while-revalidate coalescing. Storage sits behind the
-//! [`FeedCacheStore`] adapter (Redis in production, in-memory in tests) and
-//! time behind the [`Clock`] adapter (wall clock in production, fixed clock
-//! in tests), so the served rungs are exercised hermetically at this
-//! interface (the adapter-owned tail is driven through fakes until it moves
-//! in).
+//! hit (+ background revalidation), Feed Conversion — plus the serving policy
+//! numbers, Canonical Feed Key derivation and stale-while-revalidate
+//! coalescing. Storage sits behind the [`FeedCacheStore`] adapter (Redis in
+//! production, in-memory in tests), time behind the [`Clock`] adapter (wall
+//! clock in production, fixed clock in tests) and background scheduling
+//! behind the [`RevalidationSpawner`] adapter (actix runtime in production,
+//! recording spawner in tests), so every served rung is exercised hermetically
+//! at this interface (the adapter-owned tail is driven through fakes until it
+//! moves in).
 //!
 //! The module reads no environment configuration: the HTTP adapter reads the
 //! config and injects a [`ServingPolicy`]. The ladder tail (Quota Breaker
 //! preemption and the Degraded Feed rung) still lives in the HTTP adapter and
 //! is injected as [`DownstreamRungs`] — ceiling: tail outside the module,
-//! carve it in per issue #157 (background revalidation likewise, #156).
+//! carve it in per issue #157.
 
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, LazyLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -84,6 +88,28 @@ impl Clock for WallClock {
     }
 }
 
+/// A background revalidation task handed to the spawner adapter.
+pub type RevalidationTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Schedules the module's background revalidation outside the serving
+/// request. The actix runtime in production; a recording spawner in tests, so
+/// revalidation requests — the Canonical Feed Key they target included — and
+/// their effects are observable hermetically.
+pub trait RevalidationSpawner: Send + Sync {
+    /// Schedule the revalidation of the Feed cached under `canonical_key`.
+    fn spawn(&self, canonical_key: &str, task: RevalidationTask);
+}
+
+/// Production spawner: the actix runtime the server runs on.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ActixSpawner;
+
+impl RevalidationSpawner for ActixSpawner {
+    fn spawn(&self, _canonical_key: &str, task: RevalidationTask) {
+        actix_rt::spawn(task);
+    }
+}
+
 /// Storage of cached Feeds, behind which the byte layout hides: the module
 /// owns freshness policy, the adapter owns storage mechanics. The Redis
 /// adapter runs in production (current data layout), the in-memory adapter
@@ -113,12 +139,26 @@ pub trait FeedCacheStore: Send + Sync {
     /// Record metered units a Feed Conversion consumed (best-effort usage
     /// estimate; a failure only loses the estimate, never the feed).
     async fn bump_quota_usage(&self, units: u64) -> eyre::Result<i64>;
+
+    /// Re-anchor freshness after a probe answered "unchanged": the fresh
+    /// marker gets `fresh_ttl_secs` (which must not outlive the Fresh
+    /// Period), the body TTL is re-anchored to the Stale Window. The
+    /// generation timestamp is deliberately not touched, so the Fresh Period
+    /// still forces a full conversion eventually.
+    async fn renew_freshness(
+        &self,
+        canonical_key: &str,
+        fresh_ttl_secs: u64,
+        stale_window_secs: u64,
+    ) -> eyre::Result<()>;
 }
 
 /// The tail of the Degradation Ladder not yet owned by this module: Quota
 /// Breaker preemption and the Degraded Feed rung. Injected at construction;
-/// the module calls it at exactly the two ladder points where those rungs
-/// apply, so the rung order of docs/adr/0001 is unchanged.
+/// the module calls it at exactly the ladder points where the tail applies —
+/// the two serving points of the request path, and the two points where
+/// background revalidation meets metered work — so the rung order of
+/// docs/adr/0001 is unchanged.
 /// ceiling: adapter-owned tail — carve into this module per issue #157,
 /// which also deletes this trait.
 #[async_trait]
@@ -144,6 +184,24 @@ pub trait DownstreamRungs: Send + Sync {
         canonical_key: &str,
         err: eyre::Error,
     ) -> Option<ServedFeed>;
+
+    /// Background revalidation asks the tail before doing metered work (the
+    /// Freshness Probe and the Feed Conversion both are): `true` when a
+    /// downstream rung preempts it — the Quota Breaker is open for the
+    /// provider — and the stale body must keep serving untouched.
+    async fn blocks_metered_revalidation(&self, provider: &dyn MediaProvider) -> bool;
+
+    /// Background revalidation's Feed Conversion failed. The tail records the
+    /// failure's ladder consequences (opening the Quota Breaker on quota
+    /// exhaustion); the stale body stays cached either way and nothing is
+    /// served from here.
+    async fn on_revalidation_failed(
+        &self,
+        source_url: &Url,
+        provider: &dyn MediaProvider,
+        canonical_key: &str,
+        err: &eyre::Error,
+    );
 }
 
 /// Which ladder rung produced the served Feed: the metadata the HTTP side
@@ -282,59 +340,80 @@ async fn regeneration_lock(canonical_key: &str) -> Arc<Mutex<()>> {
 /// Wait for any in-flight regeneration of this feed, then hold its slot.
 /// Callers MUST re-read the cache after acquiring: the previous holder may
 /// have refreshed the entry in the meantime.
-pub async fn begin_regeneration(canonical_key: &str) -> OwnedMutexGuard<()> {
+async fn begin_regeneration(canonical_key: &str) -> OwnedMutexGuard<()> {
     regeneration_lock(canonical_key).await.lock_owned().await
 }
 
-/// Non-blocking variant for background revalidation: `None` means another
-/// regeneration is already running for this feed, so there is nothing to do.
-pub async fn try_begin_regeneration(canonical_key: &str) -> Option<OwnedMutexGuard<()>> {
+/// Non-blocking variant for the module's background revalidation: `None`
+/// means another regeneration is already running for this feed, so there is
+/// nothing to do.
+async fn try_begin_regeneration(canonical_key: &str) -> Option<OwnedMutexGuard<()>> {
     regeneration_lock(canonical_key).await.try_lock_owned().ok()
 }
 
-/// The Feed Serving module. Constructed with an injected policy, clock and
-/// downstream rungs; the cache adapter is supplied per serve call, so the
-/// HTTP adapter keeps its connection handling.
+/// The Feed Serving module. Constructed with an injected policy, clock,
+/// spawner and downstream rungs; the cache adapter is supplied per serve
+/// call, so the HTTP adapter keeps its connection handling. Cloning is cheap:
+/// the adapters are shared through `Arc`s, which is how the background
+/// revalidation future owns the module logic it runs.
+#[derive(Clone)]
 pub struct FeedServing {
     policy: ServingPolicy,
     clock: Arc<dyn Clock>,
-    downstream: Box<dyn DownstreamRungs>,
+    /// Schedules the module's background revalidation outside the serving
+    /// request: the actix runtime in production, a recording spawner in
+    /// tests.
+    spawner: Arc<dyn RevalidationSpawner>,
+    downstream: Arc<dyn DownstreamRungs>,
 }
 
 impl FeedServing {
     pub fn new(
         policy: ServingPolicy,
         clock: Arc<dyn Clock>,
-        downstream: Box<dyn DownstreamRungs>,
+        spawner: Arc<dyn RevalidationSpawner>,
+        downstream: Arc<dyn DownstreamRungs>,
     ) -> Self {
         Self {
             policy,
             clock,
+            spawner,
             downstream,
         }
     }
 
     /// Run the Degradation Ladder for a Source URL and return the Feed to
     /// serve (docs/adr/0001): a Fresh copy is served as-is; a Stale copy is
-    /// served within the Stale Window; a miss performs a coalesced Feed
-    /// Conversion, stores the result and serves it. The remaining rungs
-    /// (Quota Breaker preemption, Degraded Feed) come from the injected
-    /// downstream rungs until they are carved into this module. An error
-    /// means the ladder is exhausted: the adapter answers the client with an
-    /// error.
+    /// served within the Stale Window while its background revalidation is
+    /// scheduled through the spawner adapter (stale-while-revalidate); a miss
+    /// performs a coalesced Feed Conversion, stores the result and serves it.
+    /// The remaining rungs (Quota Breaker preemption, Degraded Feed) come from
+    /// the injected downstream rungs until they are carved into this module.
+    /// An error means the ladder is exhausted: the adapter answers the client
+    /// with an error.
+    ///
+    /// The cache and provider are `Arc`s because the scheduled revalidation
+    /// keeps working with them after this request returns.
     pub async fn serve(
         &self,
-        cache: &dyn FeedCacheStore,
+        cache: Arc<dyn FeedCacheStore>,
         source_url: &Url,
-        provider: &dyn MediaProvider,
+        provider: Arc<dyn MediaProvider>,
     ) -> eyre::Result<ServedFeed> {
-        let canonical_key = canonical_feed_key(source_url, provider).await;
+        let canonical_key = canonical_feed_key(source_url, provider.as_ref()).await;
         debug!("canonical feed key for {source_url}: {canonical_key}");
 
         // rung 0/1: a fresh copy is served without contacting the provider at
         // all; a stale copy is served while the feed is revalidated in the
         // background (stale-while-revalidate)
-        if let Some(served) = self.serve_from_cache(cache, &canonical_key).await {
+        if let Some(served) = self.serve_from_cache(&*cache, &canonical_key).await {
+            self.schedule_revalidation(
+                served.freshness,
+                &cache,
+                &canonical_key,
+                source_url,
+                &provider,
+            );
             return Ok(served);
         }
 
@@ -343,9 +422,16 @@ impl FeedServing {
         // waiting because the previous slot holder may have refreshed it
         // already.
         let _regen_slot = begin_regeneration(&canonical_key).await;
-        if let Some(served) = self.serve_from_cache(cache, &canonical_key).await {
+        if let Some(served) = self.serve_from_cache(&*cache, &canonical_key).await {
             info!(
                 "re-checked cache after waiting for a concurrent regeneration of {canonical_key}"
+            );
+            self.schedule_revalidation(
+                served.freshness,
+                &cache,
+                &canonical_key,
+                source_url,
+                &provider,
             );
             return Ok(served);
         }
@@ -354,7 +440,7 @@ impl FeedServing {
         // miss, before any metered call
         if let Some(served) = self
             .downstream
-            .before_conversion(source_url, provider, &canonical_key)
+            .before_conversion(source_url, provider.as_ref(), &canonical_key)
             .await
         {
             return Ok(served);
@@ -362,7 +448,7 @@ impl FeedServing {
 
         // rung 2: Feed Conversion
         match self
-            .convert_and_store(cache, &canonical_key, source_url, provider)
+            .convert_and_store(&*cache, &canonical_key, source_url, provider.as_ref())
             .await
         {
             Ok(served) => Ok(served),
@@ -371,10 +457,128 @@ impl FeedServing {
                 // exhaustion included); the fallback itself failing surfaces
                 // the error to the client
                 self.downstream
-                    .on_conversion_failed(source_url, provider, &canonical_key, e)
+                    .on_conversion_failed(source_url, provider.as_ref(), &canonical_key, e)
                     .await
                     .ok_or_else(|| eyre::eyre!("degradation ladder exhausted for {source_url}"))
             }
+        }
+    }
+
+    /// A Stale hit serves immediately and schedules its background
+    /// revalidation through the spawner adapter: exactly one revalidation
+    /// request per stale serve (coalescing happens inside the revalidation
+    /// itself). The revalidation future owns a cheap clone of this module, so
+    /// it runs the same ladder logic after the request is gone.
+    fn schedule_revalidation(
+        &self,
+        freshness: Freshness,
+        cache: &Arc<dyn FeedCacheStore>,
+        canonical_key: &str,
+        source_url: &Url,
+        provider: &Arc<dyn MediaProvider>,
+    ) {
+        if freshness != Freshness::Stale {
+            return;
+        }
+        info!("serving stale feed {canonical_key}, scheduling background revalidation");
+        self.spawner.spawn(
+            canonical_key,
+            Box::pin(self.clone().revalidate(
+                cache.clone(),
+                canonical_key.to_string(),
+                source_url.clone(),
+                provider.clone(),
+            )),
+        );
+    }
+
+    /// The background half of stale-while-revalidate (the ladder's
+    /// revalidation rung): probe the cached copy while it is still probeable
+    /// — "unchanged" renews freshness without a Feed Conversion — and re-run
+    /// the module's own Feed Conversion otherwise (probe "changed", probe
+    /// failure, Fresh Period exhausted, Degraded Feed). Failures keep the
+    /// stale body cached so clients keep being served. Runs through the
+    /// spawner adapter, outside any request.
+    async fn revalidate(
+        self,
+        cache: Arc<dyn FeedCacheStore>,
+        canonical_key: String,
+        source_url: Url,
+        provider: Arc<dyn MediaProvider>,
+    ) {
+        // coalescing: another revalidation or conversion of this feed is in
+        // flight, there is nothing to do
+        let Some(_regen_slot) = try_begin_regeneration(&canonical_key).await else {
+            debug!("revalidation of {canonical_key} already in flight, skipping");
+            return;
+        };
+
+        // metered work (probe and conversion alike) is preempted while the
+        // Quota Breaker is open: the stale body keeps serving untouched
+        if self
+            .downstream
+            .blocks_metered_revalidation(provider.as_ref())
+            .await
+        {
+            info!("quota breaker open, skipping background revalidation of {canonical_key}");
+            return;
+        }
+
+        let Some(cached) = cache.load(&canonical_key).await else {
+            return;
+        };
+
+        let age = self.clock.unix_now() - cached.generated_at;
+        // probes may only renew a feed while it is within the Fresh Period;
+        // degraded feeds are never probed, they must be replaced by a real
+        // conversion as soon as possible
+        let probeable = age < self.policy.max_fresh_period_secs as i64 && !cached.degraded;
+
+        if probeable {
+            if let Some(state) = cached.probe_state.clone() {
+                match provider.probe_feed_freshness(&source_url, &state).await {
+                    Ok(true) => {
+                        info!(
+                            "feed {canonical_key} unchanged upstream, renewing freshness after probe"
+                        );
+                        if let Err(e) = cache.bump_quota_usage(1).await {
+                            warn!("could not record quota usage estimate: {e}");
+                        }
+                        // the fresh marker must not outlive the Fresh Period
+                        let remaining_fresh = (self.policy.max_fresh_period_secs as i64 - age)
+                            .min(self.policy.fresh_ttl_secs as i64);
+                        if let Err(e) = cache
+                            .renew_freshness(
+                                &canonical_key,
+                                remaining_fresh.max(1) as u64,
+                                self.policy.stale_window_secs,
+                            )
+                            .await
+                        {
+                            warn!("could not renew freshness of {canonical_key}: {e}");
+                        }
+                        return;
+                    }
+                    Ok(false) => info!("feed {canonical_key} changed upstream, regenerating"),
+                    Err(e) => {
+                        warn!("freshness probe failed for {canonical_key} ({e}), regenerating")
+                    }
+                }
+            }
+        } else if age >= self.policy.max_fresh_period_secs as i64 {
+            info!("feed {canonical_key} reached the fresh period limit, regenerating fully");
+        }
+
+        if let Err(e) = self
+            .convert_and_store(&*cache, &canonical_key, &source_url, provider.as_ref())
+            .await
+        {
+            // the stale body is kept on purpose, it keeps serving clients;
+            // the ladder tail records the failure's consequences (opening the
+            // Quota Breaker on quota exhaustion)
+            self.downstream
+                .on_revalidation_failed(&source_url, provider.as_ref(), &canonical_key, &e)
+                .await;
         }
     }
 
@@ -424,10 +628,9 @@ impl FeedServing {
     /// the cache is unavailable the generated body is served anyway (losing
     /// the cache entry only costs quota).
     ///
-    /// Public so background revalidation can invoke the conversion rung
-    /// without running the whole ladder — ceiling: revalidation lives in the
-    /// HTTP adapter until it joins this module (issue #156).
-    pub async fn convert_and_store(
+    /// The single implementation of the conversion rung: both the serving
+    /// path and background revalidation go through it.
+    async fn convert_and_store(
         &self,
         cache: &dyn FeedCacheStore,
         canonical_key: &str,
