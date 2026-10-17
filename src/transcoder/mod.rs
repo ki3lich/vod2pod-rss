@@ -3,8 +3,8 @@ pub(crate) mod staging;
 mod stdout_pump;
 mod stream_url;
 
-pub use self::staging::sweep_stale_staged_sources;
 use self::staging::StagedFileGuard;
+pub use self::staging::{init_stage_gate, sweep_stale_staged_sources};
 use self::stdout_pump::{spawn_pump_threads, ChannelBytes};
 use self::stream_url::{ProviderStreamUrlResolver, ResolvedSource, StreamUrlResolver};
 use std::error::Error;
@@ -705,7 +705,9 @@ mod test {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::transcoder::staging::{stage_gate, STAGED_FILE_PREFIX};
+    use tokio::sync::Semaphore;
+
+    use crate::transcoder::staging::{stage_gate_of, STAGED_FILE_PREFIX};
 
     use crate::provider::{GeneratedFeed, MediaProvider};
     use crate::rss_transcodizer::streamable_bytes;
@@ -819,8 +821,14 @@ mod test {
     }
 
     /// A staged resolver wired like production: direct-media provider,
-    /// reachable preflight, the real staging stage behind an open gate.
-    fn e2e_resolver(origin_url: Url, staging: StagingCheckStage) -> ProviderStreamUrlResolver {
+    /// reachable preflight, the real staging stage behind an open gate. The
+    /// gate is injected (issue #177): tests pass one of their own capacity;
+    /// a single transcode never queues, so its size is irrelevant there.
+    fn e2e_resolver(
+        origin_url: Url,
+        staging: StagingCheckStage,
+        stage_gate: Arc<Semaphore>,
+    ) -> ProviderStreamUrlResolver {
         ProviderStreamUrlResolver::new(
             Arc::new(OriginProvider(origin_url)),
             Arc::new(stream_url::TcpPreflight::with_timeout(Duration::from_secs(
@@ -828,6 +836,7 @@ mod test {
             ))),
             Some(Arc::new(staging)),
             true,
+            Some(stage_gate),
         )
     }
 
@@ -867,7 +876,7 @@ mod test {
             },
         );
         let (staging, _stage_dir) = test_staging(1024 * 1024);
-        let resolver = e2e_resolver(origin.url(), staging);
+        let resolver = e2e_resolver(origin.url(), staging, stage_gate_of(4));
         let media = e2e_media_url();
 
         let started = Instant::now();
@@ -940,7 +949,7 @@ mod test {
             },
         );
         let (staging, _stage_dir) = test_staging(1024 * 1024);
-        let resolver = e2e_resolver(origin.url(), staging);
+        let resolver = e2e_resolver(origin.url(), staging, stage_gate_of(4));
         let media = e2e_media_url();
 
         let staged = match resolver
@@ -1007,6 +1016,7 @@ mod test {
                 ))),
                 None,
                 false,
+                None,
             ),
         )
         .await
@@ -1018,7 +1028,7 @@ mod test {
         // chunks so the file is assembled from several ranged GETs — and
         // ffmpeg reads the file from disk.
         let (staging, _stage_dir) = test_staging(64 * 1024);
-        let staged = match e2e_resolver(origin.url(), staging)
+        let staged = match e2e_resolver(origin.url(), staging, stage_gate_of(4))
             .resolve(&e2e_media_url())
             .await
             .expect("staging must succeed")
@@ -1056,7 +1066,7 @@ mod test {
         // frame sync can ever appear in it: ffmpeg fails fast on it.
         let origin = ScriptedOrigin::start(5 * 1024, OriginScript::default());
         let (staging, _stage_dir) = test_staging(1024);
-        let staged = match e2e_resolver(origin.url(), staging)
+        let staged = match e2e_resolver(origin.url(), staging, stage_gate_of(4))
             .resolve(&e2e_media_url())
             .await
             .expect("staging the garbage source must succeed")
@@ -1106,7 +1116,7 @@ mod test {
             },
         );
         let (staging, _stage_dir) = test_staging(64 * 1024);
-        let staged = match e2e_resolver(origin.url(), staging)
+        let staged = match e2e_resolver(origin.url(), staging, stage_gate_of(4))
             .resolve(&e2e_media_url())
             .await
             .expect("staging must succeed")
@@ -1144,13 +1154,13 @@ mod test {
         // are bounded by the staging concurrency (STAGE_CONCURRENCY, 4
         // unset) — one slot per staged file on disk, taken before the stage
         // creates the file and held until the transcode deletes it. With
-        // more transcodes in flight than slots (three beyond the gate's
-        // capacity), the excess queue instead of staging in parallel: at
-        // most `limit` staged files ever exist at once, and every transcode
-        // still completes. The limit is read off the gate itself, so the
-        // test holds whatever the environment configures.
-        let limit = stage_gate().available_permits();
-        assert!(limit >= 1, "the gate always has at least one slot");
+        // more transcodes in flight than slots (three beyond this gate's
+        // custom capacity of two), the excess queue instead of staging in
+        // parallel: at most `limit` staged files ever exist at once, and
+        // every transcode still completes. The gate is built and injected
+        // right here (issue #177), so the capacity the test pins is the
+        // test's own, not the environment's.
+        let limit = 2;
         let fixture = MediaFixture::new("load", 30);
         let origin = ScriptedOrigin::start(
             0,
@@ -1160,7 +1170,11 @@ mod test {
             },
         );
         let (staging, stage_dir) = test_staging(64 * 1024);
-        let resolver = Arc::new(e2e_resolver(origin.url(), staging));
+        let resolver = Arc::new(e2e_resolver(
+            origin.url(),
+            staging,
+            stage_gate_of(limit as u64),
+        ));
         let media = e2e_media_url();
         let expected = e2e_expected_bytes(30);
 

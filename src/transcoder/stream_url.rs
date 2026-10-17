@@ -185,6 +185,12 @@ pub struct ProviderStreamUrlResolver {
     /// The staging kill switch (`STAGE_SOURCES`): off, every request takes
     /// the exact legacy path.
     staging_enabled: bool,
+    /// The staging gate the staged path holds its slot from, injected to
+    /// control its capacity (issue #177). `None` — production — is the
+    /// process-wide gate, which startup initialized exactly once from the
+    /// configured staging concurrency; it is consulted only when this
+    /// resolver will stage.
+    stage_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl ProviderStreamUrlResolver {
@@ -198,23 +204,29 @@ impl ProviderStreamUrlResolver {
             preflight: Arc::new(TcpPreflight::with_configured_timeout()),
             stager: Some(Arc::new(super::staging::StagingCheckStage::production())),
             staging_enabled: staging_enabled_from_conf(),
+            // Production capacity is the process-wide gate's; it is
+            // consulted at slot-acquisition time (see
+            // [`StreamUrlResolver::stage_gate`]).
+            stage_gate: None,
         }
     }
 
     /// Injection point for tests: any provider fake, any check stages, any
-    /// kill-switch state.
+    /// kill-switch state, any staging gate capacity.
     #[cfg(test)]
     pub fn new(
         provider: Arc<dyn MediaProvider>,
         preflight: Arc<dyn CheckStage>,
         stager: Option<Arc<dyn CheckStage>>,
         staging_enabled: bool,
+        stage_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         Self {
             provider,
             preflight,
             stager,
             staging_enabled,
+            stage_gate,
         }
     }
 
@@ -275,9 +287,13 @@ fn staging_enabled_from(raw: &str) -> bool {
 impl StreamUrlResolver for ProviderStreamUrlResolver {
     fn stage_gate(&self) -> Option<Arc<tokio::sync::Semaphore>> {
         // Exactly when check_stage() picks the staging stage — that is when
-        // a staged file will be created and must hold a slot.
+        // a staged file will be created and must hold a slot. With the gate
+        // open but no staging stage wired, the preflight runs and no file
+        // is ever created: slotless.
         if self.stages() {
-            self.stager.as_ref().map(|_| super::staging::stage_gate())
+            self.stager
+                .as_ref()
+                .map(|_| self.stage_gate.clone().unwrap_or_else(super::staging::stage_gate))
         } else {
             None
         }
@@ -485,8 +501,13 @@ mod test {
             )),
             Ok(None),
         ]));
-        let resolver =
-            ProviderStreamUrlResolver::new(Arc::new(provider), preflight.clone(), None, false);
+        let resolver = ProviderStreamUrlResolver::new(
+            Arc::new(provider),
+            preflight.clone(),
+            None,
+            false,
+            None,
+        );
 
         let first = resolver.resolve(&media).await;
         assert!(
@@ -516,8 +537,13 @@ mod test {
         let (provider, log) =
             ScriptedProvider::new(vec![Err(eyre::eyre!("unable to extract stream url"))]);
         let preflight = Arc::new(ScriptedCheck::new(Vec::new()));
-        let resolver =
-            ProviderStreamUrlResolver::new(Arc::new(provider), preflight.clone(), None, false);
+        let resolver = ProviderStreamUrlResolver::new(
+            Arc::new(provider),
+            preflight.clone(),
+            None,
+            false,
+            None,
+        );
 
         let err = resolver
             .resolve(&media)
@@ -550,6 +576,7 @@ mod test {
             preflight.clone(),
             Some(stager.clone()),
             false,
+            None,
         );
 
         let source = resolver
@@ -582,6 +609,7 @@ mod test {
             preflight.clone(),
             Some(stager.clone()),
             true,
+            None,
         );
 
         let source = resolver
@@ -617,6 +645,7 @@ mod test {
             preflight.clone(),
             Some(stager.clone()),
             true,
+            None,
         );
 
         let source = resolver
@@ -655,6 +684,7 @@ mod test {
             preflight.clone(),
             Some(stager.clone()),
             true,
+            None,
         );
 
         let first = resolver.resolve(&media).await;
@@ -719,6 +749,7 @@ mod test {
             preflight.clone(),
             Some(stager.clone()),
             true,
+            None,
         );
 
         let first = resolver.resolve(&media).await;
@@ -761,7 +792,7 @@ mod test {
         let (provider, log) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
         let preflight = Arc::new(ScriptedCheck::new(vec![Ok(None)]));
         let resolver =
-            ProviderStreamUrlResolver::new(Arc::new(provider), preflight.clone(), None, true);
+            ProviderStreamUrlResolver::new(Arc::new(provider), preflight.clone(), None, true, None);
 
         let source = resolver
             .resolve(&media)
@@ -779,54 +810,72 @@ mod test {
         // direct-media source, a staging stage wired. Every other shape
         // takes the legacy preflight path and must go slotless, so the
         // kill switch restores the exact legacy path with no queueing.
+        // Every shape here injects a gate of its own (issue #177): a
+        // resolver handed a gate must hand out exactly that gate when it
+        // will stage, and never hand out a gate when it will not.
+        use crate::transcoder::staging::stage_gate_of;
+
         let resolved = Url::parse("https://edge.googlevideo.com/videoplayback?x=1").unwrap();
 
-        // Staging will run: a slot gate comes with the resolver.
+        // Staging will run: the injected gate comes with the resolver.
+        let gate = stage_gate_of(1);
         let (direct, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
         let staging = ProviderStreamUrlResolver::new(
             Arc::new(direct),
             Arc::new(ScriptedCheck::new(vec![])),
             Some(Arc::new(ScriptedCheck::new(vec![]))),
             true,
+            Some(gate.clone()),
         );
+        let handed = StreamUrlResolver::stage_gate(&staging)
+            .expect("a resolver that will stage hands out the staging gate");
         assert!(
-            StreamUrlResolver::stage_gate(&staging).is_some(),
-            "a resolver that will stage hands out the staging gate"
+            Arc::ptr_eq(&handed, &gate),
+            "the handed-out gate is the injected one"
         );
 
-        // Kill switch off: the exact legacy path, no slot.
+        // Kill switch off: the exact legacy path, no slot — even with a
+        // gate injected.
+        let gate = stage_gate_of(1);
         let (direct, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
         let legacy = ProviderStreamUrlResolver::new(
             Arc::new(direct),
             Arc::new(ScriptedCheck::new(vec![])),
             Some(Arc::new(ScriptedCheck::new(vec![]))),
             false,
+            Some(gate),
         );
         assert!(
             StreamUrlResolver::stage_gate(&legacy).is_none(),
             "the kill switch must restore the legacy path slotless"
         );
 
-        // Manifest-based source: never staged, whatever the switch says.
+        // Manifest-based source: never staged, whatever the switch says —
+        // even with a gate injected.
+        let gate = stage_gate_of(1);
         let (manifest, _) = ScriptedProvider::manifest(vec![Ok(resolved.clone())]);
         let manifest_resolver = ProviderStreamUrlResolver::new(
             Arc::new(manifest),
             Arc::new(ScriptedCheck::new(vec![])),
             Some(Arc::new(ScriptedCheck::new(vec![]))),
             true,
+            Some(gate),
         );
         assert!(
             StreamUrlResolver::stage_gate(&manifest_resolver).is_none(),
             "a manifest source never stages, so it never takes a slot"
         );
 
-        // Staging enabled but no staging stage wired: the preflight runs.
+        // Staging enabled but no staging stage wired: the preflight runs —
+        // even with a gate injected.
+        let gate = stage_gate_of(1);
         let (direct, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
         let unwired = ProviderStreamUrlResolver::new(
             Arc::new(direct),
             Arc::new(ScriptedCheck::new(vec![])),
             None,
             true,
+            Some(gate),
         );
         assert!(
             StreamUrlResolver::stage_gate(&unwired).is_none(),

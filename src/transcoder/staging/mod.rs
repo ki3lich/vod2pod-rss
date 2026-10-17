@@ -25,11 +25,17 @@ pub mod check_stage;
 // Re-exports: the seam's public surface — everything outside this module
 // consumes the staging engine through the root, never by walking into a
 // submodule.
-pub use check_stage::{stage_gate, sweep_stale_staged_sources, StagedFileGuard, StagingCheckStage};
+pub use check_stage::{
+    init_stage_gate, stage_gate, sweep_stale_staged_sources, StagedFileGuard, StagingCheckStage,
+};
 
 // Test-only knobs, shared across the modules' test suites.
 #[cfg(test)]
 pub use check_stage::STAGED_FILE_PREFIX;
+// The gate constructor tests share with startup (issue #177): tests build
+// gates of their own capacity and inject them.
+#[cfg(test)]
+pub use check_stage::stage_gate_of;
 #[cfg(test)]
 pub use chunk_plan::MAX_CHUNK_ATTEMPTS;
 #[cfg(test)]

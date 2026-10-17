@@ -45,27 +45,51 @@ fn shared_client() -> Client {
 /// The staging gate with room for `concurrency` stages at once — one slot
 /// per staged file on disk. A configured zero (or anything that would leave
 /// no slot) must never deadlock the pipeline, so the floor is one.
-fn stage_gate_of(concurrency: u64) -> Arc<Semaphore> {
+///
+/// The constructor startup and tests share: startup builds the process-wide
+/// gate with it, tests build gates of their own capacity and inject them
+/// into the resolver (issue #177).
+pub fn stage_gate_of(concurrency: u64) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(concurrency.max(1) as usize))
 }
 
+/// The process-wide staging gate, initialized exactly once by
+/// [`init_stage_gate`] and handed out by [`stage_gate`] ever after.
+static STAGE_GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Initialize the process-wide staging gate from the configured staging
+/// concurrency (`STAGE_CONCURRENCY`). Runs exactly once, at startup beside
+/// the Startup Sweep and before the server accepts its first request —
+/// capacity has one owner and one place (issue #177). A second
+/// initialization is a wiring bug and fails loudly.
+pub fn init_stage_gate() {
+    let concurrency = conf_u64(ConfName::StageConcurrency, DEFAULT_STAGE_CONCURRENCY);
+    if STAGE_GATE.set(stage_gate_of(concurrency)).is_err() {
+        panic!(
+            "the staging gate is already initialized: it is initialized exactly once, at startup"
+        );
+    }
+}
+
 /// The process-wide staging gate: one permit per staged file on disk, its
-/// capacity the configured staging concurrency (`STAGE_CONCURRENCY`).
+/// capacity the staging concurrency the startup initialization configured.
 ///
 /// A staged transcode holds its slot from before its stage creates the temp
 /// file until the transcode ends and the file is deleted — so simultaneous
 /// subscribers can stage at most this many sources in parallel and hold at
 /// most this many staged files on disk; everyone else queues. The capacity
-/// is read once per process: retuning takes a restart.
+/// is fixed at startup: retuning takes a restart.
+///
+/// # Panics
+/// When startup never initialized the gate: no transcode may stage before
+/// [`init_stage_gate`] ran.
 pub fn stage_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    GATE.get_or_init(|| {
-        stage_gate_of(conf_u64(
-            ConfName::StageConcurrency,
-            DEFAULT_STAGE_CONCURRENCY,
-        ))
+    STAGE_GATE.get().cloned().unwrap_or_else(|| {
+        panic!(
+            "the staging gate is not initialized: init_stage_gate() must run at startup, \
+             before the server accepts requests"
+        )
     })
-    .clone()
 }
 
 /// The production check stage: performs the Source Stage for the resolved
@@ -605,10 +629,10 @@ mod test {
         assert_eq!(stage.limits.concurrency, 4);
 
         // Set: an operator tunes for their network without code changes.
-        // STAGE_CONCURRENCY is deliberately not exercised here — the shared
-        // global stage gate initializes from it, and this env var is
-        // process-global; its wiring is covered by the gate capacity test
-        // and the bounded-concurrency load test.
+        // STAGE_CONCURRENCY is deliberately not exercised here — the env is
+        // process-global, and the gate reads it exactly once, in its startup
+        // initialization (issue #177); its capacity floor is pinned by the
+        // gate capacity test, queueing by the injected-gate load test.
         std::env::set_var("STAGE_CHUNK_SIZE_BYTES", "1048576");
         std::env::set_var("STAGE_TOTAL_TIMEOUT_SECONDS", "30");
         std::env::set_var("STAGE_REQUEST_TIMEOUT_SECONDS", "5");
@@ -636,13 +660,26 @@ mod test {
     }
 
     #[test]
-    fn stage_gate_capacity_follows_the_configured_concurrency_clamped_to_one() {
-        // The staging slot count is the configured staging concurrency —
+    fn stage_gate_capacity_follows_the_requested_concurrency_clamped_to_one() {
+        // The staging slot count is the requested staging concurrency —
         // one slot per staged file on disk. A zero (or any way to end up
         // with none) must never deadlock the pipeline: the floor is one
-        // slot.
+        // slot. The constructor is shared: startup builds the process-wide
+        // gate with it, tests build gates of their own capacity to inject.
         assert_eq!(stage_gate_of(4).available_permits(), 4);
         assert_eq!(stage_gate_of(9).available_permits(), 9);
         assert_eq!(stage_gate_of(0).available_permits(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn a_second_gate_initialization_fails_loudly() {
+        // The gate is initialized exactly once, at startup (issue #177):
+        // capacity has one owner and one place, and a second initialization
+        // is a wiring bug that must fail loudly. Whether or not another
+        // test got here first, this test's own second initialization must
+        // panic.
+        let _ = std::panic::catch_unwind(init_stage_gate);
+        init_stage_gate();
     }
 }

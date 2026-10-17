@@ -118,8 +118,12 @@ disagree, one of them is wrong — fix it before moving on.
   Gate** (`stage_gate()` in code), the process-wide pool whose capacity is
   the **Staging Concurrency** (`STAGE_CONCURRENCY`, default 4); transcodes
   beyond it queue instead of staging in parallel, bounding egress and
-  ephemeral storage alike. A slot is held only on the staged path: the kill
-  switch, manifest-based sources and the legacy path go slotless.
+  ephemeral storage alike. The gate is initialized exactly once at startup —
+  beside the Startup Sweep, before the server accepts its first request —
+  and a second initialization fails loudly. Tests build gates of their own
+  capacity and inject them into the resolver. A slot is held only on the
+  staged path: the kill switch, manifest-based sources and the legacy path
+  go slotless.
 - **Startup Sweep**: the process-start removal of staged temp files a
   crashed predecessor left. Runs once, before the server accepts its first
   request — so a live staged file is never swept — and only touches files

@@ -34,6 +34,13 @@ async fn async_main() -> std::io::Result<()> {
     // (issue #172). Best-effort — a failure must not block startup.
     vod2pod_rss::transcoder::sweep_stale_staged_sources();
 
+    // The staging gate's capacity has one owner and one place: initialized
+    // exactly once from the configured staging concurrency (issue #177),
+    // beside the sweep and before the server accepts its first request — no
+    // transcode can stage before the gate exists. A second initialization
+    // fails loudly.
+    vod2pod_rss::transcoder::init_stage_gate();
+
     // Apple Podcasts (and most podcatchers) play MP3/M4A only: OGG/Opus
     // enclosures fail silently there. Keep the trade-off visible at startup.
     let codec: AudioCodec = conf().get(ConfName::AudioCodec).unwrap().into();
