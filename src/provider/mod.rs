@@ -449,3 +449,166 @@ mod dispatch_warning_tests {
         );
     }
 }
+
+/// Pins the dispatched provider's forwarding table (issue #176): every
+/// `MediaProvider` method called through the enum must reach the concrete
+/// provider the url dispatched to, never the trait's no-quota /
+/// unsupported defaults. A defaulted trait method that the dispatcher macro
+/// does not forward answers its default through the enum — exactly the
+/// silent fall-through that kept the Quota Breaker from ever opening.
+///
+/// The enum is constructed from a provider url the way the server does
+/// (`provider::from`): the YouTube provider is a unit struct, so no config
+/// and no network take part. Every driven method answers deterministically
+/// before any I/O; the two Redis- and yt-dlp-bound methods (`get_stream_url`,
+/// `evict_stream_url_cache`) are driven through the Generic fallback, whose
+/// answers need no services.
+#[cfg(test)]
+mod enum_contract_tests {
+    use super::*;
+
+    fn now_utc() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_provider_method_dispatches_through_the_enum() {
+        let provider = from(&Url::parse("https://www.youtube.com/playlist?list=abc").unwrap());
+        assert!(
+            matches!(provider, Provider::YoutubeProvider(_)),
+            "the provider url must dispatch to the YouTube provider"
+        );
+        let watch_url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let playlist_url = Url::parse("https://www.youtube.com/playlist?list=abc").unwrap();
+        let now = now_utc();
+
+        // the concrete provider rejects the watch url's shape before any I/O
+        // (with or without an API key configured); the enum must forward to
+        // that rejection
+        let err = provider
+            .generate_rss_feed(watch_url.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported youtube url"),
+            "generate_rss_feed must dispatch to the concrete provider, got: {err}"
+        );
+
+        // a value parsed from the url itself; the trait default would answer
+        // None
+        assert_eq!(
+            provider.canonical_feed_id(&playlist_url).await,
+            Some("yt:playlist:abc".to_string()),
+            "canonical_feed_id must dispatch to the concrete provider"
+        );
+
+        // the concrete provider rejects a state without a probe target before
+        // touching config or API; the trait default would answer its canned
+        // "not supported" error
+        let err = provider
+            .probe_feed_freshness(&playlist_url, &FeedProbeState::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no probe target"),
+            "probe_feed_freshness must dispatch to the concrete provider, got: {err}"
+        );
+
+        // same deterministic rejection as generate_rss_feed; the trait
+        // default would answer its canned "not supported" error
+        let err = provider
+            .generate_rss_feed_quota_free(watch_url)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported youtube url"),
+            "generate_rss_feed_quota_free must dispatch to the concrete provider, got: {err}"
+        );
+
+        // the quota facts: the Quota Breaker schedules on these answers, so a
+        // fall-through to the no-quota defaults (all None) is the silent
+        // production bug this table pins. Each must equal the concrete
+        // provider's answer and be a value, not the default.
+        let breaker_key = provider.quota_breaker_key();
+        assert_eq!(
+            breaker_key,
+            YoutubeProvider.quota_breaker_key(),
+            "quota_breaker_key must dispatch to the concrete provider"
+        );
+        assert!(
+            breaker_key.is_some_and(|key| !key.is_empty()),
+            "the dispatched provider must name its Quota Breaker"
+        );
+        let reset = provider.next_quota_reset(now);
+        assert_eq!(
+            reset,
+            YoutubeProvider.next_quota_reset(now),
+            "next_quota_reset must dispatch to the concrete provider"
+        );
+        assert!(
+            reset.is_some_and(|reset| reset > now),
+            "the dispatched provider must answer a future quota reset, got {reset:?}"
+        );
+        let usage_day = provider.quota_usage_day(now);
+        assert_eq!(
+            usage_day,
+            YoutubeProvider.quota_usage_day(now),
+            "quota_usage_day must dispatch to the concrete provider"
+        );
+        assert!(
+            usage_day.is_some(),
+            "the dispatched provider must answer its usage day"
+        );
+
+        // the concrete provider resolves to the media bytes themselves; the
+        // trait default would answer false
+        assert!(
+            provider.streams_direct_media(),
+            "streams_direct_media must dispatch to the concrete provider"
+        );
+
+        // the table the dispatch itself runs on: the same list the concrete
+        // provider answers, matching the url the enum was constructed from
+        let patterns = |provider: &dyn MediaProvider| -> Vec<String> {
+            provider
+                .domain_whitelist_regexes()
+                .iter()
+                .map(|regex| regex.as_str().to_string())
+                .collect()
+        };
+        assert_eq!(
+            patterns(&provider),
+            patterns(&YoutubeProvider),
+            "domain_whitelist_regexes must dispatch to the concrete provider"
+        );
+        assert!(provider
+            .domain_whitelist_regexes()
+            .iter()
+            .any(|regex| regex.is_match(playlist_url.as_str())));
+    }
+
+    #[tokio::test]
+    async fn service_bound_methods_dispatch_through_the_enum_without_services() {
+        // on the YouTube provider these two reach Redis (and yt-dlp); through
+        // the Generic fallback their forwarding arms still run end to end
+        // without any service
+        let generic = from(&Url::parse("https://example.com/video.mp4").unwrap());
+        assert!(
+            matches!(generic, Provider::GenericProvider(_)),
+            "an unmatched url must fall through to the Generic provider"
+        );
+
+        let media_url = Url::parse("https://example.com/video.mp4").unwrap();
+        // the Generic provider answers the media url itself
+        assert_eq!(
+            generic.get_stream_url(&media_url).await.unwrap(),
+            media_url,
+            "get_stream_url must dispatch to the concrete provider"
+        );
+        // the Generic provider does not override eviction (its trait default
+        // is already Ok), so no value can tell a forwarded call from a
+        // defaulted one here — the quota facts above carry the table's real
+        // teeth; this pins the arm runs and completes
+        generic.evict_stream_url_cache(&media_url).await.unwrap();
+    }
+}

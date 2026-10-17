@@ -62,6 +62,14 @@ impl MediaProvider for $name {
         provider_dispatcher!($name, self, $($provider,)* $fallback ; quota_breaker_key());
     }
 
+    fn next_quota_reset(&self, now_utc: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        provider_dispatcher!($name, self, $($provider,)* $fallback ; next_quota_reset(now_utc));
+    }
+
+    fn quota_usage_day(&self, now_utc: DateTime<Utc>) -> Option<String> {
+        provider_dispatcher!($name, self, $($provider,)* $fallback ; quota_usage_day(now_utc));
+    }
+
     async fn get_stream_url(&self, media_url: &Url) -> eyre::Result<Url> {
         provider_dispatcher!($name, self, $($provider,)* $fallback ; get_stream_url(&media_url).await);
     }

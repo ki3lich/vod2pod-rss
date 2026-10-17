@@ -1479,3 +1479,70 @@ async fn degraded_feed_gets_the_injected_short_fresh_ttl() {
     assert_eq!(served.max_age_secs, 123);
     assert_eq!(cache.fresh_marker_ttl("k").await, Some(123));
 }
+
+/// The fake-provider breaker tests above pin the ladder policy but bypass
+/// the dispatched enum; this pin drives the same policy through the real
+/// dispatched provider — `provider::from` over a provider url, exactly as
+/// the server constructs it — which must answer the quota facts the
+/// breaker consumes. A provider method the dispatcher macro does not
+/// forward answers its no-quota default, and the breaker would never open
+/// (issue #176).
+#[tokio::test]
+async fn quota_exhausted_conversion_through_the_dispatched_provider_opens_the_breaker() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let provider = Arc::new(crate::provider::from(&url(
+        "https://www.youtube.com/playlist?list=abc",
+    )));
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+    let err = eyre::Report::new(QuotaExhausted::new(eyre::eyre!(
+        "upstream rejected the call: quota spent"
+    )));
+
+    let classified = serving
+        .open_breaker_if_quota_exhausted(cache.as_ref(), provider.as_ref(), &err)
+        .await;
+
+    assert!(classified);
+    // the breaker holds until the reset time the provider itself answers
+    // through the enum — a fall-through to the no-quota default would leave
+    // it closed
+    let breaker_key = provider.quota_breaker_key().unwrap();
+    let now = DateTime::<Utc>::from_timestamp(clock.unix_now(), 0).unwrap();
+    let reset = provider.next_quota_reset(now).unwrap();
+    assert!(reset > now, "the provider answers a future reset");
+    assert_eq!(
+        cache.breaker_reset(&breaker_key).await,
+        Some(reset.timestamp())
+    );
+}
+
+/// Usage day facts reach the usage recorder through the dispatched
+/// provider: the units land only because the provider answers a day. A
+/// method the dispatcher macro does not forward answers the no-quota
+/// default, and nothing is recorded (issue #176).
+#[tokio::test]
+async fn quota_usage_reaches_the_recorder_through_the_dispatched_provider() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let provider = Arc::new(crate::provider::from(&url(
+        "https://www.youtube.com/playlist?list=abc",
+    )));
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+
+    serving
+        .record_quota_usage(cache.as_ref(), provider.as_ref(), 7)
+        .await;
+
+    // the units land only when the enum forwards the usage day; the
+    // no-quota default records nothing
+    assert_eq!(cache.total_quota_usage().await, 7);
+}
