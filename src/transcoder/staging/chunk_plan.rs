@@ -1,5 +1,8 @@
 //! The pure brain of the staging engine: the chunk plan, the concurrency
-//! window over it, and the retry-vs-fail verdict for every chunk outcome.
+//! window over it, the retry-vs-fail verdict for every chunk outcome, and —
+//! beside them — the stage loop's step decision
+//! ([`next_stage_step`]): relaunch, abort-and-fail, measure, and the final
+//! byte verification.
 //!
 //! No I/O, no logging, no side effects — the fetcher acts these decisions out
 //! and owns every await point (prior art: the stdout pump's
@@ -335,6 +338,139 @@ pub fn open_ended_verdict(
         max_attempts,
         |_, _| Verdict::Done,
     )
+}
+
+/// The stage loop's running state: the retry cost the origin has charged so
+/// far, across the probe, the open-ended fallback and every chunk. Threaded
+/// through [`next_stage_step`] the way the stdout pump threads its counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageState {
+    retries_charged: u32,
+}
+
+impl StageState {
+    /// Charge a finished run of `attempts` fresh-connection attempts — the
+    /// one charging rule for the whole stage: every attempt beyond the
+    /// run's first is a retry the origin charged. The probe, the open-ended
+    /// fallback and each delivered chunk account through here.
+    pub fn charge(&mut self, attempts: u32) {
+        self.retries_charged += attempts.saturating_sub(1);
+    }
+
+    /// The retries charged so far.
+    pub fn retries_charged(&self) -> u32 {
+        self.retries_charged
+    }
+}
+
+/// What the stage loop observed at its one decision point — the executor
+/// builds one per iteration from the scheduler state and a single join over
+/// the in-flight chunk set.
+#[derive(Debug)]
+pub enum StageObservation {
+    /// Every chunk the plan holds is accounted finished: nothing is left to
+    /// launch or join. The executor measures the assembled file next and
+    /// observes its byte count.
+    PlanComplete,
+    /// One join over the in-flight chunks returned.
+    Joined(JoinOutcome),
+    /// The staged file's byte count, measured after the plan completed,
+    /// against the Origin Total the plan was built from — the observation
+    /// the final byte verification decides on.
+    StagedByteCount { staged: u64, origin_total: u64 },
+}
+
+/// The outcome of one join over the in-flight chunk set.
+#[derive(Debug)]
+pub enum JoinOutcome {
+    /// A chunk delivered exactly its planned bytes: `index` its plan
+    /// position, `attempts` the fresh-connection attempts it charged
+    /// (1-based).
+    Delivered { index: usize, attempts: u32 },
+    /// A chunk failed within its attempt budget or on a deterministic
+    /// contradiction — `error` is the clear failure text its verdict
+    /// composed.
+    Failed { error: String },
+    /// The chunk task itself crashed (panicked); `detail` is the join
+    /// error's text.
+    Crashed { detail: String },
+    /// The join found nothing in flight while the plan is incomplete — the
+    /// loop can only be stalled.
+    NothingInFlight,
+}
+
+/// The stage loop's next step, decided purely from one observation and the
+/// running state. Every way the loop can proceed or end is named here; the
+/// executor only acts steps out — spawn, abort, and I/O.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StageStep {
+    /// Account chunk `index` finished — its retries are already charged
+    /// into the returned state — and keep the loop going: the freed window
+    /// may admit the next launch.
+    Relaunch { index: usize },
+    /// Every chunk is staged: the executor measures the assembled file's
+    /// byte count and brings it back as a
+    /// [`StageObservation::StagedByteCount`].
+    MeasureStagedFile,
+    /// The staged file verified against the Origin Total: the stage is
+    /// done, the state carries the retries the origin charged.
+    Verified,
+    /// Abort every in-flight chunk and fail the stage with this error.
+    AbortAndFail { error: String },
+}
+
+/// Decide the stage loop's next step from one observation and the running
+/// state.
+///
+/// Pure: no I/O, no logging, no side effects — the executor acts the
+/// returned step out and threads the returned state into the next call.
+pub fn next_stage_step(
+    observation: StageObservation,
+    state: StageState,
+) -> (StageStep, StageState) {
+    match observation {
+        StageObservation::Joined(JoinOutcome::Delivered { index, attempts }) => {
+            let mut next = state;
+            next.charge(attempts);
+            (StageStep::Relaunch { index }, next)
+        }
+        StageObservation::Joined(JoinOutcome::Failed { error }) => {
+            (StageStep::AbortAndFail { error }, state)
+        }
+        StageObservation::Joined(JoinOutcome::Crashed { detail }) => (
+            StageStep::AbortAndFail {
+                error: format!("staged chunk task crashed: {detail}"),
+            },
+            state,
+        ),
+        StageObservation::Joined(JoinOutcome::NothingInFlight) => (
+            StageStep::AbortAndFail {
+                error: "staged fetch stalled: no chunk in flight but the plan is incomplete"
+                    .to_string(),
+            },
+            state,
+        ),
+        StageObservation::PlanComplete => (StageStep::MeasureStagedFile, state),
+        StageObservation::StagedByteCount {
+            staged,
+            origin_total,
+        } => {
+            if staged == origin_total {
+                (StageStep::Verified, state)
+            } else {
+                (
+                    StageStep::AbortAndFail {
+                        error: format!(
+                            "the staged file is {staged} bytes but the origin reported \
+                             {origin_total}; refusing to hand ffmpeg a source that cannot \
+                             be byte-complete"
+                        ),
+                    },
+                    state,
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -828,6 +964,175 @@ mod test {
                 "the error names the fallback and the exhausted budget: {msg}"
             );
         }
+    }
+
+    // ---- next_stage_step: the stage loop's step decision ----
+
+    #[test]
+    fn a_delivered_chunk_relaunches_the_loop_and_charges_its_retries() {
+        // The loop's happy step: a chunk that reported home frees its window
+        // slot and the loop relaunches. A first-attempt delivery charges
+        // nothing; a recovered chunk's retries are every attempt beyond its
+        // first.
+        let (step, state) = next_stage_step(
+            StageObservation::Joined(JoinOutcome::Delivered {
+                index: 3,
+                attempts: 1,
+            }),
+            StageState::default(),
+        );
+        assert_eq!(step, StageStep::Relaunch { index: 3 });
+        assert_eq!(state.retries_charged(), 0);
+
+        let (step, state) = next_stage_step(
+            StageObservation::Joined(JoinOutcome::Delivered {
+                index: 5,
+                attempts: 3,
+            }),
+            state,
+        );
+        assert_eq!(step, StageStep::Relaunch { index: 5 });
+        assert_eq!(
+            state.retries_charged(),
+            2,
+            "two of the three attempts were retries"
+        );
+    }
+
+    #[test]
+    fn a_failed_chunk_aborts_the_stage_without_charging_its_retries() {
+        // A chunk that dies within its budget never reports home, so its
+        // attempts charge nothing — the stage fails with the chunk's own
+        // clear error, exactly as its verdict composed it.
+        let (step, state) = next_stage_step(
+            StageObservation::Joined(JoinOutcome::Failed {
+                error: "chunk at offset 8388608 (8388608 bytes): origin returned HTTP 503 \
+                        after 3 of 3 attempts"
+                    .to_string(),
+            }),
+            StageState::default(),
+        );
+        let StageStep::AbortAndFail { error } = step else {
+            panic!("a failed chunk must abort the stage, got {step:?}");
+        };
+        assert!(
+            error.contains("503") && error.contains("3 of 3"),
+            "the stage fails with the chunk's error: {error}"
+        );
+        assert_eq!(state.retries_charged(), 0, "a failed chunk charges nothing");
+    }
+
+    #[test]
+    fn a_crashed_chunk_task_aborts_the_stage_naming_the_crash() {
+        // A chunk task that panicked never reported a verdict: the stage
+        // must fail naming the crash, not silently hang on a window slot
+        // that will never free.
+        let (step, _) = next_stage_step(
+            StageObservation::Joined(JoinOutcome::Crashed {
+                detail: "chunk task panicked".to_string(),
+            }),
+            StageState::default(),
+        );
+        let StageStep::AbortAndFail { error } = step else {
+            panic!("a crashed chunk task must abort the stage, got {step:?}");
+        };
+        assert!(
+            error.contains("staged chunk task crashed") && error.contains("chunk task panicked"),
+            "the error names the crash and its detail: {error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_join_over_an_incomplete_plan_aborts_as_stalled() {
+        // The loop can only see an empty join while the plan is incomplete
+        // if something consumed a window slot without a task behind it: a
+        // stall, never a wait — fail it as one.
+        let (step, _) = next_stage_step(
+            StageObservation::Joined(JoinOutcome::NothingInFlight),
+            StageState::default(),
+        );
+        let StageStep::AbortAndFail { error } = step else {
+            panic!("a stalled loop must abort the stage, got {step:?}");
+        };
+        assert!(
+            error.contains("stalled") && error.contains("incomplete"),
+            "the error names the stall: {error}"
+        );
+    }
+
+    #[test]
+    fn a_complete_plan_hands_over_to_the_byte_measurement() {
+        // Every chunk accounted finished: the loop's staging phase ends and
+        // the final byte verification begins — the executor measures the
+        // assembled file and observes its byte count.
+        let (step, state) = next_stage_step(StageObservation::PlanComplete, StageState::default());
+        assert_eq!(step, StageStep::MeasureStagedFile);
+        assert_eq!(state.retries_charged(), 0, "completion charges nothing");
+    }
+
+    #[test]
+    fn staged_bytes_matching_the_origin_total_verify() {
+        // The stage's success outcome: the assembled file holds exactly the
+        // Origin Total the plan was built from.
+        let (step, state) = next_stage_step(
+            StageObservation::StagedByteCount {
+                staged: 8 * 1024 * 1024,
+                origin_total: 8 * 1024 * 1024,
+            },
+            StageState::default(),
+        );
+        assert_eq!(step, StageStep::Verified);
+        assert_eq!(state.retries_charged(), 0);
+    }
+
+    #[test]
+    fn a_falsified_origin_total_fails_the_byte_verification_naming_both_numbers() {
+        // The last-line guard, reachable with no origin at all: every chunk
+        // verdict passed, yet the assembled file's byte count misses the
+        // Origin Total the probe's Content-Range declared — a falsified
+        // observation no scripted origin can produce at the HTTP layer (the
+        // chunk verdicts catch every serving contradiction first). Both the
+        // truncated and the padded direction must refuse to hand ffmpeg a
+        // source that cannot be byte-complete, naming both numbers.
+        for (staged, direction) in [(9, "truncated"), (8 * 1024 * 1024 + 1, "padded")] {
+            let (step, _) = next_stage_step(
+                StageObservation::StagedByteCount {
+                    staged,
+                    origin_total: 8 * 1024 * 1024,
+                },
+                StageState::default(),
+            );
+            let StageStep::AbortAndFail { error } = step else {
+                panic!("a {direction} staged file must fail verification, got {step:?}");
+            };
+            assert!(
+                error.contains(&staged.to_string())
+                    && error.contains(&(8 * 1024 * 1024).to_string()),
+                "the {direction} file's error names the staged length and the origin total: \
+                 {error}"
+            );
+            assert!(
+                error.contains("byte-complete"),
+                "the {direction} file's error says what was refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_charging_is_one_rule_for_the_probe_the_fallback_and_the_chunks() {
+        // The charging rule — of a finished run, every attempt beyond its
+        // first — is the stage's one accounting seam: the probe's run, the
+        // open-ended fallback's and each delivered chunk's charge into the
+        // same ledger, and the report reads nothing else.
+        let mut state = StageState::default();
+        state.charge(1); // the probe: one clean attempt
+        assert_eq!(state.retries_charged(), 0);
+        state.charge(3); // a chunk recovered on its third attempt
+        assert_eq!(state.retries_charged(), 2);
+        state.charge(2); // the open-ended fallback's one retry
+        assert_eq!(state.retries_charged(), 3);
+        state.charge(0); // defensive: a run reporting no attempts
+        assert_eq!(state.retries_charged(), 3);
     }
 
     #[test]

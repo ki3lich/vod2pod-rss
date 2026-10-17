@@ -1,12 +1,16 @@
 //! The staging engine's executor: ranged GETs turning a resolved Stream URL
 //! into a local, byte-verified source file.
 //!
-//! The pure [`chunk_plan`] decides; this module acts decisions out — one
-//! HTTP attempt per observation, a per-chunk timeout (reqwest's request
-//! timeout: connect through body streaming) and fresh-connection retries,
-//! the total size learned from the first chunk's Content-Range (that request
-//! doubling as the reachability probe), and the assembled file verified
-//! against the origin total before it is handed on.
+//! The pure [`chunk_plan`] decides — the per-attempt verdicts and the stage
+//! loop's step decision ([`next_stage_step`]) alike; this module acts the
+//! decisions out: one HTTP attempt per observation, a per-chunk timeout
+//! (reqwest's request timeout: connect through body streaming) and
+//! fresh-connection retries, and the total size learned from the first
+//! chunk's Content-Range (that request doubling as the reachability probe).
+//! The stage loop holds no policy of its own: it spawns what the scheduler
+//! admits, aborts in-flight chunks on a failing decision, and performs the
+//! I/O — attempts, bodies, and the byte-count measurement the final byte
+//! verification decides on.
 //!
 //! A 200 answer to a ranged GET — an origin that ignores Range — engages
 //! rung 2 of the fallback ladder: the source stages via one open-ended GET
@@ -23,8 +27,8 @@ use log::{debug, info};
 use reqwest::{Client, Url};
 
 use super::chunk_plan::{
-    attempt_verdict, open_ended_verdict, AttemptObservation, ChunkPlan, ChunkSpan, RangeIgnored,
-    StageScheduler, Verdict,
+    attempt_verdict, next_stage_step, open_ended_verdict, AttemptObservation, ChunkPlan, ChunkSpan,
+    JoinOutcome, RangeIgnored, StageObservation, StageScheduler, StageState, StageStep, Verdict,
 };
 
 /// The user agent staged fetches identify with.
@@ -91,7 +95,7 @@ impl SourceStager {
     pub async fn stage_to(&self, stream_url: &Url, dest: &Path) -> eyre::Result<StageReport> {
         tokio::fs::File::create(dest).await?;
 
-        let mut chunk_retries: u32 = 0;
+        let mut state = StageState::default();
 
         // Probe: chunk 0's ranged GET learns the origin total from its
         // Content-Range and doubles as the reachability check.
@@ -121,16 +125,19 @@ impl SourceStager {
                         "the origin ignored Range for {stream_url} (answered 200 with a \
                          full body); staging via one open-ended GET"
                     );
-                    let mut report = self.stage_open_ended(stream_url, dest).await?;
                     // The probe's ranged attempts count too: every request
                     // beyond its first was a retry the origin charged.
-                    report.chunk_retries += attempts_used - 1;
-                    return Ok(report);
+                    state.charge(*attempts_used);
+                    let received = self.stage_open_ended(stream_url, dest, &mut state).await?;
+                    return Ok(StageReport {
+                        bytes: received,
+                        chunk_retries: state.retries_charged(),
+                    });
                 }
                 return Err(e);
             }
         };
-        chunk_retries += probe.attempts - 1;
+        state.charge(probe.attempts);
         let total = probe.total;
 
         let plan = ChunkPlan::new(total, self.limits.chunk_size)?;
@@ -147,6 +154,10 @@ impl SourceStager {
         scheduler.mark_finished(0);
 
         let mut in_flight = tokio::task::JoinSet::new();
+        // The stage loop: observe once, decide once, act once — the
+        // executor's acts are spawning what the scheduler admits, aborting
+        // in-flight chunks on a failing decision, and the byte-count I/O;
+        // every policy is [`next_stage_step`]'s.
         let staging: eyre::Result<()> = loop {
             while let Some(index) = scheduler.launch_next() {
                 let span = plan.spans()[index];
@@ -160,48 +171,51 @@ impl SourceStager {
                     index,
                 ));
             }
-            if scheduler.is_complete() {
-                break Ok(());
-            }
-            match in_flight.join_next().await {
-                Some(Ok((index, Ok(attempts)))) => {
-                    chunk_retries += attempts - 1;
-                    scheduler.mark_finished(index);
-                }
-                Some(Ok((_index, Err(e)))) => break Err(e),
-                Some(Err(join_error)) => {
-                    break Err(eyre::eyre!("staged chunk task crashed: {join_error}"))
-                }
-                None => {
-                    break Err(eyre::eyre!(
-                        "staged fetch stalled: no chunk in flight but the plan is incomplete"
-                    ))
-                }
+            let observation = if scheduler.is_complete() {
+                StageObservation::PlanComplete
+            } else {
+                StageObservation::Joined(observe_join(&mut in_flight).await)
+            };
+            let (step, next) = next_stage_step(observation, state);
+            state = next;
+            match step {
+                StageStep::Relaunch { index } => scheduler.mark_finished(index),
+                StageStep::MeasureStagedFile => break Ok(()),
+                StageStep::AbortAndFail { error } => break Err(eyre::eyre!(error)),
+                other => unreachable!("a staging observation never verifies: {other:?}"),
             }
         };
-        // Dropping the set aborts any in-flight chunks: a permanently
-        // failing chunk must not let the stage crawl to its natural end.
+        // Dropping the set aborts any in-flight chunks: an abort-and-fail
+        // decision must not let the stage crawl to its natural end. A
+        // completed stage leaves nothing in flight.
         drop(in_flight);
         staging?;
-        let bytes = self.verify_staged_size(dest, total).await?;
-        Ok(StageReport {
-            bytes,
-            chunk_retries,
-        })
-    }
 
-    /// The staged file must hold exactly the origin total: per-chunk byte
-    /// counts prove every span was written; this proves nothing extra crept
-    /// in or went missing.
-    async fn verify_staged_size(&self, dest: &Path, total: u64) -> eyre::Result<u64> {
+        // The final byte verification — the same decision seam, one
+        // falsifiable observation: the byte count on disk against the
+        // Origin Total the plan was built from. The per-chunk byte counts
+        // prove every span was written; this proves nothing extra crept in
+        // or went missing — a file-state no truthful serving can produce,
+        // so the verdict lives where a falsified observation can reach it.
         let staged = tokio::fs::metadata(dest).await?.len();
-        if staged != total {
-            eyre::bail!(
-                "the staged file is {staged} bytes but the origin reported {total}; \
-                 refusing to hand ffmpeg a source that cannot be byte-complete"
-            );
+        let (step, next) = next_stage_step(
+            StageObservation::StagedByteCount {
+                staged,
+                origin_total: total,
+            },
+            state,
+        );
+        state = next;
+        match step {
+            StageStep::Verified => Ok(StageReport {
+                bytes: staged,
+                chunk_retries: state.retries_charged(),
+            }),
+            StageStep::AbortAndFail { error } => Err(eyre::eyre!(error)),
+            other => {
+                unreachable!("a byte-count observation never relaunches or measures: {other:?}")
+            }
         }
-        Ok(total)
     }
 
     /// Rung 2 of the fallback ladder: the origin ignored the Range header,
@@ -213,7 +227,16 @@ impl SourceStager {
     /// one bounded attempt. That is what keeps rung 2 size-independent; the
     /// fallback differs in the request shape only, not in how cleanly it
     /// fails.
-    async fn stage_open_ended(&self, stream_url: &Url, dest: &Path) -> eyre::Result<StageReport> {
+    ///
+    /// On success the received byte count is returned and the open-ended
+    /// attempts are charged into `state` — the same ledger the probe and
+    /// every chunk account through.
+    async fn stage_open_ended(
+        &self,
+        stream_url: &Url,
+        dest: &Path,
+        state: &mut StageState,
+    ) -> eyre::Result<u64> {
         let mut attempts_used = 0;
         let received = loop {
             attempts_used += 1;
@@ -235,10 +258,8 @@ impl SourceStager {
                 Verdict::Fail(message) => return Err(eyre::eyre!(message)),
             }
         };
-        Ok(StageReport {
-            bytes: received,
-            chunk_retries: attempts_used - 1,
-        })
+        state.charge(attempts_used);
+        Ok(received)
     }
 }
 
@@ -265,6 +286,25 @@ async fn stage_chunk(
     .await
     .map(|fetched| fetched.attempts);
     (index, result)
+}
+
+/// Translate one join over the in-flight chunk set into the observation the
+/// step decision judges — the executor's whole view of a settling chunk,
+/// with no policy of its own: what each outcome means is
+/// [`next_stage_step`]'s.
+async fn observe_join(
+    in_flight: &mut tokio::task::JoinSet<(usize, eyre::Result<u32>)>,
+) -> JoinOutcome {
+    match in_flight.join_next().await {
+        Some(Ok((index, Ok(attempts)))) => JoinOutcome::Delivered { index, attempts },
+        Some(Ok((_index, Err(e)))) => JoinOutcome::Failed {
+            error: e.to_string(),
+        },
+        Some(Err(join_error)) => JoinOutcome::Crashed {
+            detail: join_error.to_string(),
+        },
+        None => JoinOutcome::NothingInFlight,
+    }
 }
 
 /// The Body observation that satisfied a chunk's verdict, plus what it cost:
@@ -1148,31 +1188,6 @@ mod test {
             origin.requests_at(None),
             0,
             "the fallback must not fire for a dead ranged origin"
-        );
-    }
-
-    #[tokio::test]
-    async fn size_verification_rejects_a_file_that_misses_the_origin_total() {
-        // The last-line guard: if the assembled file's length ever misses
-        // the origin total despite every chunk verdict passing, the stage
-        // fails naming both numbers instead of handing ffmpeg a padded or
-        // truncated source. No scripted origin can produce this state — the
-        // chunk verdicts catch every serving contradiction first — so the
-        // guard is exercised directly; the failure leaves the file the same
-        // way every stage error does, through the Err path whose
-        // no-leak behavior the check-stage tests prove for its siblings.
-        let origin = ScriptedOrigin::start(MIB as usize, OriginScript::default());
-        let dest = TempFile::new("verify");
-        tokio::fs::write(dest.path(), b"truncated").await.unwrap();
-
-        let err = stager(test_limits())
-            .verify_staged_size(dest.path(), origin.content().len() as u64)
-            .await
-            .expect_err("a file short of the origin total must fail verification");
-        let message = err.to_string();
-        assert!(
-            message.contains("9") && message.contains(&MIB.to_string()),
-            "the error names the staged length and the origin total: {message}"
         );
     }
 

@@ -5,9 +5,9 @@
 //! Three pieces:
 //!
 //! - [`chunk_plan`] is the pure brain: the ordered chunk plan, the
-//!   concurrency window over it, and the retry-vs-fail verdict for every
-//!   chunk outcome. No I/O — exhaustively testable (prior art: the stdout
-//!   pump's decision functions).
+//!   concurrency window over it, the retry-vs-fail verdict for every chunk
+//!   outcome, and the stage loop's step decision. No I/O — exhaustively
+//!   testable (prior art: the stdout pump's decision functions).
 //! - [`fetcher`] is the executor: one HTTP attempt per observation, per-chunk
 //!   timeout and fresh-connection retries, total size learned from the first
 //!   chunk's Content-Range (that request doubling as the reachability
