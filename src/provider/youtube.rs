@@ -663,62 +663,185 @@ async fn create_duration_url_map(
     Ok((video_infos, batches))
 }
 
+/// The per-Episode facts one rung-producing path extracts from its wire
+/// format, ready for the shared shaper. Extraction cannot be shared (the
+/// wire types differ); everything downstream of this struct is.
+struct EpisodeFacts {
+    title: Option<String>,
+    description: Option<String>,
+    guid: String,
+    link: Option<String>,
+    published_at: Option<DateTime<Utc>>,
+    duration_seconds: Option<u64>,
+    image_url: Option<String>,
+    author: Option<String>,
+}
+
+/// The two rung-producing sources of Episodes. They differ in what an
+/// unknown duration means and in how much their wire format guarantees;
+/// the shaper preserves those differences instead of unifying them
+/// blindly — a divergence here is where the cross-rung guid contract
+/// (docs/adr/0002) would silently break.
+#[derive(Clone, Copy)]
+enum EpisodeSource {
+    /// The metered YouTube Data API path. Durations are batch-fetched up
+    /// front, so an episode without one cannot be shaped; title and
+    /// description are always carried (empty string when the API omits
+    /// them) and the author doubles on the plain <author> element and
+    /// itunes:summary.
+    Api,
+    /// The quota-free atom path (the Degraded Feed rung). Durations come
+    /// from best-effort yt-dlp lookups; every metadata field is optional
+    /// and authoring is itunes-only.
+    Atom,
+}
+
+/// The one shorts filter both rung-producing paths go through. A known
+/// duration at or below the shorts threshold is filtered when shorts
+/// filtering is on; what an unknown duration means is the source's call,
+/// preserved exactly rather than unified:
+/// - the API path drops the episode — its durations are batch-fetched, so
+///   "unknown" means the upstream lookup failed,
+/// - the atom path keeps the episode — its durations are best-effort
+///   yt-dlp lookups, and a lookup failure must not shrink the feed.
+fn shorts_filter_admits(
+    duration_seconds: Option<u64>,
+    filter_shorts: bool,
+    source: EpisodeSource,
+) -> bool {
+    match duration_seconds {
+        None => matches!(source, EpisodeSource::Atom),
+        Some(seconds) => !(filter_shorts && seconds <= SHORTS_THRESHOLD_SECONDS),
+    }
+}
+
+/// The one Episode shaper both rung-producing paths call. Owns every
+/// per-Episode field a Feed item carries — the Episode Metadata (title,
+/// description, artwork, publish date), the Episode Guid, duration, and
+/// author — plus the shorts filter, so the two paths cannot drift apart
+/// on any of them. Returns None when the shorts filter drops the episode.
+fn shape_episode(facts: EpisodeFacts, source: EpisodeSource, filter_shorts: bool) -> Option<Item> {
+    if !shorts_filter_admits(facts.duration_seconds, filter_shorts, source) {
+        if let Some(seconds) = facts.duration_seconds {
+            debug!(
+                "filtering out short video: {} ({} seconds)",
+                facts.guid, seconds
+            );
+        }
+        return None;
+    }
+
+    let mut item_builder = ItemBuilder::default();
+    item_builder.guid(Some(GuidBuilder::default().value(facts.guid).build()));
+    item_builder.link(facts.link);
+    item_builder.pub_date(facts.published_at.map(|date| date.to_rfc2822()));
+    let mut itunes_item_builder = ITunesItemExtensionBuilder::default();
+    itunes_item_builder.image(facts.image_url);
+    itunes_item_builder.duration(facts.duration_seconds.map(format_duration));
+    match source {
+        // the API path guarantees title and description (empty string when
+        // the API omits them) and doubles the author: Apple ignores plain
+        // <author>, so episodes need itunes:author too
+        EpisodeSource::Api => {
+            item_builder.title(Some(facts.title.unwrap_or_default()));
+            let description = Some(facts.description.unwrap_or_default());
+            item_builder.description(description.clone());
+            itunes_item_builder.summary(description);
+            item_builder.author(facts.author.clone());
+            itunes_item_builder.author(facts.author);
+        }
+        // the atom path carries only optional metadata and authors
+        // itunes-only
+        EpisodeSource::Atom => {
+            item_builder.title(facts.title);
+            item_builder.description(facts.description);
+            itunes_item_builder.author(facts.author);
+        }
+    }
+    item_builder.itunes_ext(Some(itunes_item_builder.build()));
+    Some(item_builder.build())
+}
+
+/// Extracts one Episode's facts from a playlist item, dropping the items the
+/// API path cannot shape (no snippet, no video id, unparsable guid) and
+/// warning on the durations the API lookup failed to produce — the shaper's
+/// shorts policy drops those, per the API path's unknown-duration semantics.
+fn episode_facts_from_playlist_item(
+    mut item: PlaylistItem,
+    videos_infos: &HashMap<String, VideoExtraInfo>,
+) -> Option<EpisodeFacts> {
+    let mut snippet = item.snippet.take()?;
+    let video_id = snippet.resource_id.take()?.video_id?;
+    let url = Url::parse(&episode_identity::youtube_episode_guid(&video_id)).ok()?;
+
+    let duration_seconds = match videos_infos.get(&video_id) {
+        Some(info) => Some(
+            (info.duration.hour * 3600.0 + info.duration.minute * 60.0 + info.duration.second)
+                as u64,
+        ),
+        None => {
+            warn!("no duration found for {:?}", video_id);
+            None
+        }
+    };
+
+    Some(EpisodeFacts {
+        title: snippet.title.take(),
+        description: snippet.description.take(),
+        guid: url.to_string(),
+        link: Some(url.to_string()),
+        published_at: snippet.published_at,
+        duration_seconds,
+        image_url: get_thumb!(snippet).and_then(|t| t.url),
+        author: snippet.channel_title.take(),
+    })
+}
+
+/// Extracts one Episode's facts from an atom entry. Durations are a
+/// best-effort lookup by watch URL — an unknown one keeps the episode (the
+/// shaper's shorts policy preserves that). The channel title doubles as the
+/// itunes:author; an empty one means no author.
+fn episode_facts_from_atom_entry(
+    entry: feed_rs::model::Entry,
+    duration_map: &HashMap<String, Option<usize>>,
+    channel_title: &str,
+) -> EpisodeFacts {
+    let link = entry.links.first().map(|d| d.clone().href);
+    let duration_seconds = link
+        .as_ref()
+        .and_then(|link| duration_map.get(link))
+        .and_then(|seconds| *seconds)
+        .map(|seconds| seconds as u64);
+    let media = entry.media.first();
+    let description = media
+        .and_then(|media| media.description.clone())
+        .map(|description| description.content);
+    let image_url = media
+        .and_then(|media| media.thumbnails.first())
+        .map(|thumbnail| thumbnail.image.uri.clone());
+
+    EpisodeFacts {
+        title: entry.title.map(|title| title.content),
+        description,
+        guid: episode_identity::youtube_episode_guid_from_atom(entry.id.as_str(), link.as_deref()),
+        link,
+        published_at: entry.published.or(entry.updated),
+        duration_seconds,
+        image_url,
+        author: (!channel_title.is_empty()).then(|| channel_title.to_string()),
+    }
+}
+
 fn build_channel_items_from_playlist(
     items: Vec<PlaylistItem>,
     videos_infos: HashMap<String, VideoExtraInfo>,
     filter_shorts: bool,
 ) -> Vec<Item> {
-    let rss_item: Vec<Item> = items
+    items
         .into_iter()
-        .filter_map(|item| {
-            let mut snippet = item.snippet?;
-            let title = snippet.title.take().unwrap_or("".to_owned());
-            let description = snippet.description.take().unwrap_or("".to_owned());
-            let video_id = snippet.resource_id.take()?.video_id?;
-            let url = Url::parse(&episode_identity::youtube_episode_guid(&video_id)).ok()?;
-
-            let video_infos = videos_infos.get(&video_id).or_else(|| {
-                warn!("no duration found for {:?}", video_id);
-                None
-            })?;
-
-            // Calculate duration in seconds for filtering (fields are f32)
-            let duration_seconds = (video_infos.duration.hour * 3600.0
-                + video_infos.duration.minute * 60.0
-                + video_infos.duration.second) as u64;
-
-            // Filter out shorts if enabled (videos <= 3 minutes/180 seconds)
-            if filter_shorts && duration_seconds <= SHORTS_THRESHOLD_SECONDS {
-                debug!(
-                    "filtering out short video: {} ({} seconds)",
-                    video_id, duration_seconds
-                );
-                return None;
-            }
-
-            let mut item_builder = ItemBuilder::default();
-            item_builder.title(Some(title));
-            item_builder.description(Some(description.clone()));
-            item_builder.link(Some(url.to_string()));
-            item_builder.guid(Some(GuidBuilder::default().value(url.to_string()).build()));
-            item_builder.pub_date(
-                snippet
-                    .published_at
-                    .map(|pub_date| pub_date.to_rfc2822().to_string()),
-            );
-            item_builder.author(snippet.channel_title.clone());
-            let itunes_item_extension = ITunesItemExtensionBuilder::default()
-                .summary(Some(description))
-                // Apple ignores plain <author>; episodes need itunes:author
-                .author(snippet.channel_title.take())
-                .duration(Some(format_duration(duration_seconds)))
-                .image(get_thumb!(snippet).and_then(|t| t.url))
-                .build();
-            item_builder.itunes_ext(Some(itunes_item_extension));
-            Some(item_builder.build())
-        })
-        .collect();
-    rss_item
+        .filter_map(|item| episode_facts_from_playlist_item(item, &videos_infos))
+        .filter_map(|facts| shape_episode(facts, EpisodeSource::Api, filter_shorts))
+        .collect()
 }
 
 /// Result of fetching a playlist's items: the items sorted by publication
@@ -1039,65 +1162,8 @@ fn convert_atom_to_rss(
     let items = feed
         .entries
         .into_iter()
-        .filter_map(|entry| {
-            let link = entry.links.first().map(|d| d.clone().href);
-
-            // Get duration for filtering
-            let duration_seconds = (|| -> Option<u64> {
-                duration_map
-                    .get(&link.clone()?)
-                    .and_then(|s| s.map(|a| a as u64))
-            })();
-
-            // Filter out shorts if enabled (videos <= 3 minutes/180 seconds)
-            if filter_shorts {
-                if let Some(seconds) = duration_seconds {
-                    if seconds <= SHORTS_THRESHOLD_SECONDS {
-                        debug!(
-                            "filtering out short video from atom feed: {} ({} seconds)",
-                            link.clone().unwrap_or_default(),
-                            seconds
-                        );
-                        return None;
-                    }
-                }
-            }
-
-            let mut item_builder = ItemBuilder::default();
-            item_builder.title(entry.title.map(|d| d.content));
-            item_builder.description(
-                entry
-                    .media
-                    .first()
-                    .and_then(|d| Some(d.clone().description?.content)),
-            );
-            item_builder.link(link.clone());
-            let guid = episode_identity::youtube_episode_guid_from_atom(
-                entry.id.as_str(),
-                link.as_deref(),
-            );
-            item_builder.guid(Some(GuidBuilder::default().value(guid).build()));
-            item_builder.pub_date(
-                entry
-                    .published
-                    .or(entry.updated)
-                    .map(|date| date.to_rfc2822().to_string()),
-            );
-            let mut itunes_item_builder = ITunesItemExtensionBuilder::default();
-            if !channel_title.is_empty() {
-                // Apple ignores plain <author>; episodes need itunes:author
-                itunes_item_builder.author(Some(channel_title.clone()));
-            }
-            let media = entry.media.first();
-            itunes_item_builder.image(
-                media
-                    .and_then(|m| m.thumbnails.first())
-                    .map(|t| t.clone().image.uri),
-            );
-            itunes_item_builder.duration(duration_seconds.map(format_duration));
-            item_builder.itunes_ext(Some(itunes_item_builder.build()));
-            Some(item_builder.build())
-        })
+        .map(|entry| episode_facts_from_atom_entry(entry, &duration_map, &channel_title))
+        .filter_map(|facts| shape_episode(facts, EpisodeSource::Atom, filter_shorts))
         .collect::<Vec<Item>>();
     feed_builder.items(items);
     feed_builder.build().to_string()
@@ -1846,5 +1912,155 @@ mod tests {
                 "every Episode needs a pubDate"
             );
         }
+    }
+
+    // -- the one shorts filter ----------------------------------------------------
+    //
+    // Pins `shorts_filter_admits` and the one per-path difference it must
+    // preserve: the API path drops episodes with unknown duration, the
+    // atom path keeps them.
+
+    #[test]
+    fn test_shorts_filter_decision_table() {
+        let short = Some(SHORTS_THRESHOLD_SECONDS); // at the threshold: a short
+        let long = Some(SHORTS_THRESHOLD_SECONDS + 1);
+
+        // known durations: the threshold applies on both paths alike
+        for source in [EpisodeSource::Api, EpisodeSource::Atom] {
+            assert!(
+                !shorts_filter_admits(short, true, source),
+                "a short is filtered"
+            );
+            assert!(
+                shorts_filter_admits(long, true, source),
+                "a long video survives"
+            );
+            assert!(
+                shorts_filter_admits(short, false, source),
+                "with shorts filtering off nothing is filtered"
+            );
+        }
+        // an unknown duration means opposite things per path, whatever the
+        // shorts setting: the API path drops, the atom path keeps
+        assert!(!shorts_filter_admits(None, true, EpisodeSource::Api));
+        assert!(!shorts_filter_admits(None, false, EpisodeSource::Api));
+        assert!(shorts_filter_admits(None, true, EpisodeSource::Atom));
+        assert!(shorts_filter_admits(None, false, EpisodeSource::Atom));
+    }
+
+    #[test]
+    fn test_api_path_drops_episodes_with_unknown_duration() {
+        // the API path batch-fetches durations; an episode the lookup failed
+        // for is dropped even with shorts filtering off — unknown means
+        // unshapable there
+        let items: Vec<PlaylistItem> = vec![PlaylistItem {
+            snippet: Some(api::PlaylistItemSnippet {
+                title: Some("Video One".to_string()),
+                resource_id: Some(api::ResourceId {
+                    video_id: Some("abc123".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let rss_items = build_channel_items_from_playlist(items, HashMap::new(), false);
+        assert!(
+            rss_items.is_empty(),
+            "an unknown duration must drop the episode on the API path"
+        );
+    }
+
+    #[test]
+    fn test_atom_path_keeps_episodes_with_unknown_duration() {
+        // the atom path's durations are best-effort yt-dlp lookups; a lookup
+        // failure must not shrink the feed. The real fixture carries two
+        // Shorts, so with durations known and shorts filtering on every
+        // episode is filtered — pinning the unknown-duration keep exactly.
+        let feed = feed_rs::parser::parse(REAL_ATOM_FEED_FIXTURE.as_bytes()).unwrap();
+        let body = convert_atom_to_rss(feed, HashMap::new(), true);
+        let channel = rss::Channel::read_from(body.as_bytes()).unwrap();
+        assert_eq!(
+            channel.items.len(),
+            3,
+            "unknown durations must keep every episode on the atom path"
+        );
+
+        // the same feed with known short durations loses every episode
+        let known_shorts: HashMap<String, Option<usize>> = [
+            // the fixture's raw link shapes: two shorts-style, one watch URL
+            "https://www.youtube.com/shorts/dWuPnW0EHKM",
+            "https://www.youtube.com/watch?v=71ya_JC_IbM",
+            "https://www.youtube.com/shorts/q4-rVbyEmrc",
+        ]
+        .into_iter()
+        .map(|url| (url.to_string(), Some(60)))
+        .collect();
+        let feed = feed_rs::parser::parse(REAL_ATOM_FEED_FIXTURE.as_bytes()).unwrap();
+        let body = convert_atom_to_rss(feed, known_shorts, true);
+        let channel = rss::Channel::read_from(body.as_bytes()).unwrap();
+        assert!(
+            channel.items.is_empty(),
+            "known short durations must filter every episode"
+        );
+    }
+
+    #[test]
+    fn test_api_item_carries_full_metadata() {
+        // the API path has no golden test upstream of the shaper, so pin the
+        // metadata the shaper owns: title, description, guid, artwork, publish
+        // date, duration, and the doubled author
+        let items: Vec<PlaylistItem> = vec![PlaylistItem {
+            snippet: Some(api::PlaylistItemSnippet {
+                title: Some("Video One".to_string()),
+                description: Some("A description".to_string()),
+                channel_title: Some("Test Channel".to_string()),
+                published_at: Some(
+                    chrono::DateTime::parse_from_rfc3339("2024-01-01T10:00:00Z")
+                        .unwrap()
+                        .into(),
+                ),
+                resource_id: Some(api::ResourceId {
+                    video_id: Some("abc123".to_string()),
+                    ..Default::default()
+                }),
+                thumbnails: Some(api::ThumbnailDetails {
+                    high: Some(api::Thumbnail {
+                        url: Some("https://example.com/thumb.jpg".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let infos: HashMap<String, VideoExtraInfo> = HashMap::from([(
+            "abc123".to_string(),
+            VideoExtraInfo {
+                duration: iso8601_duration::Duration::parse("PT10M").unwrap(),
+            },
+        )]);
+        let rss_items = build_channel_items_from_playlist(items, infos, false);
+        assert_eq!(rss_items.len(), 1);
+        let item = &rss_items[0];
+        assert_eq!(item.title.as_deref(), Some("Video One"));
+        assert_eq!(item.description.as_deref(), Some("A description"));
+        assert_eq!(
+            item.guid().unwrap().value(),
+            "https://www.youtube.com/watch?v=abc123"
+        );
+        assert_eq!(item.author.as_deref(), Some("Test Channel"));
+        assert_eq!(
+            item.pub_date().unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2024-01-01T10:00:00Z")
+                .unwrap()
+                .to_rfc2822()
+        );
+        let itunes = item.itunes_ext().unwrap();
+        assert_eq!(itunes.author(), Some("Test Channel"));
+        assert_eq!(itunes.summary(), Some("A description"));
+        assert_eq!(itunes.duration(), Some("00:10:00"));
+        assert_eq!(itunes.image(), Some("https://example.com/thumb.jpg"));
     }
 }

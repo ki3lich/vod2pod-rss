@@ -22,6 +22,9 @@ vod2pod-rss is composed of 3 different phases:
 
 feed generation is done by implementing the `MediaProvider` trait which describes the generation of the raw rss feed, it's very important that
 the provider generated a duration for each entry or seeking will not work.
+(The one exception is a Degraded Feed: it is served quota-free from the provider's
+own public feed, where durations are a best-effort lookup and may be absent — a
+missing duration keeps the episode there rather than shrinking the feed.)
 
 this is then passed to the feed injection that will prepare the generic rss feed with the necessary links to the trancode endpoint.
 one key rule is that the MediaProvider has no idea that the generated feed is intended for trancoding, this way if you disable trancoding
