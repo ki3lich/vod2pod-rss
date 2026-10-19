@@ -28,10 +28,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use url::Url;
 
-use crate::{
-    feed_cache::CachedFeed,
-    provider::{MediaProvider, QuotaExhausted},
-};
+use crate::provider::{FeedProbeState, MediaProvider, QuotaExhausted};
 
 /// Seconds of jitter added on top of the Fresh TTL so that many feeds polled
 /// by the same podcatcher do not all expire (and regenerate) at the same
@@ -132,61 +129,95 @@ impl RevalidationSpawner for ActixSpawner {
     }
 }
 
+/// A cached feed: the raw body plus everything needed to revalidate it
+/// cheaply. The body is stored BEFORE per-request customization (transcoding
+/// url injection): that step depends on the requesting host, so it is redone
+/// on every serve and the response ETag is computed from the injected body.
+#[derive(Clone, Debug)]
+pub struct CachedFeed {
+    pub body: String,
+    /// When the body was produced (unix seconds). Drives the Fresh Period
+    /// and the Stale Window.
+    pub generated_at: i64,
+    pub probe_state: Option<FeedProbeState>,
+    /// `true` when the body came from the quota-free Degradation Ladder rung
+    /// (fewer items than a full conversion); such bodies are never renewed by
+    /// a probe, so they expire normally and get replaced by a full feed.
+    pub degraded: bool,
+}
+
+/// What one load round trip found: the stored copy, when one is servable,
+/// and the fresh marker's remaining seconds, when the marker lives. One
+/// storage round trip serves both, so the hot path pays one round trip per
+/// cache check.
+#[derive(Clone, Debug, Default)]
+pub struct LoadState {
+    pub feed: Option<CachedFeed>,
+    pub fresh_marker_ttl: Option<i64>,
+}
+
 /// Storage behind the serving ladder: cached Feeds and the shared Quota
-/// Breaker flag. The module owns freshness and quota policy, the adapter owns
-/// storage mechanics. The Redis adapter runs in production (current data
+/// Breaker flag. The module owns freshness and quota policy, the adapter
+/// owns storage mechanics — the record layout and the TTL semantics, with
+/// each operation served in a single storage round trip. Adapters hold no
+/// clock of their own: every time-dependent judgment uses the module's
+/// `now`, so Quota Breaker expiry is compared against the same time source
+/// as freshness. The Redis adapter runs in production (current data
 /// layout), the in-memory adapter in tests.
 #[async_trait]
 pub trait FeedCacheStore: Send + Sync {
-    /// The cached Feed for a Canonical Feed Key, when one is stored and still
-    /// inside the Stale Window. A storage failure behaves like a miss: the
-    /// ladder keeps serving clients.
-    async fn load(&self, canonical_key: &str) -> Option<CachedFeed>;
+    /// The cache state for a Canonical Feed Key as of `now`: the stored copy
+    /// when one is servable and still inside the Stale Window, plus the
+    /// fresh marker's remaining ttl. A storage failure behaves like a miss:
+    /// the ladder keeps serving clients.
+    async fn load_state(&self, canonical_key: &str, now: i64) -> LoadState;
 
-    /// Remaining seconds of the fresh marker, or `None` when it is gone (or
-    /// its TTL could not be read).
-    async fn fresh_marker_ttl(&self, canonical_key: &str) -> Option<i64>;
-
-    /// Store a Feed (overwriting any previous one) and anchor its freshness:
-    /// the fresh marker lives for the windows' Fresh TTL, the body for the
-    /// windows' Stale Window.
-    async fn store(
+    /// Store a Feed (overwriting any previous one), anchor its freshness as
+    /// of `now` — the fresh marker lives for the windows' Fresh TTL, the
+    /// body for the windows' Stale Window — and report the fresh marker ttl
+    /// the store anchored, so callers never re-read what they just stored.
+    async fn store_and_report(
         &self,
         canonical_key: &str,
         feed: &CachedFeed,
         windows: FreshnessWindows,
-    ) -> eyre::Result<()>;
+        now: i64,
+    ) -> eyre::Result<i64>;
 
     /// Record metered units a Feed Conversion consumed, bucketed on the
     /// provider-owned usage day `day_key` (best-effort usage estimate; a
     /// failure only loses the estimate, never the feed).
     async fn bump_quota_usage(&self, units: u64, day_key: &str) -> eyre::Result<i64>;
 
-    /// Re-anchor freshness after a probe answered "unchanged": the fresh
-    /// marker gets the windows' Fresh TTL (which must not outlive the Fresh
-    /// Period), the body TTL is re-anchored to the Stale Window. The
-    /// generation timestamp is deliberately not touched, so the Fresh Period
-    /// still forces a full conversion eventually.
+    /// Re-anchor freshness as of `now` after a probe answered "unchanged":
+    /// the fresh marker gets the windows' Fresh TTL (which must not outlive
+    /// the Fresh Period), the body TTL is re-anchored to the Stale Window.
+    /// The generation timestamp is deliberately not touched, so the Fresh
+    /// Period still forces a full conversion eventually.
     async fn renew_freshness(
         &self,
         canonical_key: &str,
         windows: FreshnessWindows,
+        now: i64,
     ) -> eyre::Result<()>;
 
-    /// The Quota Breaker identified by `breaker_key` while it is open —
-    /// metered calls to the provider owning the key must not be made —
-    /// carrying the unix time it holds until. `None` when it is closed (or
-    /// its state could not be read: a closed breaker only ever costs quota).
-    async fn quota_breaker_open(&self, breaker_key: &str) -> Option<i64>;
+    /// The Quota Breaker identified by `breaker_key` while it is open as of
+    /// `now` — metered calls to the provider owning the key must not be
+    /// made — carrying the unix time it holds until. `None` when it is
+    /// closed (or its state could not be read: a closed breaker only ever
+    /// costs quota).
+    async fn quota_breaker_open(&self, breaker_key: &str, now: i64) -> Option<i64>;
 
     /// Open the Quota Breaker identified by `breaker_key` until
     /// `reset_epoch_secs`, so no request pays the failing-call cost until
-    /// then. Persistence is best-effort: a failure only delays the
-    /// preemption, the ladder keeps serving clients either way.
+    /// then. A reset at or before `now` is a no-op. Persistence is
+    /// best-effort: a failure only delays the preemption, the ladder keeps
+    /// serving clients either way.
     async fn open_quota_breaker(
         &self,
         breaker_key: &str,
         reset_epoch_secs: i64,
+        now: i64,
     ) -> eyre::Result<()>;
 }
 
@@ -521,11 +552,12 @@ impl FeedServing {
             return;
         }
 
-        let Some(cached) = cache.load(&canonical_key).await else {
+        let now = self.clock.unix_now();
+        let Some(cached) = cache.load_state(&canonical_key, now).await.feed else {
             return;
         };
 
-        let age = self.clock.unix_now() - cached.generated_at;
+        let age = now - cached.generated_at;
         // probes may only renew a feed while it is within the Fresh Period;
         // degraded feeds are never probed, they must be replaced by a real
         // conversion as soon as possible
@@ -546,6 +578,7 @@ impl FeedServing {
                             .renew_freshness(
                                 &canonical_key,
                                 self.freshness_windows(remaining_fresh.max(1) as u64),
+                                self.clock.unix_now(),
                             )
                             .await
                         {
@@ -583,19 +616,25 @@ impl FeedServing {
     }
 
     /// Read the cache and classify the entry. `Some` = a usable copy: serve
-    /// it. `None` = miss, a Feed Conversion is needed.
+    /// it. `None` = miss, a Feed Conversion is needed. One cache check costs
+    /// one storage round trip: the load-state operation carries the copy and
+    /// the fresh marker together.
     async fn serve_from_cache(
         &self,
         cache: &dyn FeedCacheStore,
         canonical_key: &str,
     ) -> Option<ServedFeed> {
-        let entry = cache.load(canonical_key).await;
-        let fresh_marker_ttl = cache.fresh_marker_ttl(canonical_key).await;
+        let now = self.clock.unix_now();
+        let state = cache.load_state(canonical_key, now).await;
         let freshness = classify_freshness(
-            entry.is_some(),
-            fresh_marker_ttl.is_some(),
-            entry.as_ref().map(|entry| entry.generated_at).unwrap_or(0),
-            self.clock.unix_now(),
+            state.feed.is_some(),
+            state.fresh_marker_ttl.is_some(),
+            state
+                .feed
+                .as_ref()
+                .map(|entry| entry.generated_at)
+                .unwrap_or(0),
+            now,
             self.policy.max_fresh_period_secs as i64,
             self.policy.stale_window_secs as i64,
         )?;
@@ -605,13 +644,15 @@ impl FeedServing {
             generated_at,
             probe_state: _,
             degraded,
-        } = entry?;
+        } = state.feed?;
         Some(ServedFeed {
             body,
             generated_at,
             degraded,
             max_age_secs: match freshness {
-                Freshness::Fresh => fresh_marker_ttl.unwrap_or(self.policy.fresh_ttl_secs as i64),
+                Freshness::Fresh => state
+                    .fresh_marker_ttl
+                    .unwrap_or(self.policy.fresh_ttl_secs as i64),
                 Freshness::Stale => self.policy.stale_serve_max_age_secs as i64,
                 // classify_freshness never produces this for a cached copy;
                 // treat it as a miss rather than panic in the serving path
@@ -634,29 +675,37 @@ impl FeedServing {
 
     /// Store a freshly converted or degraded copy, tolerating a cache
     /// failure: losing the entry only costs quota, never the response being
-    /// built.
+    /// built. Reports the fresh marker ttl the store anchored, when it
+    /// succeeded.
     async fn store_or_warn(
         &self,
         cache: &dyn FeedCacheStore,
         canonical_key: &str,
         entry: &CachedFeed,
         windows: FreshnessWindows,
-    ) {
-        if let Err(e) = cache.store(canonical_key, entry, windows).await {
-            let kind = if entry.degraded {
-                "degraded feed"
-            } else {
-                "feed"
-            };
-            warn!("could not store {kind} {canonical_key} in cache: {e}");
+    ) -> Option<i64> {
+        match cache
+            .store_and_report(canonical_key, entry, windows, self.clock.unix_now())
+            .await
+        {
+            Ok(fresh_marker_ttl) => Some(fresh_marker_ttl),
+            Err(e) => {
+                let kind = if entry.degraded {
+                    "degraded feed"
+                } else {
+                    "feed"
+                };
+                warn!("could not store {kind} {canonical_key} in cache: {e}");
+                None
+            }
         }
     }
 
     /// Rung 2: full Feed Conversion, then store the raw body together with the
-    /// Freshness Probe state it was generated from. The stored copy is
-    /// re-read so the response metadata reflects what was just cached; when
-    /// the cache is unavailable the generated body is served anyway (losing
-    /// the cache entry only costs quota).
+    /// Freshness Probe state it was generated from. The store-and-report
+    /// round trip anchors freshness and reports the fresh marker ttl it
+    /// stored; when the cache is unavailable the generated body is served
+    /// anyway (losing the cache entry only costs quota).
     ///
     /// The single implementation of the conversion rung: both the serving
     /// path and background revalidation go through it.
@@ -676,13 +725,17 @@ impl FeedServing {
             probe_state: generated.probe_state,
             degraded: false,
         };
-        self.store_or_warn(
-            cache,
-            canonical_key,
-            &entry,
-            self.freshness_windows(self.jittered_fresh_ttl()),
-        )
-        .await;
+        // the store-and-report round trip anchors freshness and reports the
+        // fresh marker ttl it stored: the response reflects exactly what the
+        // store anchored, with no re-read round trips
+        let fresh_marker_ttl = self
+            .store_or_warn(
+                cache,
+                canonical_key,
+                &entry,
+                self.freshness_windows(self.jittered_fresh_ttl()),
+            )
+            .await;
 
         if let Some(units) = generated.quota_units {
             self.record_quota_usage(cache, provider, units).await;
@@ -692,17 +745,9 @@ impl FeedServing {
             start.elapsed().as_secs_f32()
         );
 
-        // prefer the cache read so the fresh marker (and its max-age)
-        // reflects what was just stored; fall back to the generated body
-        // when the cache read fails
-        let fresh_marker_ttl = cache.fresh_marker_ttl(canonical_key).await;
-        let (body, generated_at) = match cache.load(canonical_key).await {
-            Some(cached) => (cached.body, cached.generated_at),
-            None => (entry.body, entry.generated_at),
-        };
         Ok(ServedFeed {
-            body,
-            generated_at,
+            body: entry.body,
+            generated_at: entry.generated_at,
             degraded: false,
             freshness: Freshness::FreshlyGenerated,
             max_age_secs: fresh_marker_ttl.unwrap_or(self.policy.fresh_ttl_secs as i64),
@@ -720,7 +765,7 @@ impl FeedServing {
         provider: &dyn MediaProvider,
     ) -> Option<i64> {
         match provider.quota_breaker_key().as_deref() {
-            Some(key) => cache.quota_breaker_open(key).await,
+            Some(key) => cache.quota_breaker_open(key, self.clock.unix_now()).await,
             None => None,
         }
     }
@@ -748,7 +793,10 @@ impl FeedServing {
                 .now_utc()
                 .and_then(|now| provider.next_quota_reset(now));
             match reset {
-                Some(reset) => match cache.open_quota_breaker(&key, reset.timestamp()).await {
+                Some(reset) => match cache
+                    .open_quota_breaker(&key, reset.timestamp(), self.clock.unix_now())
+                    .await
+                {
                     Ok(()) => warn!("quota breaker {key} open until {}", reset.to_rfc3339()),
                     Err(e) => warn!("could not persist quota breaker: {e}"),
                 },

@@ -291,9 +291,11 @@ impl StreamUrlResolver for ProviderStreamUrlResolver {
         // open but no staging stage wired, the preflight runs and no file
         // is ever created: slotless.
         if self.stages() {
-            self.stager
-                .as_ref()
-                .map(|_| self.stage_gate.clone().unwrap_or_else(super::staging::stage_gate))
+            self.stager.as_ref().map(|_| {
+                self.stage_gate
+                    .clone()
+                    .unwrap_or_else(super::staging::stage_gate)
+            })
         } else {
             None
         }

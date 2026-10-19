@@ -2,7 +2,6 @@ use configs::{conf, Conf, ConfName};
 
 pub mod configs;
 pub mod episode_identity;
-pub mod feed_cache;
 pub mod feed_serving;
 pub mod provider;
 pub mod rss_transcodizer;

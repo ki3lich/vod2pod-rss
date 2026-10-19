@@ -14,10 +14,9 @@ use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{
-    FeedCacheStore, FeedServing, Freshness, FreshnessWindows, RevalidationSpawner,
+    CachedFeed, FeedCacheStore, FeedServing, Freshness, FreshnessWindows, RevalidationSpawner,
     RevalidationTask, ServingPolicy,
 };
-use crate::feed_cache::CachedFeed;
 use crate::provider::{FeedProbeState, GeneratedFeed, MediaProvider, QuotaExhausted};
 
 use super::memory::InMemoryCache;
@@ -243,6 +242,82 @@ impl RevalidationSpawner for RecordingSpawner {
     }
 }
 
+/// Cache adapter wrapper counting every seam call the serving module makes:
+/// one call is one storage round trip (the Redis adapter pipelines each
+/// widened operation into a single round trip; the in-memory adapter is one
+/// map access). Pins the hot path's round-trip budget — a fresh check costs
+/// one load, a conversion costs one store, and nothing re-reads what it
+/// just stored.
+struct CountingCache {
+    inner: InMemoryCache,
+    loads: AtomicUsize,
+    stores: AtomicUsize,
+    renewals: AtomicUsize,
+}
+
+impl CountingCache {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryCache::new(),
+            loads: AtomicUsize::new(0),
+            stores: AtomicUsize::new(0),
+            renewals: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl FeedCacheStore for CountingCache {
+    async fn load_state(&self, canonical_key: &str, now: i64) -> super::LoadState {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.inner.load_state(canonical_key, now).await
+    }
+
+    async fn store_and_report(
+        &self,
+        canonical_key: &str,
+        feed: &CachedFeed,
+        windows: FreshnessWindows,
+        now: i64,
+    ) -> eyre::Result<i64> {
+        self.stores.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .store_and_report(canonical_key, feed, windows, now)
+            .await
+    }
+
+    async fn bump_quota_usage(&self, units: u64, day_key: &str) -> eyre::Result<i64> {
+        self.inner.bump_quota_usage(units, day_key).await
+    }
+
+    async fn renew_freshness(
+        &self,
+        canonical_key: &str,
+        windows: FreshnessWindows,
+        now: i64,
+    ) -> eyre::Result<()> {
+        self.renewals.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .renew_freshness(canonical_key, windows, now)
+            .await
+    }
+
+    async fn quota_breaker_open(&self, breaker_key: &str, now: i64) -> Option<i64> {
+        self.inner.quota_breaker_open(breaker_key, now).await
+    }
+
+    async fn open_quota_breaker(
+        &self,
+        breaker_key: &str,
+        reset_epoch_secs: i64,
+        now: i64,
+    ) -> eyre::Result<()> {
+        self.inner
+            .open_quota_breaker(breaker_key, reset_epoch_secs, now)
+            .await
+    }
+}
+
 /// Redis key shared by the provider fake and the breaker manipulations in
 /// the tests below: both sides must name the same breaker for the preemption
 /// and opening behavior to engage.
@@ -288,7 +363,7 @@ async fn seed_with(
 ) {
     let generated_at = clock.unix_now() - 10;
     cache
-        .store(
+        .store_and_report(
             key,
             &CachedFeed {
                 body: body.to_string(),
@@ -300,6 +375,7 @@ async fn seed_with(
                 fresh_ttl_secs,
                 stale_window_secs: 7 * 24 * 3600,
             },
+            clock.unix_now(),
         )
         .await
         .unwrap();
@@ -309,7 +385,7 @@ async fn seed_with(
 async fn fresh_hit_serves_cached_body_with_freshness_metadata() {
     // the conversion happened at t=990; the poll arrives 10s later
     let clock = Arc::new(FixedClock::at(990));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
     let serving = FeedServing::new(
@@ -342,7 +418,7 @@ async fn fresh_hit_serves_cached_body_with_freshness_metadata() {
 #[tokio::test]
 async fn stale_hit_serves_within_stale_window_honoring_stale_serve_max_age() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
     let serving = FeedServing::new(
@@ -373,7 +449,7 @@ async fn stale_hit_serves_within_stale_window_honoring_stale_serve_max_age() {
 #[tokio::test]
 async fn fresh_period_expiry_serves_stale_even_with_live_marker() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
     let serving = FeedServing::new(
@@ -405,7 +481,7 @@ async fn fresh_period_expiry_serves_stale_even_with_live_marker() {
 #[tokio::test]
 async fn miss_converts_stores_and_serves() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
     let serving = FeedServing::new(
@@ -431,7 +507,11 @@ async fn miss_converts_stores_and_serves() {
     assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
 
     // the conversion result went through the cache adapter
-    let stored = cache.load("k").await.expect("conversion must be stored");
+    let stored = cache
+        .load_state("k", clock.unix_now())
+        .await
+        .feed
+        .expect("conversion must be stored");
     assert_eq!(stored.body, served.body);
     assert_eq!(stored.generated_at, 1_000);
     assert!(!stored.degraded);
@@ -453,7 +533,7 @@ async fn miss_converts_stores_and_serves() {
 #[tokio::test]
 async fn injected_policy_governs_the_windows() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
     let policy = ServingPolicy {
@@ -519,7 +599,7 @@ async fn injected_policy_governs_the_windows() {
 #[tokio::test]
 async fn injected_fresh_ttl_jitter_spreads_expiry() {
     let clock = Arc::new(FixedClock::with_nanos(1_000, 250));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, _) = FakeProvider::new(Some("k"));
     let provider = Arc::new(provider);
     let policy = ServingPolicy {
@@ -556,7 +636,7 @@ async fn injected_fresh_ttl_jitter_spreads_expiry() {
 #[tokio::test]
 async fn provider_canonical_key_shares_entry_freshness_and_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("yt:playlist:PLabc"));
     let provider = Arc::new(provider);
     let serving = FeedServing::new(
@@ -594,7 +674,7 @@ async fn provider_canonical_key_shares_entry_freshness_and_conversion() {
 #[tokio::test]
 async fn normalized_url_canonical_key_shares_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     // provider cannot determine an identity: the module falls back to
     // Source URL normalization
     let (provider, counters) = FakeProvider::new(None);
@@ -633,7 +713,7 @@ async fn normalized_url_canonical_key_shares_conversion() {
 #[tokio::test]
 async fn concurrent_misses_coalesce_into_one_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("coalesce"));
     provider.conversion_delay = Duration::from_millis(300);
     let provider = Arc::new(provider);
@@ -659,12 +739,77 @@ async fn concurrent_misses_coalesce_into_one_conversion() {
     assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
 }
 
+// --- the hot path's round-trip budget: one seam call per storage round trip ---
+
+#[tokio::test]
+async fn a_fresh_serve_costs_exactly_one_load_round_trip() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(CountingCache::new());
+    let (provider, counters) = FakeProvider::new(Some("rt-fresh"));
+    let provider = Arc::new(provider);
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+    seed(&cache.inner, "rt-fresh", &clock, "<rss>cached</rss>", 3600).await;
+    clock.advance_secs(10);
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.freshness, Freshness::Fresh);
+
+    // one cache check, one round trip: the load-state call carried the copy
+    // and the fresh marker together, nothing stored or re-read
+    assert_eq!(cache.loads.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.stores.load(Ordering::SeqCst), 0);
+    assert_eq!(cache.renewals.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_cold_conversion_costs_two_loads_and_one_store() {
+    let clock = Arc::new(FixedClock::at(1_000));
+    let cache = Arc::new(CountingCache::new());
+    let (provider, counters) = FakeProvider::new(Some("rt-miss"));
+    let provider = Arc::new(provider);
+    let serving = FeedServing::new(
+        test_policy(),
+        clock.clone(),
+        Arc::new(RecordingSpawner::default()),
+    );
+
+    let served = serving
+        .serve(
+            cache.clone(),
+            &url("https://example.com/feed"),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.freshness, Freshness::FreshlyGenerated);
+
+    // the miss check, the re-check after the regeneration slot, and the
+    // store-and-report that anchored the result: nothing re-read what it
+    // just stored
+    assert_eq!(cache.loads.load(Ordering::SeqCst), 2);
+    assert_eq!(cache.stores.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.renewals.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
+}
+
 // --- stale-while-revalidate: the module schedules and runs revalidation ---
 
 #[tokio::test]
 async fn stale_hit_records_one_revalidation_request_per_hit_and_fresh_none() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (provider, counters) = FakeProvider::new(Some("req-per-hit"));
     let provider = Arc::new(provider);
     let spawner = Arc::new(RecordingSpawner::default());
@@ -717,7 +862,7 @@ async fn stale_hit_records_one_revalidation_request_per_hit_and_fresh_none() {
 #[tokio::test]
 async fn revalidation_probes_and_renews_freshness_without_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("probe-renews"));
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
@@ -755,7 +900,13 @@ async fn revalidation_probes_and_renews_freshness_without_conversion() {
     assert_eq!(counters.probes.load(Ordering::SeqCst), 1);
     assert_eq!(counters.conversions.load(Ordering::SeqCst), 0);
     assert_eq!(cache.total_quota_usage().await, 1);
-    assert_eq!(cache.fresh_marker_ttl("probe-renews").await, Some(3600));
+    assert_eq!(
+        cache
+            .load_state("probe-renews", clock.unix_now())
+            .await
+            .fresh_marker_ttl,
+        Some(3600)
+    );
 
     // the next poll is served fresh again
     let renewed = serving
@@ -772,7 +923,7 @@ async fn revalidation_probes_and_renews_freshness_without_conversion() {
 #[tokio::test]
 async fn probe_changed_falls_through_to_full_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("probe-changed"));
     provider.probe_unchanged = Some(false);
     let provider = Arc::new(provider);
@@ -821,7 +972,7 @@ async fn probe_changed_falls_through_to_full_conversion() {
 #[tokio::test]
 async fn probe_failure_falls_through_to_full_conversion() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     // probe_unchanged = None: the fake reports the probe unsupported (Err)
     let (provider, counters) = FakeProvider::new(Some("probe-failure"));
     let provider = Arc::new(provider);
@@ -868,7 +1019,7 @@ async fn probe_failure_falls_through_to_full_conversion() {
 #[tokio::test]
 async fn feed_past_fresh_period_is_never_probed_and_converts_fully() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("past-period"));
     // the probe would answer "unchanged": if it ran, the copy would be
     // renewed instead of converted
@@ -910,7 +1061,7 @@ async fn feed_past_fresh_period_is_never_probed_and_converts_fully() {
 #[tokio::test]
 async fn degraded_feed_is_never_probed_and_converts_fully() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("degraded"));
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
@@ -959,7 +1110,7 @@ async fn degraded_feed_is_never_probed_and_converts_fully() {
 #[tokio::test]
 async fn revalidation_coalesces_when_one_is_already_in_flight() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("coalesce-reval"));
     provider.probe_unchanged = Some(true);
     let provider = Arc::new(provider);
@@ -1001,7 +1152,7 @@ async fn revalidation_coalesces_when_one_is_already_in_flight() {
 #[tokio::test]
 async fn revalidation_is_skipped_while_the_quota_breaker_is_open() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("tail-preempts"));
     provider.probe_unchanged = Some(true);
     provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
@@ -1021,7 +1172,7 @@ async fn revalidation_is_skipped_while_the_quota_breaker_is_open() {
     // the provider's quota is known to be exhausted until far past the test's
     // clock
     cache
-        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000)
+        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000, clock.unix_now())
         .await
         .unwrap();
     clock.advance_secs(20);
@@ -1056,7 +1207,7 @@ async fn revalidation_is_skipped_while_the_quota_breaker_is_open() {
 #[tokio::test]
 async fn revalidation_failure_keeps_the_stale_body_and_does_not_degrade() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("reval-failure"));
     provider.fail_conversions = true;
     provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
@@ -1098,7 +1249,7 @@ async fn revalidation_failure_keeps_the_stale_body_and_does_not_degrade() {
 #[tokio::test]
 async fn revalidation_quota_exhaustion_opens_the_breaker() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("reval-quota"));
     provider.quota_exhausted_conversions = true;
     provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
@@ -1143,7 +1294,7 @@ async fn revalidation_quota_exhaustion_opens_the_breaker() {
     assert_eq!(served.body, "<rss>cached</rss>");
 }
 
-// --- pure-function pins (moved with their functions from feed_cache) ---
+// --- pure-function pins ---
 
 #[test]
 fn test_canonicalize_url_merges_host_spelling_variants() {
@@ -1262,7 +1413,7 @@ fn test_classify_freshness_miss_without_body() {
 #[tokio::test]
 async fn exhausted_ladder_errors_when_degraded_feed_generation_fails() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.fail_conversions = true;
     // the Degraded Feed rung cannot produce anything either
@@ -1287,13 +1438,13 @@ async fn exhausted_ladder_errors_when_degraded_feed_generation_fails() {
     assert!(result.is_err());
     assert_eq!(counters.conversions.load(Ordering::SeqCst), 1);
     assert_eq!(counters.quota_free_generations.load(Ordering::SeqCst), 1);
-    assert!(cache.load("k").await.is_none());
+    assert!(cache.load_state("k", clock.unix_now()).await.feed.is_none());
 }
 
 #[tokio::test]
 async fn open_breaker_skips_metered_conversion_and_serves_the_degraded_feed() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
     provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
@@ -1306,7 +1457,7 @@ async fn open_breaker_skips_metered_conversion_and_serves_the_degraded_feed() {
     // the provider's quota is known to be exhausted until far past the test's
     // clock
     cache
-        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000)
+        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000, clock.unix_now())
         .await
         .unwrap();
 
@@ -1328,9 +1479,15 @@ async fn open_breaker_skips_metered_conversion_and_serves_the_degraded_feed() {
     assert_eq!(served.body, "<atom>degraded</atom>");
     // the Degraded Feed is cached with its own short fresh ttl
     assert_eq!(served.max_age_secs, 300);
-    let cached = cache.load("k").await.unwrap();
+    let cached = cache.load_state("k", clock.unix_now()).await.feed.unwrap();
     assert!(cached.degraded);
-    assert_eq!(cache.fresh_marker_ttl("k").await, Some(300));
+    assert_eq!(
+        cache
+            .load_state("k", clock.unix_now())
+            .await
+            .fresh_marker_ttl,
+        Some(300)
+    );
 
     // a later poll is served by that cached copy, fresh, no new generation
     let again = serving
@@ -1349,7 +1506,7 @@ async fn open_breaker_skips_metered_conversion_and_serves_the_degraded_feed() {
 #[tokio::test]
 async fn quota_exhausted_conversion_opens_the_breaker_and_degrades() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.quota_exhausted_conversions = true;
     provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
@@ -1388,7 +1545,7 @@ async fn quota_exhausted_conversion_opens_the_breaker_and_degrades() {
 #[tokio::test]
 async fn non_quota_conversion_failure_still_attempts_the_degraded_rung() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.fail_conversions = true;
     provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
@@ -1421,7 +1578,7 @@ async fn non_quota_conversion_failure_still_attempts_the_degraded_rung() {
 #[tokio::test]
 async fn quota_exhaustion_without_a_breaker_key_degrades_without_opening_a_breaker() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, counters) = FakeProvider::new(Some("k"));
     provider.quota_exhausted_conversions = true;
     // no breaker key: the provider has no metered quota to break
@@ -1451,7 +1608,7 @@ async fn quota_exhaustion_without_a_breaker_key_degrades_without_opening_a_break
 #[tokio::test]
 async fn degraded_feed_gets_the_injected_short_fresh_ttl() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let (mut provider, _counters) = FakeProvider::new(Some("k"));
     provider.quota_breaker_key = Some(FAKE_BREAKER_KEY.to_string());
     provider.quota_free_outcome = QuotaFreeOutcome::Body("<atom>degraded</atom>".to_string());
@@ -1462,7 +1619,7 @@ async fn degraded_feed_gets_the_injected_short_fresh_ttl() {
     };
     let serving = FeedServing::new(policy, clock.clone(), Arc::new(RecordingSpawner::default()));
     cache
-        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000)
+        .open_quota_breaker(FAKE_BREAKER_KEY, 10_000, clock.unix_now())
         .await
         .unwrap();
 
@@ -1477,7 +1634,13 @@ async fn degraded_feed_gets_the_injected_short_fresh_ttl() {
 
     // the degraded fresh ttl comes from the injected policy, not a constant
     assert_eq!(served.max_age_secs, 123);
-    assert_eq!(cache.fresh_marker_ttl("k").await, Some(123));
+    assert_eq!(
+        cache
+            .load_state("k", clock.unix_now())
+            .await
+            .fresh_marker_ttl,
+        Some(123)
+    );
 }
 
 /// The fake-provider breaker tests above pin the ladder policy but bypass
@@ -1490,7 +1653,7 @@ async fn degraded_feed_gets_the_injected_short_fresh_ttl() {
 #[tokio::test]
 async fn quota_exhausted_conversion_through_the_dispatched_provider_opens_the_breaker() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let provider = Arc::new(crate::provider::from(&url(
         "https://www.youtube.com/playlist?list=abc",
     )));
@@ -1528,7 +1691,7 @@ async fn quota_exhausted_conversion_through_the_dispatched_provider_opens_the_br
 #[tokio::test]
 async fn quota_usage_reaches_the_recorder_through_the_dispatched_provider() {
     let clock = Arc::new(FixedClock::at(1_000));
-    let cache = Arc::new(InMemoryCache::new(clock.clone()));
+    let cache = Arc::new(InMemoryCache::new());
     let provider = Arc::new(crate::provider::from(&url(
         "https://www.youtube.com/playlist?list=abc",
     )));
