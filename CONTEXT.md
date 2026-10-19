@@ -115,13 +115,17 @@ disagree, one of them is wrong — fix it before moving on.
   an unrecognized value is never read as a rollback.
 - **Staging Slot**: the concurrency unit of Source Staging — one per Staged
   Source on disk, taken before the stage creates its temp file and held
-  until the transcode deletes it. Slots are handed out by the **Staging
-  Gate** (`stage_gate()` in code), the process-wide pool whose capacity is
-  the **Staging Concurrency** (`STAGE_CONCURRENCY`, default 4); transcodes
-  beyond it queue instead of staging in parallel, bounding egress and
-  ephemeral storage alike. The gate is initialized exactly once at startup —
-  beside the Startup Sweep, before the server accepts its first request —
-  and a second initialization fails loudly. Tests build gates of their own
+  until the transcode deletes it. The resolver acquires the slot before
+  resolution begins and returns the Staged Source already owning it
+  (`StagedSource` in code, issue #181): slot and file deletion travel with
+  the value, so the transcoder holds no slot-ordering logic and a staged
+  artifact without its slot is not constructible. Slots are drawn from the
+  **Staging Gate**, the process-wide pool whose capacity is the **Staging
+  Concurrency** (`STAGE_CONCURRENCY`, default 4); transcodes beyond it
+  queue instead of staging in parallel, bounding egress and ephemeral
+  storage alike. The gate is initialized exactly once at startup — beside
+  the Startup Sweep, before the server accepts its first request — and a
+  second initialization fails loudly. Tests build gates of their own
   capacity and inject them into the resolver. A slot is held only on the
   staged path: the kill switch, manifest-based sources and the legacy path
   go slotless.

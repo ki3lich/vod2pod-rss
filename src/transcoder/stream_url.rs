@@ -17,18 +17,69 @@ use reqwest::Url;
 use crate::configs::{conf, Conf, ConfName};
 use crate::provider::MediaProvider;
 use crate::transcoder::staging::StagedFileGuard;
+use tokio::sync::OwnedSemaphorePermit;
 
 /// The source a resolution hands the transcoder: either the resolved Stream
 /// URL for ffmpeg to read over the network (the legacy artifact), or a
 /// Staged Source — the local, byte-verified file a Source Stage produced —
-/// for ffmpeg to read from disk. The staged artifact is carried as its
-/// [`StagedFileGuard`]: ownership of the file's deletion travels with the
-/// value, so a resolution or transcoder construction that fails or is
-/// dropped deletes the file instead of stranding it for the startup sweep.
+/// for ffmpeg to read from disk. The staged artifact is carried as a
+/// [`StagedSource`]: the file and its Staging Slot owned together, so a
+/// resolution or transcoder construction that fails or is dropped deletes
+/// the file and releases the slot instead of stranding either for the
+/// startup sweep or a queued transcode.
 #[derive(Debug)]
 pub enum ResolvedSource {
     StreamUrl(Url),
-    StagedFile(StagedFileGuard),
+    StagedFile(StagedSource),
+}
+
+/// A Staged Source already holding its Staging Slot — the artifact
+/// resolution hands the transcoder (issue #181).
+///
+/// The resolver acquires the slot before resolution begins and returns the
+/// staged file owning it, so acquire-before-resolve is enforced by the type:
+/// a staged artifact without a slot cannot be constructed, and the
+/// transcoder — which cannot even name the gate — has no ordering to
+/// remember. The slot is held from before the stage creates the file until
+/// the value drops, so at most the gate's capacity of staged files exists at
+/// once and transcodes beyond it queue.
+///
+/// Field order is load-bearing: `file` drops first, deleting the staged
+/// file, and only then does the slot return to the gate — the "one slot per
+/// staged file on disk" invariant holds exactly, with no window holding
+/// capacity+1 files.
+#[derive(Debug)]
+pub struct StagedSource {
+    file: StagedFileGuard,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl StagedSource {
+    /// Pair a staged file with the slot its stage ran under. Only the
+    /// resolution pipeline constructs this — the slot is acquired before
+    /// resolution begins, never after.
+    pub(crate) fn new(file: StagedFileGuard, slot: OwnedSemaphorePermit) -> Self {
+        Self { file, _slot: slot }
+    }
+
+    /// The staged file's path — what ffmpeg's `-i` reads.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.file.path()
+    }
+
+    /// Adopt an already-staged file, with a private one-slot gate backing
+    /// its Staging Slot. Test-only — production acquires the slot from the
+    /// injected or process-wide gate before resolution; the test fakes
+    /// script a staged artifact by adopting a fixture path.
+    #[cfg(test)]
+    pub(crate) fn adopt(path: std::path::PathBuf) -> Self {
+        Self::new(
+            StagedFileGuard::adopt(path),
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("a fresh semaphore always yields its permit"),
+        )
+    }
 }
 
 /// Turns a media URL — the original provider URL carried inside the RSS
@@ -41,22 +92,12 @@ pub enum ResolvedSource {
 #[async_trait]
 pub trait StreamUrlResolver: Send + Sync {
     /// Resolve the source for `media_url` — a Stream URL, or a staged local
-    /// file — failing fast when the resolved source turns out to be
-    /// unreachable or unstaged (the cached resolution is then evicted so the
-    /// next request re-resolves).
+    /// file already holding its Staging Slot — failing fast when the resolved
+    /// source turns out to be unreachable or unstaged (the cached resolution
+    /// is then evicted so the next request re-resolves). A staged hand-back
+    /// always carries its slot: whoever holds the value holds the slot until
+    /// the transcode ends (issue #181).
     async fn resolve(&self, media_url: &Url) -> eyre::Result<ResolvedSource>;
-
-    /// The staging gate a transcode of this resolver's staged sources must
-    /// hold a slot from: `Some` exactly when resolving will stage a file —
-    /// the kill switch open, a direct-media source, a staging stage wired.
-    /// One slot per staged file on disk, taken before the stage creates the
-    /// file and held until the transcode deletes it (issue #172): concurrent
-    /// transcodes beyond the gate's capacity queue instead of staging in
-    /// parallel. `None` — the default — means this resolver never stages and
-    /// its transcodes go slotless, the exact legacy path.
-    fn stage_gate(&self) -> Option<Arc<tokio::sync::Semaphore>> {
-        None
-    }
 }
 
 /// The resolution pipeline's check stage, consulted with a resolved stream
@@ -204,9 +245,9 @@ impl ProviderStreamUrlResolver {
             preflight: Arc::new(TcpPreflight::with_configured_timeout()),
             stager: Some(Arc::new(super::staging::StagingCheckStage::production())),
             staging_enabled: staging_enabled_from_conf(),
-            // Production capacity is the process-wide gate's; it is
-            // consulted at slot-acquisition time (see
-            // [`StreamUrlResolver::stage_gate`]).
+            // Production capacity is the process-wide gate's; a slot is
+            // acquired from it in `resolve` (via [`Self::gate`]) exactly when
+            // [`Self::staging_stage`] picks the staging stage.
             stage_gate: None,
         }
     }
@@ -230,35 +271,38 @@ impl ProviderStreamUrlResolver {
         }
     }
 
-    /// Whether this resolver stages its sources: the kill switch open *and*
-    /// a provider whose Stream URL is a direct media source — a
-    /// manifest-based source (PeerTube playlists) can never be
-    /// routed into staging, whatever the switch says. The one predicate both
-    /// [`Self::check_stage`] (which stage runs) and [`Self::stage_gate`]
-    /// (whether a slot is held) decide on.
-    fn stages(&self) -> bool {
-        self.staging_enabled && self.provider.streams_direct_media()
+    /// The one staging decision: which check stage this resolution consults.
+    /// `Some` is the staging stage, and its slot is acquired before
+    /// resolution begins; `None` is the legacy preflight, slotless. Staging
+    /// applies when the kill switch is open *and* the provider's Stream URL
+    /// is a direct media source — a manifest-based source (PeerTube
+    /// playlists) can never be routed into staging, whatever the switch
+    /// says. The gate and the check stage's required agreement is this
+    /// single decision — a staged-but-slotless or slotted-but-preflight
+    /// resolution is not representable, because both flow from the same
+    /// `Option` (issue #181).
+    fn staging_stage(&self) -> Option<&dyn CheckStage> {
+        if !(self.staging_enabled && self.provider.streams_direct_media()) {
+            return None;
+        }
+        match &self.stager {
+            Some(stager) => Some(stager.as_ref()),
+            None => {
+                warn!(
+                    "source staging is enabled (STAGE_SOURCES) but no staging stage is \
+                     wired; taking the legacy direct-url path"
+                );
+                None
+            }
+        }
     }
 
-    /// The check stage: the staging stage when [`Self::stages`], the legacy
-    /// preflight otherwise. With the gate open but no staging stage wired
-    /// yet, the preflight runs and the fallback is shouted about: the
-    /// operator asked for staging and is not getting it.
-    fn check_stage(&self) -> &dyn CheckStage {
-        if self.stages() {
-            match &self.stager {
-                Some(stager) => stager.as_ref(),
-                None => {
-                    warn!(
-                        "source staging is enabled (STAGE_SOURCES) but no staging stage is \
-                         wired; taking the legacy direct-url path"
-                    );
-                    self.preflight.as_ref()
-                }
-            }
-        } else {
-            self.preflight.as_ref()
-        }
+    /// The gate this resolution's slot comes from: the injected one when a
+    /// test handed one over, the process-wide gate otherwise.
+    fn gate(&self) -> Arc<tokio::sync::Semaphore> {
+        self.stage_gate
+            .clone()
+            .unwrap_or_else(super::staging::stage_gate)
     }
 }
 
@@ -285,33 +329,36 @@ fn staging_enabled_from(raw: &str) -> bool {
 
 #[async_trait]
 impl StreamUrlResolver for ProviderStreamUrlResolver {
-    fn stage_gate(&self) -> Option<Arc<tokio::sync::Semaphore>> {
-        // Exactly when check_stage() picks the staging stage — that is when
-        // a staged file will be created and must hold a slot. With the gate
-        // open but no staging stage wired, the preflight runs and no file
-        // is ever created: slotless.
-        if self.stages() {
-            self.stager.as_ref().map(|_| {
-                self.stage_gate
-                    .clone()
-                    .unwrap_or_else(super::staging::stage_gate)
-            })
-        } else {
-            None
-        }
-    }
-
     async fn resolve(&self, media_url: &Url) -> eyre::Result<ResolvedSource> {
+        // The one staging decision, made once: the slot is acquired before
+        // resolution begins (issue #172's ordering, now structural — issue
+        // #181), and the same decision picks the stage. On any failure the
+        // slot drops with it; a successful stage returns owning it.
+        let staging = self.staging_stage();
+        let slot = match staging {
+            Some(_) => Some(
+                self.gate()
+                    .acquire_owned()
+                    .await
+                    .expect("the staging gate is never closed"),
+            ),
+            None => None,
+        };
         let stream_url = self.provider.get_stream_url(media_url).await?;
 
-        // Check stage: the staging gate picks the preflight or the staging
-        // stage. A failure — a SYN-dropping edge on the preflight, a failed
-        // stage on the stager — means ffmpeg would hang or read a broken
-        // source: fail fast, and evict the cached stream URL so the next
-        // request re-resolves (the upstream edge may have rotated).
-        match self.check_stage().check(&stream_url).await {
+        // Check stage: the staging stage when a slot was taken, the legacy
+        // preflight otherwise. A failure — a SYN-dropping edge on the
+        // preflight, a failed stage on the stager — means ffmpeg would hang
+        // or read a broken source: fail fast, and evict the cached stream
+        // URL so the next request re-resolves (the upstream edge may have
+        // rotated).
+        let consulted = staging.unwrap_or(self.preflight.as_ref());
+        match consulted.check(&stream_url).await {
             Ok(None) => Ok(ResolvedSource::StreamUrl(stream_url)),
-            Ok(Some(staged)) => Ok(ResolvedSource::StagedFile(staged)),
+            Ok(Some(staged)) => {
+                let slot = slot.expect("the staging stage runs exactly when a slot was taken");
+                Ok(ResolvedSource::StagedFile(StagedSource::new(staged, slot)))
+            }
             Err(e) => {
                 warn!(
                     "check stage failed for {stream_url}; \
@@ -628,12 +675,135 @@ mod test {
     }
 
     #[tokio::test]
+    async fn the_staged_handback_carries_its_slot_until_the_source_dies() {
+        // The slotted hand-back (issue #181): the resolver acquires the slot
+        // before resolution begins and returns the Staged Source owning it —
+        // on a capacity-1 gate the handback holds the only slot, a second
+        // resolution queues while the source lives, and dropping the source
+        // frees the slot for it. Slot and file travel with the value; the
+        // transcoder has no ordering to remember.
+        use crate::transcoder::staging::stage_gate_of;
+
+        let media = Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap();
+        let resolved = Url::parse("https://edge.googlevideo.com/videoplayback?x=1").unwrap();
+        let staged = staged_path("vod2pod-test-staged-slotted.source");
+        // Both resolutions resolve: the first stages and holds the slot, the
+        // second runs queued on it.
+        let (provider, _) = ScriptedProvider::new(vec![Ok(resolved.clone()), Ok(resolved.clone())]);
+        let gate = stage_gate_of(1);
+        let stager = Arc::new(ScriptedCheck::new(vec![
+            Ok(Some(StagedFileGuard::adopt(staged.clone()))),
+            Ok(Some(StagedFileGuard::adopt(staged.clone()))),
+        ]));
+        let resolver = Arc::new(ProviderStreamUrlResolver::new(
+            Arc::new(provider),
+            Arc::new(ScriptedCheck::new(Vec::new())),
+            Some(stager),
+            true,
+            Some(gate.clone()),
+        ));
+
+        let first = resolver
+            .resolve(&media)
+            .await
+            .expect("the first resolution stages and holds the gate's only slot");
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the handed-back source must hold the gate's only slot"
+        );
+
+        // While the first source lives, a second resolution queues on the
+        // empty gate: the staging stage is never consulted, no slot is free.
+        let second = {
+            let resolver = resolver.clone();
+            let media = media.clone();
+            tokio::spawn(async move { resolver.resolve(&media).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "the second resolution must queue while the first source holds its slot"
+        );
+
+        // Dropping the source releases its slot; the queued resolution
+        // proceeds and stages in its turn.
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the queued resolution must proceed once the slot is released")
+            .expect("the queued resolution task must not panic");
+        assert!(matches!(second, Ok(ResolvedSource::StagedFile(_))));
+        drop(second);
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "every slot dies with the source carrying it"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_shapes_resolve_slotless_even_with_a_gate_injected() {
+        // The slot is bound to staging and nothing else (issue #181): with
+        // the kill switch off, or a manifest-based provider, resolution
+        // never touches the gate — even when one is injected — so two
+        // resolutions on a capacity-1 gate never queue.
+        use crate::transcoder::staging::stage_gate_of;
+
+        // Kill switch off: the exact legacy path, slotless.
+        let media = Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap();
+        let resolved = Url::parse("https://edge.googlevideo.com/videoplayback?x=1").unwrap();
+        let (provider, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
+        let gate = stage_gate_of(1);
+        let resolver = ProviderStreamUrlResolver::new(
+            Arc::new(provider),
+            Arc::new(ScriptedCheck::new(vec![Ok(None)])),
+            Some(Arc::new(ScriptedCheck::new(Vec::new()))),
+            false,
+            Some(gate.clone()),
+        );
+        resolver
+            .resolve(&media)
+            .await
+            .expect("the legacy path resolves");
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the kill-switch path must stay slotless"
+        );
+
+        // Manifest-based provider: never staged, whatever the switch says.
+        let media = Url::parse("https://framatube.org/videos/watch/abc123").unwrap();
+        let playlist = Url::parse("https://framatube.org/static/hls/abc.m3u8").unwrap();
+        let (provider, _) = ScriptedProvider::manifest(vec![Ok(playlist.clone())]);
+        let gate = stage_gate_of(1);
+        let resolver = ProviderStreamUrlResolver::new(
+            Arc::new(provider),
+            Arc::new(ScriptedCheck::new(vec![Ok(None)])),
+            Some(Arc::new(ScriptedCheck::new(Vec::new()))),
+            true,
+            Some(gate.clone()),
+        );
+        resolver
+            .resolve(&media)
+            .await
+            .expect("a manifest provider resolves through the legacy path");
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "a manifest-based source can never take a slot"
+        );
+    }
+
+    #[tokio::test]
     async fn staged_check_stage_success_hands_over_the_staged_file() {
         // Gate fully open (switch on, direct-media provider): the staging
         // stage replaces the preflight as the consulted check stage, and its
         // staged artifact — not the Stream URL — is what the pipeline hands
         // the transcoder. The preflight is scripted empty, so the test panics
         // if it runs: on a staged path ffmpeg does no network I/O.
+        use crate::transcoder::staging::stage_gate_of;
+
         let media = Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap();
         let resolved = Url::parse("https://edge.googlevideo.com/videoplayback?x=1").unwrap();
         let staged = staged_path("vod2pod-test-staged-success.source");
@@ -642,12 +812,15 @@ mod test {
         let stager = Arc::new(ScriptedCheck::new(vec![Ok(Some(StagedFileGuard::adopt(
             staged.clone(),
         )))]));
+        // The staged path resolves holding a slot (issue #181): the test
+        // injects a gate of its own (issue #177) — the process-wide gate is
+        // startup's, and tests never run it.
         let resolver = ProviderStreamUrlResolver::new(
             Arc::new(provider),
             preflight.clone(),
             Some(stager.clone()),
             true,
-            None,
+            Some(stage_gate_of(4)),
         );
 
         let source = resolver
@@ -671,6 +844,8 @@ mod test {
         // a preflight failure: the request fails fast, the cached resolution
         // is evicted, and the next request re-resolves — the fresh URL then
         // goes through the staging gate again.
+        use crate::transcoder::staging::stage_gate_of;
+
         let media = Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap();
         let cached = Url::parse("https://dead.edge.googlevideo.com/videoplayback?x=1").unwrap();
         let fresh = Url::parse("https://live.edge.googlevideo.com/videoplayback?x=1").unwrap();
@@ -681,12 +856,15 @@ mod test {
             Err(eyre::eyre!("source stage failed: origin reset mid-chunk")),
             Ok(Some(StagedFileGuard::adopt(staged_retry.clone()))),
         ]));
+        // The staged path resolves holding a slot (issue #181): a test gate
+        // is injected (issue #177); the failed first attempt drops its slot
+        // with its error, the second hands back owning one.
         let resolver = ProviderStreamUrlResolver::new(
             Arc::new(provider),
             preflight.clone(),
             Some(stager.clone()),
             true,
-            None,
+            Some(stage_gate_of(4)),
         );
 
         let first = resolver.resolve(&media).await;
@@ -722,6 +900,7 @@ mod test {
         // staged file comes back byte-identical. The preflight is scripted
         // empty — on a staging path it must never run.
         use crate::test_support::staging_test_limits;
+        use crate::transcoder::staging::stage_gate_of;
         use crate::transcoder::staging::test_origin::{FaultPolicy, OriginScript, ScriptedOrigin};
         use crate::transcoder::staging::{StageLimits, StagingCheckStage};
         use std::time::Duration;
@@ -746,12 +925,14 @@ mod test {
             },
             temp_dir.path().to_path_buf(),
         ));
+        // The real staging engine resolves slot-carrying now (issue #181):
+        // a test gate is injected (issue #177).
         let resolver = ProviderStreamUrlResolver::new(
             Arc::new(provider),
             preflight.clone(),
             Some(stager.clone()),
             true,
-            None,
+            Some(stage_gate_of(4)),
         );
 
         let first = resolver.resolve(&media).await;
@@ -803,86 +984,6 @@ mod test {
         assert_stream_url(source, &resolved);
         assert_eq!(log.evictions.load(Ordering::SeqCst), 0);
         assert_eq!(preflight.checked().await, vec![resolved]);
-    }
-
-    #[tokio::test]
-    async fn stage_gate_handed_out_exactly_when_staging_will_run() {
-        // The staging slot is taken only when the check stage consulted
-        // will actually create a staged file — kill switch open, a
-        // direct-media source, a staging stage wired. Every other shape
-        // takes the legacy preflight path and must go slotless, so the
-        // kill switch restores the exact legacy path with no queueing.
-        // Every shape here injects a gate of its own (issue #177): a
-        // resolver handed a gate must hand out exactly that gate when it
-        // will stage, and never hand out a gate when it will not.
-        use crate::transcoder::staging::stage_gate_of;
-
-        let resolved = Url::parse("https://edge.googlevideo.com/videoplayback?x=1").unwrap();
-
-        // Staging will run: the injected gate comes with the resolver.
-        let gate = stage_gate_of(1);
-        let (direct, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
-        let staging = ProviderStreamUrlResolver::new(
-            Arc::new(direct),
-            Arc::new(ScriptedCheck::new(vec![])),
-            Some(Arc::new(ScriptedCheck::new(vec![]))),
-            true,
-            Some(gate.clone()),
-        );
-        let handed = StreamUrlResolver::stage_gate(&staging)
-            .expect("a resolver that will stage hands out the staging gate");
-        assert!(
-            Arc::ptr_eq(&handed, &gate),
-            "the handed-out gate is the injected one"
-        );
-
-        // Kill switch off: the exact legacy path, no slot — even with a
-        // gate injected.
-        let gate = stage_gate_of(1);
-        let (direct, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
-        let legacy = ProviderStreamUrlResolver::new(
-            Arc::new(direct),
-            Arc::new(ScriptedCheck::new(vec![])),
-            Some(Arc::new(ScriptedCheck::new(vec![]))),
-            false,
-            Some(gate),
-        );
-        assert!(
-            StreamUrlResolver::stage_gate(&legacy).is_none(),
-            "the kill switch must restore the legacy path slotless"
-        );
-
-        // Manifest-based source: never staged, whatever the switch says —
-        // even with a gate injected.
-        let gate = stage_gate_of(1);
-        let (manifest, _) = ScriptedProvider::manifest(vec![Ok(resolved.clone())]);
-        let manifest_resolver = ProviderStreamUrlResolver::new(
-            Arc::new(manifest),
-            Arc::new(ScriptedCheck::new(vec![])),
-            Some(Arc::new(ScriptedCheck::new(vec![]))),
-            true,
-            Some(gate),
-        );
-        assert!(
-            StreamUrlResolver::stage_gate(&manifest_resolver).is_none(),
-            "a manifest source never stages, so it never takes a slot"
-        );
-
-        // Staging enabled but no staging stage wired: the preflight runs —
-        // even with a gate injected.
-        let gate = stage_gate_of(1);
-        let (direct, _) = ScriptedProvider::new(vec![Ok(resolved.clone())]);
-        let unwired = ProviderStreamUrlResolver::new(
-            Arc::new(direct),
-            Arc::new(ScriptedCheck::new(vec![])),
-            None,
-            true,
-            Some(gate),
-        );
-        assert!(
-            StreamUrlResolver::stage_gate(&unwired).is_none(),
-            "no staging stage wired, no staged file to hold a slot for"
-        );
     }
 
     #[test]

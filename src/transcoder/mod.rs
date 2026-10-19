@@ -3,10 +3,11 @@ pub(crate) mod staging;
 mod stdout_pump;
 mod stream_url;
 
-use self::staging::StagedFileGuard;
 pub use self::staging::{init_stage_gate, sweep_stale_staged_sources};
 use self::stdout_pump::{spawn_pump_threads, ChannelBytes};
-use self::stream_url::{ProviderStreamUrlResolver, ResolvedSource, StreamUrlResolver};
+use self::stream_url::{
+    ProviderStreamUrlResolver, ResolvedSource, StagedSource, StreamUrlResolver,
+};
 use std::error::Error;
 use std::ops::{Deref, DerefMut};
 use std::process::Command;
@@ -44,7 +45,6 @@ use serde::Serialize;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::configs::AudioCodec;
 
@@ -70,16 +70,13 @@ pub struct Transcoder {
     ffmpeg_command: Command,
     expected_bytes_count: usize,
     /// A handed-over Staged Source: the transcode reads this local file
-    /// instead of the network. Owned here so the file is deleted exactly
-    /// when the transcode ends — completed, failed, or the client gone
-    /// (the guard moves into the transcode stream).
-    staged_source: Option<StagedFileGuard>,
-    /// The staging slot this transcode's staged file occupies (issue #172):
-    /// taken before the stage creates the file, held until the transcode
-    /// ends — dropped with the stream, exactly when the staged file dies.
-    /// One slot per staged file on disk bounds both; transcodes beyond the
-    /// staging concurrency queue on it instead of staging in parallel.
-    stage_slot: Option<OwnedSemaphorePermit>,
+    /// instead of the network, and the value carries its own Staging Slot
+    /// (issue #181) — the resolver acquired it before resolution began, so
+    /// the ordering is the type's, not a caller's. Owned here so the file
+    /// is deleted and the slot released exactly when the transcode ends —
+    /// completed, failed, or the client gone (the value moves into the
+    /// transcode stream).
+    staged_source: Option<StagedSource>,
 }
 
 impl Transcoder {
@@ -100,27 +97,14 @@ impl Transcoder {
         ffmpeg_paramenters: &FfmpegParameters,
         resolver: &dyn StreamUrlResolver,
     ) -> eyre::Result<Self> {
-        // One staging slot per staged source, taken before the stage creates
-        // its file and held until the transcode deletes it — the slot moves
-        // into the transcode stream and dies with it. Transcodes beyond the
-        // staging concurrency queue here instead of staging in parallel
-        // (issue #172). Resolvers that never stage hand out no gate: the
-        // legacy path goes slotless, exactly as before.
-        let stage_slot = match resolver.stage_gate() {
-            Some(gate) => Some(
-                gate.acquire_owned()
-                    .await
-                    .expect("the staging gate is never closed"),
-            ),
-            None => None,
-        };
         // The seam carries either artifact: a Stream URL (ffmpeg reads the
         // network itself) or a Staged Source (ffmpeg reads the local file —
         // the `file` protocol is in the command's whitelist below, so no
         // network I/O happens on a staged path). The staged artifact arrives
-        // as its guard, already owning the file's deletion: held here, it
-        // dies with the transcode — or with any construction failure below,
-        // leaving no stranded file for the startup sweep.
+        // already holding its Staging Slot (issue #181): held here, both the
+        // file's deletion and the slot's release die with the transcode —
+        // or with any construction failure below, leaving no stranded file
+        // and no held slot.
         let (input_url, staged_source) = match resolver.resolve(&ffmpeg_paramenters.url).await? {
             ResolvedSource::StreamUrl(stream_url) => (stream_url, None),
             ResolvedSource::StagedFile(staged) => {
@@ -148,7 +132,6 @@ impl Transcoder {
             ffmpeg_command,
             expected_bytes_count: ffmpeg_paramenters.expected_bytes_count,
             staged_source,
-            stage_slot,
         })
     }
 
@@ -211,14 +194,12 @@ impl Transcoder {
             // Held for the life of the transcode: dropped when the stream is
             // consumed to its end (completed or failed) or dropped early
             // (client gone) — either way the staged file is deleted with the
-            // transcode. Safe against a still-running ffmpeg: it keeps its
-            // open descriptor of the unlinked file.
-            // The underscore is the name only: the guard's Drop is its use.
-            _staged: Option<StagedFileGuard>,
-            // The staging slot the staged file occupies, released with the
-            // file itself at transcode end — the next queued transcode then
-            // gets its turn (issue #172). Same Drop-is-the-use story.
-            _stage_slot: Option<OwnedSemaphorePermit>,
+            // transcode and its Staging Slot returns to the gate, the next
+            // queued transcode then gets its turn (issues #172, #181). Safe
+            // against a still-running ffmpeg: it keeps its open descriptor
+            // of the unlinked file.
+            // The underscore is the name only: the value's Drop is its use.
+            _staged: Option<StagedSource>,
             co: Co<Result<Bytes, std::io::Error>>,
         ) {
             let mut child = ChildGuard(
@@ -255,17 +236,8 @@ impl Transcoder {
             ffmpeg_command,
             expected_bytes_count,
             staged_source,
-            stage_slot,
         } = self;
-        Gen::new(|co| {
-            generetor_coroutine(
-                ffmpeg_command,
-                expected_bytes_count,
-                staged_source,
-                stage_slot,
-                co,
-            )
-        })
+        Gen::new(|co| generetor_coroutine(ffmpeg_command, expected_bytes_count, staged_source, co))
     }
 }
 
@@ -410,7 +382,7 @@ mod test {
             Ok(match &self.0 {
                 FixedSource::Url(url) => ResolvedSource::StreamUrl(url.clone()),
                 FixedSource::Staged(path) => {
-                    ResolvedSource::StagedFile(StagedFileGuard::adopt(path.clone()))
+                    ResolvedSource::StagedFile(StagedSource::adopt(path.clone()))
                 }
             })
         }
@@ -591,7 +563,6 @@ mod test {
             ffmpeg_command: Transcoder::get_ffmpeg_command(&params),
             expected_bytes_count,
             staged_source: None,
-            stage_slot: None,
         };
 
         use futures::StreamExt;
@@ -672,7 +643,6 @@ mod test {
             ffmpeg_command: Transcoder::get_ffmpeg_command(&params),
             expected_bytes_count,
             staged_source: None,
-            stage_slot: None,
         };
 
         use futures::StreamExt;
