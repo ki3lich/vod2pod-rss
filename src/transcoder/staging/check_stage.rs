@@ -16,8 +16,8 @@ use reqwest::Client;
 use tokio::sync::Semaphore;
 
 use crate::configs::{
-    conf_u64, ConfName, DEFAULT_STAGE_CHUNK_CONCURRENCY, DEFAULT_STAGE_CHUNK_SIZE_BYTES,
-    DEFAULT_STAGE_CONCURRENCY, DEFAULT_STAGE_REQUEST_TIMEOUT_SECS,
+    conf, conf_u64, Conf, ConfName, DEFAULT_FFMPEG_TIMEOUT_SECS, DEFAULT_STAGE_CHUNK_CONCURRENCY,
+    DEFAULT_STAGE_CHUNK_SIZE_BYTES, DEFAULT_STAGE_CONCURRENCY, DEFAULT_STAGE_REQUEST_TIMEOUT_SECS,
     DEFAULT_STAGE_TOTAL_TIMEOUT_SECS,
 };
 use crate::transcoder::stream_url::CheckStage;
@@ -69,6 +69,45 @@ pub fn init_stage_gate() {
             "the staging gate is already initialized: it is initialized exactly once, at startup"
         );
     }
+}
+
+/// The one cross-config timeout invariant, asserted at startup beside the
+/// gate initialization (issue #182): the ffmpeg timeout must dominate the
+/// staging total. The transcoder-construction timeout wraps resolution and
+/// staging (the outer wrapper in the server), so a staging total at or
+/// above it would make every large source die mid-stage at the outer
+/// wrapper — all staged bytes discarded, the stage's own deadline never
+/// allowed to fire first and name the real cause. Loud at boot beats
+/// truncated transcodes: refusing to start names the misconfiguration
+/// instead.
+pub fn assert_ffmpeg_dominates_staging() {
+    // The ffmpeg knob parses strictly: the server reads it with
+    // `.parse().unwrap()` per transcode request, so a garbage value would
+    // otherwise pass this assert on the fallback default and only panic on
+    // the first download — the refusal happens here, at boot, naming the
+    // value (issue #182). The staging total keeps the conf_u64 fallback,
+    // the same tolerance its runtime reader applies.
+    let raw = conf()
+        .get(ConfName::FfmpegTimeoutSeconds)
+        .unwrap_or_else(|_| DEFAULT_FFMPEG_TIMEOUT_SECS.to_string());
+    let ffmpeg = raw.trim().parse::<u64>().unwrap_or_else(|_| {
+        panic!(
+            "configuration error: FFMPEG_TIMEOUT_SECONDS ({raw:?}) is not a whole number of \
+             seconds"
+        )
+    });
+    let stage_total = conf_u64(
+        ConfName::StageTotalTimeoutSeconds,
+        DEFAULT_STAGE_TOTAL_TIMEOUT_SECS,
+    );
+    assert!(
+        ffmpeg > stage_total,
+        "configuration error: FFMPEG_TIMEOUT_SECONDS ({ffmpeg}) must dominate \
+         STAGE_TOTAL_TIMEOUT_SECONDS ({stage_total}) — the transcoder-construction timeout \
+         wraps resolution and staging, so a staging total at or above it makes every large \
+         source die mid-stage at the outer wrapper. Raise FFMPEG_TIMEOUT_SECONDS above \
+         STAGE_TOTAL_TIMEOUT_SECONDS, or lower STAGE_TOTAL_TIMEOUT_SECONDS"
+    );
 }
 
 /// The process-wide staging gate: one permit per staged file on disk, its
@@ -159,24 +198,15 @@ impl CheckStage for StagingCheckStage {
         let guard = StagedFileGuard::reserve_in(&self.temp_dir);
         let stager = SourceStager::new(self.client.clone(), self.limits);
         let started = Instant::now();
-        let report = match tokio::time::timeout(
-            self.limits.stage_timeout,
-            stager.stage_to(stream_url, guard.path()),
-        )
-        .await
-        {
-            Ok(Ok(report)) => report,
-            Ok(Err(e)) => {
+        // The total stage deadline is the engine's ([`SourceStager::stage_to`]
+        // enforces it exactly once, issue #182): the wiring carries no
+        // timeout semantics of its own, and the error already names the
+        // timeout when it fires.
+        let report = match stager.stage_to(stream_url, guard.path()).await {
+            Ok(report) => report,
+            Err(e) => {
                 warn!("source stage failed for {stream_url}; the staged file is discarded: {e}");
                 return Err(e);
-            }
-            Err(_elapsed) => {
-                let message = format!(
-                    "source stage timed out after {:?} (the total stage deadline)",
-                    self.limits.stage_timeout
-                );
-                warn!("source stage timed out for {stream_url}; the staged file is discarded");
-                return Err(eyre::eyre!(message));
             }
         };
         let elapsed = started.elapsed();
@@ -494,8 +524,9 @@ mod test {
 
     #[tokio::test]
     async fn a_timed_out_stage_leaves_no_temp_file() {
-        // The total-stage timeout bounds staging: when it fires, the partial
-        // file is discarded with the attempt.
+        // The total-stage timeout bounds staging — enforced by the engine,
+        // exactly once (issue #182): when it fires, the error names the
+        // timeout and the partial file is discarded with the attempt.
         let (mut test, origin) = TestStage::new(OriginScript::default(), 5 * KIB as usize);
         test.stage.limits.stage_timeout = Duration::from_nanos(1);
 
@@ -681,5 +712,91 @@ mod test {
         // panic.
         let _ = std::panic::catch_unwind(init_stage_gate);
         init_stage_gate();
+    }
+
+    // ---- the startup dominance assert (issue #182) ----
+
+    /// The message a caught panic carries.
+    fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("the panic carries a message")
+    }
+
+    #[test]
+    fn startup_refuses_when_the_ffmpeg_timeout_does_not_dominate_the_staging_total() {
+        // The one cross-config timeout invariant is asserted at startup, not
+        // trusted to a comment: a staging total at or above the ffmpeg
+        // timeout makes every large source die mid-stage at the outer
+        // wrapper, so the wiring refuses to start and names the
+        // misconfiguration — both env vars and their values.
+        let _env = crate::test_support::env_lock();
+        std::env::set_var("FFMPEG_TIMEOUT_SECONDS", "10");
+        std::env::set_var("STAGE_TOTAL_TIMEOUT_SECONDS", "240");
+
+        let panic = std::panic::catch_unwind(assert_ffmpeg_dominates_staging)
+            .expect_err("ffmpeg 10s must not dominate a 240s staging total");
+        let message = panic_message(panic);
+        assert!(
+            message.contains("FFMPEG_TIMEOUT_SECONDS (10)")
+                && message.contains("STAGE_TOTAL_TIMEOUT_SECONDS (240)"),
+            "the refusal names the misconfiguration: {message}"
+        );
+
+        // Strictness: equal is not dominating — the outer wrapper would fire
+        // at the same instant with none of the stage's own deadline left.
+        std::env::set_var("FFMPEG_TIMEOUT_SECONDS", "240");
+        assert!(
+            std::panic::catch_unwind(assert_ffmpeg_dominates_staging).is_err(),
+            "equal budgets must be refused"
+        );
+
+        for var in ["FFMPEG_TIMEOUT_SECONDS", "STAGE_TOTAL_TIMEOUT_SECONDS"] {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn startup_refuses_an_unparsable_ffmpeg_timeout_instead_of_transcoding_on_the_default() {
+        // The assert parses the ffmpeg knob strictly: the server would panic
+        // on `.parse().unwrap()` at the first transcode request, so a garbage
+        // value must refuse to start here — not pass silently on the default
+        // and blow up mid-serve.
+        let _env = crate::test_support::env_lock();
+        std::env::set_var("FFMPEG_TIMEOUT_SECONDS", "abc");
+
+        let panic = std::panic::catch_unwind(assert_ffmpeg_dominates_staging)
+            .expect_err("a garbage ffmpeg timeout must refuse to start");
+        let message = panic_message(panic);
+        assert!(
+            message.contains("not a whole number of seconds") && message.contains("abc"),
+            "the refusal names the unparsable value: {message}"
+        );
+
+        std::env::remove_var("FFMPEG_TIMEOUT_SECONDS");
+    }
+
+    #[test]
+    fn startup_accepts_the_default_budgets_and_a_dominating_pair() {
+        // The shipped defaults (300s ffmpeg vs 240s staging total) leave the
+        // stage's own deadline room to fire first; an explicit dominating
+        // pair is accepted the same way.
+        let _env = crate::test_support::env_lock();
+
+        // Unset: the defaults pass.
+        std::env::remove_var("FFMPEG_TIMEOUT_SECONDS");
+        std::env::remove_var("STAGE_TOTAL_TIMEOUT_SECONDS");
+        assert_ffmpeg_dominates_staging();
+
+        // An operator pair with real headroom passes.
+        std::env::set_var("FFMPEG_TIMEOUT_SECONDS", "600");
+        std::env::set_var("STAGE_TOTAL_TIMEOUT_SECONDS", "120");
+        assert_ffmpeg_dominates_staging();
+
+        for var in ["FFMPEG_TIMEOUT_SECONDS", "STAGE_TOTAL_TIMEOUT_SECONDS"] {
+            std::env::remove_var(var);
+        }
     }
 }

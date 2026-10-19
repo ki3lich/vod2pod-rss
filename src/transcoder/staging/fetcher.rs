@@ -48,16 +48,24 @@ pub struct StageLimits {
     /// Fresh-connection attempts per chunk before the stage fails.
     pub max_attempts: u32,
     /// Deadline for one chunk attempt: connect, response headers and body
-    /// streaming combined.
+    /// streaming combined — capped at the total budget it spends from
+    /// (see [`StageLimits::chunk_deadline`]).
     pub attempt_timeout: Duration,
-    /// Deadline for the whole stage — the total stage budget. The
-    /// open-ended fallback's single GET streams the whole source under
-    /// this deadline rather than the per-chunk one: a 200 full body cannot
-    /// be resumed from a range start, so the per-chunk deadline would
-    /// strand every large Range-ignoring source.
+    /// Deadline for the whole stage — the one total budget every request
+    /// shape spends from; decomposed internally and enforced exactly once
+    /// by [`SourceStager::stage_to`] (issue #182).
     pub stage_timeout: Duration,
     /// Pause between a chunk's retries.
     pub retry_backoff: Duration,
+}
+
+impl StageLimits {
+    /// The deadline one chunk attempt sends with: the per-attempt knob
+    /// capped at the total stage budget — no request deadline outlives the
+    /// budget that bounds the stage (issue #182).
+    pub fn chunk_deadline(&self) -> Duration {
+        self.attempt_timeout.min(self.stage_timeout)
+    }
 }
 
 /// The staging engine: stages a resolved stream URL's source media to a
@@ -92,7 +100,33 @@ impl SourceStager {
     /// (dropped SYNs, refused connects, 5xx storms) fails here within the
     /// attempt budget. Surfacing that failure to the eviction-and-retry
     /// loop is the caller's job, exactly as for a preflight failure.
+    ///
+    /// The total stage deadline is enforced here, exactly once — the one
+    /// site of the deadline algebra (issue #182). Every request shape
+    /// spends from the one budget: chunks through their derived per-attempt
+    /// slice, the open-ended fallback through the whole budget — and
+    /// nothing outlives it, so no caller carries timeout knowledge.
     pub async fn stage_to(&self, stream_url: &Url, dest: &Path) -> eyre::Result<StageReport> {
+        tokio::time::timeout(
+            self.limits.stage_timeout,
+            self.stage_within_budget(stream_url, dest),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "source stage timed out after {:?} (the total stage deadline)",
+                self.limits.stage_timeout
+            )
+        })?
+    }
+
+    /// The staging steps the total budget bounds: file creation, the probe,
+    /// the chunk loop and the final byte verification.
+    async fn stage_within_budget(
+        &self,
+        stream_url: &Url,
+        dest: &Path,
+    ) -> eyre::Result<StageReport> {
         tokio::fs::File::create(dest).await?;
 
         let mut state = StageState::default();
@@ -222,11 +256,11 @@ impl SourceStager {
     /// so one open-ended GET stages the source — ffmpeg still reads locally,
     /// the win the ladder preserves. The attempt budget and backoff are the
     /// ranged path's for the failures a fresh connection can beat (drops,
-    /// 5xx); a timeout is not one — the GET's deadline is the total stage
-    /// deadline itself, so a too-slow origin consumes the whole budget in
-    /// one bounded attempt. That is what keeps rung 2 size-independent; the
-    /// fallback differs in the request shape only, not in how cleanly it
-    /// fails.
+    /// 5xx); a timeout is not one — the GET carries no deadline of its own
+    /// and spends the whole total stage budget, which [`SourceStager::stage_to`]
+    /// enforces exactly once. That is what keeps rung 2 size-independent;
+    /// the fallback differs in the request shape only, not in how cleanly
+    /// it fails.
     ///
     /// On success the received byte count is returned and the open-ended
     /// attempts are charged into `state` — the same ledger the probe and
@@ -240,8 +274,7 @@ impl SourceStager {
         let mut attempts_used = 0;
         let received = loop {
             attempts_used += 1;
-            let observation =
-                attempt_open_ended(&self.client, &self.limits, stream_url, dest).await;
+            let observation = attempt_open_ended(&self.client, stream_url, dest).await;
             match open_ended_verdict(&observation, attempts_used, self.limits.max_attempts) {
                 Verdict::Done => match observation {
                     AttemptObservation::Body { received, .. } => break received,
@@ -372,22 +405,26 @@ async fn drive_chunk_attempts(
 }
 
 /// One HTTP GET attempt against the Stream URL — the staging user agent,
-/// an optional Range header, and the request's deadline. Transport-level
-/// failures map onto [`AttemptObservation`]; both request shapes (the
-/// ranged chunk and the open-ended fallback) send through here.
+/// an optional Range header, and the request's own deadline, if its shape
+/// has one (the ranged chunk: [`StageLimits::chunk_deadline`]; the
+/// open-ended fallback: none — the total budget bounds it once, see
+/// [`SourceStager::stage_to`]). Transport-level failures map onto
+/// [`AttemptObservation`]; both request shapes send through here.
 async fn send_attempt(
     client: &Client,
     stream_url: &Url,
     range: Option<(u64, u64)>,
-    deadline: Duration,
+    deadline: Option<Duration>,
 ) -> Result<reqwest::Response, AttemptObservation> {
     let mut request = client.get(stream_url.clone());
     if let Some((start, end)) = range {
         request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
     }
+    if let Some(deadline) = deadline {
+        request = request.timeout(deadline);
+    }
     match request
         .header(reqwest::header::USER_AGENT, STAGING_USER_AGENT)
-        .timeout(deadline)
         .send()
         .await
     {
@@ -454,7 +491,7 @@ async fn attempt_chunk(
         client,
         stream_url,
         Some((span.offset, range_end)),
-        limits.attempt_timeout,
+        Some(limits.chunk_deadline()),
     )
     .await
     {
@@ -570,18 +607,13 @@ async fn attempt_chunk(
 /// previous attempt's partial bytes are truncated away first, so a retry
 /// rewrites the body from its start.
 ///
-/// The request runs under the total stage deadline, not the per-chunk one:
-/// a 200 full body cannot be resumed from a range start, so bounding it by
-/// the per-chunk deadline would strand every source bigger than one
-/// chunk's worth of throughput (the fallback ladder's rung 2 must stay
-/// size-independent).
-async fn attempt_open_ended(
-    client: &Client,
-    limits: &StageLimits,
-    stream_url: &Url,
-    dest: &Path,
-) -> AttemptObservation {
-    let mut response = match send_attempt(client, stream_url, None, limits.stage_timeout).await {
+/// The request carries no deadline of its own — the whole total stage
+/// budget bounds it, once (see [`SourceStager::stage_to`]). That is what
+/// keeps the fallback size-independent: a 200 full body cannot be resumed
+/// from a range start, so bounding it by the per-chunk deadline would
+/// strand every source bigger than one chunk's worth of throughput.
+async fn attempt_open_ended(client: &Client, stream_url: &Url, dest: &Path) -> AttemptObservation {
+    let mut response = match send_attempt(client, stream_url, None, None).await {
         Ok(response) => response,
         Err(observation) => return observation,
     };
@@ -716,6 +748,74 @@ mod test {
 
     async fn staged_bytes(dest: &Path) -> Vec<u8> {
         tokio::fs::read(dest).await.expect("read the staged file")
+    }
+
+    // ---- the deadline algebra (issue #182) ----
+
+    #[test]
+    fn chunk_deadline_is_the_attempt_knob_below_the_total() {
+        // The ordinary shape: the per-attempt knob inside the total budget
+        // is the deadline a chunk attempt sends with, unchanged.
+        let limits = StageLimits {
+            attempt_timeout: Duration::from_secs(5),
+            stage_timeout: Duration::from_secs(30),
+            ..test_limits()
+        };
+        assert_eq!(limits.chunk_deadline(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn chunk_deadline_is_capped_at_the_total_budget() {
+        // The algebra's derivation: no request deadline outlives the one
+        // budget that bounds the stage — a per-attempt knob past the total
+        // is capped at it, so the ffmpeg timeout dominating the total
+        // (asserted at startup) dominates every request deadline as well.
+        let limits = StageLimits {
+            attempt_timeout: Duration::from_secs(600),
+            stage_timeout: Duration::from_secs(240),
+            ..test_limits()
+        };
+        assert_eq!(limits.chunk_deadline(), Duration::from_secs(240));
+        // At the boundary the cap and the knob agree: the total.
+        let limits = StageLimits {
+            attempt_timeout: Duration::from_secs(240),
+            ..limits
+        };
+        assert_eq!(limits.chunk_deadline(), Duration::from_secs(240));
+    }
+
+    #[tokio::test]
+    async fn open_ended_fallback_dies_at_the_total_stage_deadline() {
+        // The open-ended GET carries no per-request deadline — it spends the
+        // whole total stage budget, enforced exactly once by stage_to's
+        // wrapper (issue #182): a too-slow origin consumes the budget in one
+        // bounded attempt and the stage fails naming the total deadline, not
+        // hung forever and not killed twice at two sites.
+        let origin = ScriptedOrigin::start(
+            (64 * KIB) as usize,
+            OriginScript {
+                ignore_range: true,
+                throttle_open_ended: true,
+                ..OriginScript::default()
+            },
+        );
+        // 64 KiB at the scripted ~27 KB/s crawl takes ~2.5 s: far past this
+        // 300 ms total budget, which is the only deadline the fallback has.
+        let limits = StageLimits {
+            stage_timeout: Duration::from_millis(300),
+            ..test_limits()
+        };
+        let dest = TempFile::new("open-ended-total-deadline");
+
+        let err = stager(limits)
+            .stage_to(&origin.url(), dest.path())
+            .await
+            .expect_err("a crawl past the total budget must time the stage out");
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out") && message.contains("the total stage deadline"),
+            "the error names the total stage deadline: {message}"
+        );
     }
 
     #[tokio::test]

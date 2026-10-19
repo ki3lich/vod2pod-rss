@@ -9,7 +9,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    configs::{conf, conf_u64, Conf, ConfName},
+    configs::{conf, conf_u64, Conf, ConfName, DEFAULT_FFMPEG_TIMEOUT_SECS},
     feed_serving::{self, FeedServing, ServedFeed, ServingPolicy},
     provider::{self, MediaProvider},
     rss_transcodizer,
@@ -419,7 +419,11 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
     }
 
     match tokio::time::timeout(
-        Duration::from_secs(timeout_in_seconds.try_into().unwrap_or(300)),
+        Duration::from_secs(
+            timeout_in_seconds
+                .try_into()
+                .unwrap_or(DEFAULT_FFMPEG_TIMEOUT_SECS),
+        ),
         Transcoder::new(&ffmpeg_paramenters),
     )
     .await

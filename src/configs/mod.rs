@@ -26,8 +26,12 @@ pub const DEFAULT_STAGE_CONCURRENCY: u64 = 4;
 /// runs at once. 4 is the measured full-aggregate speed of the googlevideo
 /// edge (issue #166): four parallel chunks drained a 27.9 MB source in 1.09 s.
 pub const DEFAULT_STAGE_CHUNK_CONCURRENCY: u64 = 4;
-/// Default total stage deadline, seconds (240 — inside the
-/// transcoder-construction timeout that also covers resolution).
+/// Default transcoder-construction timeout, seconds (300 — wraps resolution
+/// and staging per transcode request; must dominate the staging total, which
+/// the startup wiring asserts — issue #182).
+pub const DEFAULT_FFMPEG_TIMEOUT_SECS: u64 = 300;
+/// Default total stage deadline, seconds (240 — dominated by the
+/// transcoder-construction timeout, asserted at startup, issue #182).
 pub const DEFAULT_STAGE_TOTAL_TIMEOUT_SECS: u64 = 240;
 /// Default per-request deadline, seconds (60 — one chunk attempt's connect,
 /// headers and body combined; a slower read is retried on a fresh
@@ -154,9 +158,8 @@ impl Conf for EnvConf {
                 Ok(std::env::var("MAX_FRESH_PERIOD")
                     .unwrap_or_else(|_| DEFAULT_MAX_FRESH_PERIOD_SECS.to_string()))
             }
-            ConfName::FfmpegTimeoutSeconds => {
-                Ok(std::env::var("FFMPEG_TIMEOUT_SECONDS").unwrap_or_else(|_| "300".to_string()))
-            }
+            ConfName::FfmpegTimeoutSeconds => Ok(std::env::var("FFMPEG_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| DEFAULT_FFMPEG_TIMEOUT_SECS.to_string())),
             ConfName::PreflightTimeoutSeconds => {
                 // Max seconds to wait for a TCP handshake to the resolved media
                 // stream URL before declaring the source unreachable. Guards
@@ -203,9 +206,11 @@ impl Conf for EnvConf {
                     .unwrap_or_else(|_| DEFAULT_STAGE_CONCURRENCY.to_string()))
             }
             ConfName::StageTotalTimeoutSeconds => {
-                // Deadline for one whole Source Stage, resolution included
-                // upstream of it. Bounds the largest source a stage may
-                // fetch before the request fails fast.
+                // Deadline for one whole Source Stage — the one total budget
+                // every staged request shape spends from, decomposed inside
+                // the staging module and bounded by the transcoder-construction
+                // (ffmpeg) timeout, a dominance the startup wiring asserts
+                // (issue #182) instead of trusting this comment.
                 Ok(std::env::var("STAGE_TOTAL_TIMEOUT_SECONDS")
                     .unwrap_or_else(|_| DEFAULT_STAGE_TOTAL_TIMEOUT_SECS.to_string()))
             }

@@ -41,6 +41,12 @@ async fn async_main() -> std::io::Result<()> {
     // fails loudly.
     vod2pod_rss::transcoder::init_stage_gate();
 
+    // The one cross-config timeout invariant, asserted instead of trusted to
+    // a comment (issue #182): the ffmpeg timeout must dominate the staging
+    // total, or the outer wrapper kills every large source mid-stage. A
+    // violating configuration refuses to start, naming the misconfiguration.
+    vod2pod_rss::transcoder::assert_ffmpeg_dominates_staging();
+
     // Apple Podcasts (and most podcatchers) play MP3/M4A only: OGG/Opus
     // enclosures fail silently there. Keep the trade-off visible at startup.
     let codec: AudioCodec = conf().get(ConfName::AudioCodec).unwrap().into();

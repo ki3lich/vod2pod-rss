@@ -3,7 +3,9 @@ pub(crate) mod staging;
 mod stdout_pump;
 mod stream_url;
 
-pub use self::staging::{init_stage_gate, sweep_stale_staged_sources};
+pub use self::staging::{
+    assert_ffmpeg_dominates_staging, init_stage_gate, sweep_stale_staged_sources,
+};
 use self::stdout_pump::{spawn_pump_threads, ChannelBytes};
 use self::stream_url::{
     ProviderStreamUrlResolver, ResolvedSource, StagedSource, StreamUrlResolver,

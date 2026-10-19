@@ -26,7 +26,8 @@ pub mod check_stage;
 // consumes the staging engine through the root, never by walking into a
 // submodule.
 pub use check_stage::{
-    init_stage_gate, stage_gate, sweep_stale_staged_sources, StagedFileGuard, StagingCheckStage,
+    assert_ffmpeg_dominates_staging, init_stage_gate, stage_gate, sweep_stale_staged_sources,
+    StagedFileGuard, StagingCheckStage,
 };
 
 // Test-only knobs, shared across the modules' test suites.

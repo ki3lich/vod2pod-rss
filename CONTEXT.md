@@ -158,6 +158,18 @@ disagree, one of them is wrong — fix it before moving on.
   fetches the whole source with one open-ended GET into the same temp file,
   engaging on its own with no operator action. ffmpeg still reads locally;
   the attempt budget and the fast, clean failure rules are the ranged path's.
+- **Stage Deadline**: the one total budget of a Source Stage
+  (`STAGE_TOTAL_TIMEOUT_SECONDS`, default 240) — decomposed inside the
+  staging module and enforced exactly once, around the whole stage: a Chunk
+  attempt spends at most its per-attempt slice
+  (`STAGE_REQUEST_TIMEOUT_SECONDS`, capped at the total), while the
+  Open-ended Fallback's single unresumable GET spends the whole budget with
+  no per-request deadline of its own. The transcoder-construction (ffmpeg)
+  timeout must dominate the Stage Deadline — resolution and staging happen
+  inside it — and the startup wiring refuses to start otherwise, naming the
+  misconfiguration (issue #182); violating it would make every large source
+  die mid-stage at the outer wrapper instead of at the stage's own
+  deadline.
 - **Scripted Origin**: the test fixture encoding the measured edge behavior
   (fast bounded ranges, throttled open-ended reads, stalled responses,
   mid-body drops, Range ignored, 5xx, Content-Range lies) so the throttle bug
