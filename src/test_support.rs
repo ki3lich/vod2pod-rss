@@ -34,6 +34,40 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Pin `REDIS_ADDRESS`/`REDIS_PORT` to a dead port for one test, restoring
+/// the ambient values on drop — even when the test panics mid-await. The
+/// integration binaries keep their own copy of this shape: `pub(crate)` is
+/// invisible across the tests/ crate boundary.
+pub(crate) struct DeadRedisEnvPin {
+    prev: (Option<String>, Option<String>),
+}
+
+impl DeadRedisEnvPin {
+    pub(crate) fn new() -> Self {
+        let prev = (
+            std::env::var("REDIS_ADDRESS").ok(),
+            std::env::var("REDIS_PORT").ok(),
+        );
+        std::env::set_var("REDIS_ADDRESS", "127.0.0.1");
+        // Port 1 hosts no Redis in any environment.
+        std::env::set_var("REDIS_PORT", "1");
+        Self { prev }
+    }
+}
+
+impl Drop for DeadRedisEnvPin {
+    fn drop(&mut self) {
+        match self.prev.0.take() {
+            Some(v) => std::env::set_var("REDIS_ADDRESS", v),
+            None => std::env::remove_var("REDIS_ADDRESS"),
+        }
+        match self.prev.1.take() {
+            Some(v) => std::env::set_var("REDIS_PORT", v),
+            None => std::env::remove_var("REDIS_PORT"),
+        }
+    }
+}
+
 /// Fast-but-real staging limits for tests outside the fetcher's own suite:
 /// 1 KiB chunks, 2 in flight, tight timeouts, near-zero backoff. Tests
 /// override the fields their scenario cares about with struct-update

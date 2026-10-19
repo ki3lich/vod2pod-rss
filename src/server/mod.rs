@@ -52,8 +52,30 @@ pub fn spawn_server(listener: TcpListener) -> eyre::Result<Server> {
     .run())
 }
 
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().finish()
+async fn health(query: web::Query<HashMap<String, String>>) -> HttpResponse {
+    // Plain `/health` is the liveness probe: process-only, green while the
+    // server runs. The `deep` variant is the readiness probe: it pings
+    // Redis, the app's one hard dependency (ADR 0003), so a broken Redis
+    // shows up as a not-ready pod instead of silently 503ing downloads.
+    if query.get("deep").map(String::as_str) != Some("1") {
+        return HttpResponse::Ok().finish();
+    }
+    match deep_redis_check().await {
+        Ok(()) => HttpResponse::Ok().finish(),
+        Err(e) => HttpResponse::ServiceUnavailable().body(format!("redis unreachable: {e}")),
+    }
+}
+
+/// PING Redis on a fresh connection, bounded well under the k8s probe
+/// timeout so a hung Redis yields a fast 503, never a hanging probe.
+async fn deep_redis_check() -> eyre::Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut con = crate::get_redis_client().await?;
+        let _: String = redis::cmd("PING").query_async(&mut con).await?;
+        Ok::<(), eyre::Report>(())
+    })
+    .await
+    .map_err(|_| eyre::eyre!("redis ping timed out"))?
 }
 
 async fn index(req: HttpRequest) -> HttpResponse {
@@ -104,14 +126,16 @@ async fn transcodize_rss(
         Err(e) => return HttpResponse::BadRequest().body(e.to_string()),
     };
 
-    let provider = Arc::new(provider::from(&parsed_url));
+    let provider: Arc<dyn MediaProvider> = Arc::new(provider::from(&parsed_url));
 
     if !provider
         .domain_whitelist_regexes()
         .iter()
         .any(|r| r.is_match(parsed_url.as_ref()))
     {
-        error!("supplied url ({parsed_url}) not in whitelist (whitelist is needed to prevent SSRF attack)");
+        error!(
+            "supplied url ({parsed_url}) not in whitelist (whitelist is needed to prevent SSRF attack)"
+        );
         return HttpResponse::Forbidden().body("scheme and host not in whitelist");
     }
 
@@ -124,7 +148,8 @@ async fn transcodize_rss(
     // revalidate included; the adapter reads the policy numbers from config
     // and injects them at construction (the module itself reads no
     // environment configuration)
-    let cache = Arc::new(feed_serving::RedisFeedCache::new(redis.clone()));
+    let cache: Arc<dyn feed_serving::FeedCacheStore> =
+        Arc::new(feed_serving::RedisFeedCache::new(redis.clone()));
     let serving = FeedServing::new(
         serving_policy(),
         Arc::new(feed_serving::WallClock),
@@ -332,7 +357,9 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
         .iter()
         .any(|r| r.is_match(stream_url.as_ref()))
     {
-        error!("supplied url ({stream_url}) not in whitelist (whitelist is needed to prevent SSRF attack)");
+        error!(
+            "supplied url ({stream_url}) not in whitelist (whitelist is needed to prevent SSRF attack)"
+        );
         return HttpResponse::Forbidden().body("scheme and host not in whitelist");
     }
 
@@ -416,8 +443,18 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
                 .no_chunking((expected_bytes).try_into().unwrap())
                 .streaming(stream)
         }
-        Ok(Err(e)) => HttpResponse::ServiceUnavailable().body(e.to_string()),
-        Err(_) => HttpResponse::ServiceUnavailable().body("transcoder initialization timed out"),
+        Ok(Err(e)) => {
+            // The 503 body alone is invisible to the operator: without this
+            // line a failed resolution (e.g. Redis down — see ADR 0003)
+            // leaves nothing in the logs but the request's first line, and
+            // only the podcatcher's retries hint at the failure.
+            error!("transcoder init failed for {stream_url}: {e:#}");
+            HttpResponse::ServiceUnavailable().body(e.to_string())
+        }
+        Err(_) => {
+            error!("transcoder init timed out for {stream_url} after {timeout_in_seconds}s");
+            HttpResponse::ServiceUnavailable().body("transcoder initialization timed out")
+        }
     }
 }
 
@@ -577,5 +614,26 @@ mod tests {
         );
 
         assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    // The env pin must span the whole call (EnvConf reads env at call time),
+    // so the std guard is held across the await. Safe: the lock's contenders
+    // are other tests' threads — blocking serializes them; nothing on this
+    // test's own runtime ever locks it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn deep_redis_check_fails_when_redis_unreachable() {
+        let _guard = crate::test_support::env_lock();
+        // Port 1 hosts no Redis in any environment, so the check must fail
+        // fast with a connect error (refused in CI, denied in sandboxes) —
+        // never hang and never report Ok.
+        let _pin = crate::test_support::DeadRedisEnvPin::new();
+
+        let verdict = deep_redis_check().await;
+
+        assert!(
+            verdict.is_err(),
+            "deep check must fail with Redis unreachable"
+        );
     }
 }

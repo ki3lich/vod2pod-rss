@@ -34,7 +34,8 @@ disagree, one of them is wrong — fix it before moving on.
 - **Stale Window**: the period after a Feed stopped being Fresh during which
   the cached copy may still be served — both while it is being revalidated in
   the background and when upstream cannot be reached. Serving within the
-  Stale Window is always preferred over failing.
+  Stale Window is always preferred over failing — while Redis is reachable;
+  with Redis itself unreachable the app fails fast (see ADR 0003).
 - **Stale Feed**: a cached Feed that is no longer Fresh but is inside the
   Stale Window.
 - **Degraded Feed**: a Feed produced without the provider's metered API (for

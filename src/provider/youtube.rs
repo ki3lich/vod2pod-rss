@@ -1017,6 +1017,11 @@ async fn build_yt_stream_url_cache() -> AsyncRedisCache<Url, Url> {
     AsyncRedisCache::builder(YT_STREAM_URL_CACHE_PREFIX)
         .ttl(std::time::Duration::from_secs(900))
         .refresh_on_hit(false)
+        // Auto-reconnect: these singletons hold one connection for the
+        // process lifetime, and without the manager a single Redis blip
+        // poisoned it with "broken pipe" until the next app restart (the
+        // 2026-10-19 downloads outage). See ADR 0003.
+        .connection_manager(true)
         .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
         .build()
         .await
@@ -1101,6 +1106,9 @@ async fn feed_url_for_yt_channel(url: &Url) -> eyre::Result<Url> {
         AsyncRedisCache::builder("youtube_channel_username_to_id=")
             .ttl(std::time::Duration::from_secs(9999999))
             .refresh_on_hit(false)
+            // Auto-reconnect, same reason as the stream-url cache: a dead
+            // singleton connection must heal, not require an app restart.
+            .connection_manager(true)
             .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
             .build()
             .await
@@ -1178,6 +1186,9 @@ fn convert_atom_to_rss(
         AsyncRedisCache::builder("cached_yt_video_duration=")
             .ttl(std::time::Duration::from_secs(86400))
             .refresh_on_hit(false)
+            // Auto-reconnect, same reason as the stream-url cache: a dead
+            // singleton connection must heal, not require an app restart.
+            .connection_manager(true)
             .connection_string(&conf().get(ConfName::RedisUrl).unwrap())
             .build()
             .await
