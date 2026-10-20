@@ -5,7 +5,16 @@ mod stdout_pump;
 // fakes installed behind this seam (issue #183) — the resolver types must be
 // nameable across the crate, not just inside this module.
 pub(crate) mod stream_url;
+// pub(crate): the RSS transcodizer calls the byte-count formula here — the
+// enclosure `length` attribute and the served Content-Length share one
+// owner (issue #184, ADR-0002).
+pub(crate) mod media_sizing;
+// The deep transcode-request hand-off (issue #184): the raw request comes
+// in, every derived fact — window, seek, byte counts, argv, construction
+// deadline — comes out. The route only shapes HTTP around it.
+pub(crate) mod request;
 
+use self::request::TranscodeRequest;
 pub use self::staging::{
     assert_ffmpeg_dominates_staging, init_stage_gate, sweep_stale_staged_sources,
 };
@@ -44,31 +53,11 @@ impl DerefMut for ChildGuard {
 use actix_web::web::Bytes;
 use futures::Future;
 use genawaiter::sync::{Co, Gen};
-use log::{debug, info};
+use log::info;
 use reqwest::Url;
-use serde::Serialize;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-
-use crate::configs::AudioCodec;
-
-#[derive(Serialize)]
-pub struct FfmpegParameters {
-    pub seek_time: f32,
-    pub url: Url,
-    pub audio_codec: AudioCodec,
-    pub bitrate_kbit: usize,
-    pub max_rate_kbit: usize,
-    pub expected_bytes_count: usize,
-    pub timeout_in_seconds: usize,
-}
-
-impl FfmpegParameters {
-    pub fn bitarate(&self) -> usize {
-        self.bitrate_kbit * 1024
-    }
-}
 
 #[derive(Debug)]
 pub struct Transcoder {
@@ -88,30 +77,32 @@ impl Transcoder {
     /// Production entry point: wires the real resolution pipeline behind the
     /// [`StreamUrlResolver`] seam — the provider the media URL dispatches to
     /// (cached yt-dlp resolution on the YouTube rung) plus the TCP preflight
-    /// with its configured timeout — then builds the transcoder from what it
-    /// resolves.
-    pub async fn new(ffmpeg_paramenters: &FfmpegParameters) -> eyre::Result<Self> {
-        let resolver = ProviderStreamUrlResolver::for_media_url(&ffmpeg_paramenters.url);
-        Self::with_resolver(ffmpeg_paramenters, &resolver).await
+    /// with its configured timeout — then builds the transcoder from the
+    /// request's derived facts and what resolution hands back (issue #184).
+    /// pub(crate): the request type it consumes is the transcoder's internal
+    /// hand-off — nothing outside the crate can state one.
+    pub(crate) async fn new(request: &TranscodeRequest) -> eyre::Result<Self> {
+        let resolver = ProviderStreamUrlResolver::for_media_url(&request.media_url);
+        Self::with_request(request, &resolver).await
     }
 
-    /// Builds the transcoder from the stream URL resolved behind the
-    /// [`StreamUrlResolver`] seam — the injection point tests use to drive
-    /// resolution with fakes, including the server's route-level tests
-    /// (issue #183).
-    pub(crate) async fn with_resolver(
-        ffmpeg_paramenters: &FfmpegParameters,
+    /// Builds the transcoder from a [`TranscodeRequest`]'s derived facts and
+    /// the source resolved behind the [`StreamUrlResolver`] seam — the
+    /// injection point tests use to drive resolution with fakes, including
+    /// the server's route-level tests (issue #183).
+    pub(crate) async fn with_request(
+        request: &TranscodeRequest,
         resolver: &dyn StreamUrlResolver,
     ) -> eyre::Result<Self> {
         // The seam carries either artifact: a Stream URL (ffmpeg reads the
         // network itself) or a Staged Source (ffmpeg reads the local file —
-        // the `file` protocol is in the command's whitelist below, so no
-        // network I/O happens on a staged path). The staged artifact arrives
-        // already holding its Staging Slot (issue #181): held here, both the
-        // file's deletion and the slot's release die with the transcode —
-        // or with any construction failure below, leaving no stranded file
-        // and no held slot.
-        let (input_url, staged_source) = match resolver.resolve(&ffmpeg_paramenters.url).await? {
+        // the `file` protocol is in the argv's whitelist, so no network I/O
+        // happens on a staged path). The staged artifact arrives already
+        // holding its Staging Slot (issue #181): held here, both the file's
+        // deletion and the slot's release die with the transcode — or with
+        // any construction failure below, leaving no stranded file and no
+        // held slot.
+        let (input_url, staged_source) = match resolver.resolve(&request.media_url).await? {
             ResolvedSource::StreamUrl(stream_url) => (stream_url, None),
             ResolvedSource::StagedFile(staged) => {
                 let input_url = Url::from_file_path(staged.path()).map_err(|_| {
@@ -124,71 +115,15 @@ impl Transcoder {
             }
         };
 
-        let ffmpeg_command = Self::get_ffmpeg_command(&FfmpegParameters {
-            seek_time: ffmpeg_paramenters.seek_time,
-            url: input_url,
-            audio_codec: ffmpeg_paramenters.audio_codec.to_owned(),
-            bitrate_kbit: ffmpeg_paramenters.bitrate_kbit,
-            max_rate_kbit: ffmpeg_paramenters.max_rate_kbit,
-            expected_bytes_count: ffmpeg_paramenters.expected_bytes_count,
-            timeout_in_seconds: ffmpeg_paramenters.timeout_in_seconds,
-        });
-
+        // The argv derives inside the request module (issue #184); the one
+        // fact the transcoder adds is the resolved input URL. The expected
+        // byte count is the request's derived window length — the stdout
+        // pump pads or truncates to exactly it.
         Ok(Self {
-            ffmpeg_command,
-            expected_bytes_count: ffmpeg_paramenters.expected_bytes_count,
+            ffmpeg_command: request.ffmpeg_command(&input_url),
+            expected_bytes_count: request.window.expected_bytes,
             staged_source,
         })
-    }
-
-    fn get_ffmpeg_command(ffmpeg_paramenters: &FfmpegParameters) -> Command {
-        debug!("generating ffmpeg command");
-        let mut command = Command::new("ffmpeg");
-        let command_ref = &mut command;
-
-        command_ref
-            .args(["-ss", ffmpeg_paramenters.seek_time.to_string().as_str()])
-            .args([
-                "-protocol_whitelist",
-                "file,http,https,tcp,tls",
-                "-i",
-                ffmpeg_paramenters.url.as_str(),
-            ])
-            .args([
-                "-acodec",
-                ffmpeg_paramenters.audio_codec.get_ffmpeg_codec_str(),
-            ])
-            .args(["-threads", "0"])
-            .args([
-                "-ab",
-                format!("{}k", ffmpeg_paramenters.bitrate_kbit).as_str(),
-            ])
-            .args(["-f", ffmpeg_paramenters.audio_codec.get_extension_str()])
-            .args([
-                "-bufsize",
-                (ffmpeg_paramenters.bitrate_kbit * 30).to_string().as_str(),
-            ])
-            .args([
-                "-maxrate",
-                format!("{}k", ffmpeg_paramenters.max_rate_kbit).as_str(),
-            ])
-            .args([
-                "-timeout",
-                ffmpeg_paramenters.timeout_in_seconds.to_string().as_str(),
-            ])
-            .args(["-hide_banner"])
-            .args(["-loglevel", "error"])
-            .arg("-");
-        let args: Vec<String> = command_ref
-            .get_args()
-            .map(|x| x.to_string_lossy().to_string())
-            .collect();
-        info!(
-            "generated ffmpeg command:\n{} {}",
-            command_ref.get_program().to_string_lossy(),
-            args.join(" ")
-        );
-        command
     }
 
     pub fn get_transcode_stream(
@@ -250,96 +185,25 @@ impl Transcoder {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::configs::AudioCodec;
     use async_trait::async_trait;
     use log::info;
 
-    #[test]
-    fn check_ffmpeg_command() {
-        // Exercises pure command construction directly. `Transcoder::new` now
-        // also runs a reachability preflight (network), so driving it here would
-        // couple this command-shape test to DNS/TCP behavior. `url.mp3` is not
-        // expected to resolve; only the produced argv is asserted.
-        let stream_url = Url::parse("http://url.mp3").unwrap();
-        let params = FfmpegParameters {
-            seek_time: 30.0,
-            url: stream_url,
-            max_rate_kbit: 64,
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 3,
-            expected_bytes_count: 999,
-            timeout_in_seconds: 600,
-        };
+    // The argv pin lives in the request module (issue #184), beside
+    // `TranscodeRequest::ffmpeg_command`, the derivation it pins.
 
-        let command = Transcoder::get_ffmpeg_command(&params);
-        let ppath = command.get_program();
-        if let Some(x) = ppath.to_str() {
-            info!("{} ", x);
-            assert_eq!(x, "ffmpeg");
-        }
-        let mut args = command.get_args();
-
-        while let Some(arg) = args.next() {
-            match arg.to_str() {
-                Some("-ss") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-ss {}", value);
-                    assert_eq!(value, params.seek_time.to_string().as_str());
-                }
-                Some("-protocol_whitelist") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-protocol_whitelist {}", value);
-                    assert_eq!(value, "file,http,https,tcp,tls");
-                }
-                Some("-i") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-i {}", value);
-                    assert_eq!(value, params.url.as_str());
-                }
-                Some("-acodec") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-acodec {}", value);
-                    assert_eq!(value, params.audio_codec.get_ffmpeg_codec_str());
-                }
-                Some("-ab") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-ab {}", value);
-                }
-                Some("-f") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-f {}", value);
-                    assert_eq!(value, "mp3");
-                }
-                Some("-bufsize") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-bufsize {}", value);
-                }
-                Some("-maxrate") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-maxrate {}", value);
-                }
-                Some("-") => {
-                    info!("-");
-                }
-                Some("-timeout") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-timeout {}", value);
-                    assert_eq!(value, "600");
-                }
-                Some("-hide_banner") => {
-                    info!("-hide_banner");
-                }
-                Some("-loglevel") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-loglevel {}", value);
-                }
-                Some("-threads") => {
-                    let value = args.next().unwrap().to_str().unwrap();
-                    info!("-threads {}", value);
-                }
-                Some(x) => panic!("ffmpeg run with uknown option: {x}"),
-                None => panic!("ffmpeg run with no options"),
-            }
-        }
+    /// The request behind the resolution-seam pins: a YouTube media URL (as
+    /// production would carry), 2 s at 128 kbit, no seek, 300 s timeout.
+    fn resolution_test_request() -> TranscodeRequest {
+        TranscodeRequest::new(
+            Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap(),
+            2,
+            128,
+            None,
+            300,
+            AudioCodec::MP3,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -349,16 +213,8 @@ mod test {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let url = Url::parse(&format!("http://127.0.0.1:{port}/x.mp3")).unwrap();
-        let params = FfmpegParameters {
-            seek_time: 0.0,
-            url,
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 128,
-            max_rate_kbit: 3840,
-            expected_bytes_count: 100,
-            timeout_in_seconds: 300,
-        };
-        let transcoder = Transcoder::new(&params).await;
+        let request = TranscodeRequest::new(url, 2, 128, None, 300, AudioCodec::MP3).unwrap();
+        let transcoder = Transcoder::new(&request).await;
         assert!(
             transcoder.is_ok(),
             "expected preflight to pass for a listening local port, got {transcoder:?}"
@@ -395,23 +251,15 @@ mod test {
     }
 
     #[tokio::test]
-    async fn with_resolver_builds_command_from_resolved_stream_url() {
+    async fn with_request_builds_command_from_resolved_stream_url() {
         // The transcoder consumes the seam: ffmpeg's `-i` is the *resolved*
-        // stream URL the resolver handed over, not the media URL being
-        // transcoded.
+        // stream URL the resolver handed over, not the media URL the request
+        // carries.
         let resolved = Url::parse("https://resolved.example.com/audio.mp3").unwrap();
-        let params = FfmpegParameters {
-            seek_time: 0.0,
-            url: Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap(),
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 128,
-            max_rate_kbit: 3840,
-            expected_bytes_count: 100,
-            timeout_in_seconds: 300,
-        };
+        let request = resolution_test_request();
 
         let transcoder =
-            Transcoder::with_resolver(&params, &FixedResolver(FixedSource::Url(resolved.clone())))
+            Transcoder::with_request(&request, &FixedResolver(FixedSource::Url(resolved.clone())))
                 .await
                 .expect("resolution via the fake must succeed");
 
@@ -428,10 +276,10 @@ mod test {
     }
 
     #[tokio::test]
-    async fn with_resolver_builds_command_from_staged_file() {
+    async fn with_request_builds_command_from_staged_file() {
         // The staged half of the seam: when the check stage hands back a
         // Staged Source, ffmpeg's `-i` is the staged file itself — read via
-        // the command's whitelisted `file` protocol — not a network URL. No
+        // the argv's whitelisted `file` protocol — not a network URL. No
         // network: the staged artifact is a real local file and nothing is
         // fetched.
         let fixture_dir =
@@ -440,20 +288,14 @@ mod test {
         let staged = fixture_dir.join("staged-source.bin");
         std::fs::write(&staged, b"staged source bytes").unwrap();
 
-        let params = FfmpegParameters {
-            seek_time: 0.0,
-            url: Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap(),
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 128,
-            max_rate_kbit: 3840,
-            expected_bytes_count: 100,
-            timeout_in_seconds: 300,
-        };
+        let request = resolution_test_request();
 
-        let transcoder =
-            Transcoder::with_resolver(&params, &FixedResolver(FixedSource::Staged(staged.clone())))
-                .await
-                .expect("a staged source must build the transcoder");
+        let transcoder = Transcoder::with_request(
+            &request,
+            &FixedResolver(FixedSource::Staged(staged.clone())),
+        )
+        .await
+        .expect("a staged source must build the transcoder");
         std::fs::remove_dir_all(&fixture_dir).ok();
 
         let args: Vec<String> = transcoder
@@ -488,19 +330,13 @@ mod test {
             std::path::PathBuf::from(format!("vod2pod-test-orphan-{}.bin", uuid::Uuid::new_v4()));
         std::fs::write(&staged, b"staged source bytes").unwrap();
 
-        let params = FfmpegParameters {
-            seek_time: 0.0,
-            url: Url::parse("https://www.youtube.com/watch?v=UMO52N2vfk0").unwrap(),
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 128,
-            max_rate_kbit: 3840,
-            expected_bytes_count: 100,
-            timeout_in_seconds: 300,
-        };
-        let err =
-            Transcoder::with_resolver(&params, &FixedResolver(FixedSource::Staged(staged.clone())))
-                .await
-                .expect_err("a relative staged path must fail the construction");
+        let request = resolution_test_request();
+        let err = Transcoder::with_request(
+            &request,
+            &FixedResolver(FixedSource::Staged(staged.clone())),
+        )
+        .await
+        .expect_err("a relative staged path must fail the construction");
         assert!(
             err.to_string().contains("not absolute"),
             "the error names the unusable path: {err}"
@@ -555,21 +391,23 @@ mod test {
 
         let real_len = std::fs::metadata(&fixture).unwrap().len() as usize;
         let url = Url::from_file_path(&fixture).unwrap();
-        let expected_bytes_count = real_len * 15;
-        let params = FfmpegParameters {
-            seek_time: 0.0,
-            url,
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 32,
-            max_rate_kbit: 960,
-            expected_bytes_count,
-            timeout_in_seconds: 600,
-        };
-        let transcoder = Transcoder {
-            ffmpeg_command: Transcoder::get_ffmpeg_command(&params),
-            expected_bytes_count,
-            staged_source: None,
-        };
+        // The request declares 30 s at 32 kbit — the derivation works out to
+        // 30 × 32 × 1000 / 8 = 120000 expected bytes, well over 10× what the
+        // 2 s fixture actually delivers, so the shortfall is far past the
+        // tolerance and must surface as an error.
+        let request = TranscodeRequest::new(url.clone(), 30, 32, None, 600, AudioCodec::MP3)
+            .expect("a whole-stream request of a positive length must build");
+        let expected_bytes_count = request.window.expected_bytes;
+        assert!(
+            expected_bytes_count > real_len * 10,
+            "the fixture must end far short of the declared length: \
+             {real_len} actual vs {expected_bytes_count} declared"
+        );
+        let transcoder = futures::executor::block_on(async {
+            Transcoder::with_request(&request, &FixedResolver(FixedSource::Url(url)))
+                .await
+                .expect("a file-URL request must build the transcoder")
+        });
 
         use futures::StreamExt;
         let mut stream = transcoder.get_transcode_stream();
@@ -629,27 +467,21 @@ mod test {
             .expect("ffmpeg must be available to run this test");
         assert!(generated.success(), "failed to generate test fixture");
 
-        let real_len = std::fs::metadata(&fixture).unwrap().len() as usize;
         let url = Url::from_file_path(&fixture).unwrap();
-        // Re-encoding the same audio at the same bitrate lands within a few
-        // percent of the fixture size — well inside the 10% threshold either
-        // way (a slightly larger output takes the partial-request truncation
-        // branch, a slightly smaller one the padding branch; both complete).
-        let expected_bytes_count = real_len;
-        let params = FfmpegParameters {
-            seek_time: 0.0,
-            url,
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 32,
-            max_rate_kbit: 960,
-            expected_bytes_count,
-            timeout_in_seconds: 600,
-        };
-        let transcoder = Transcoder {
-            ffmpeg_command: Transcoder::get_ffmpeg_command(&params),
-            expected_bytes_count,
-            staged_source: None,
-        };
+        // The request derives its expected count from the same raw facts the
+        // enclosure `length` uses: 2 s at 32 kbit → 8000 bytes. Re-encoding
+        // the same audio lands within a few percent of that — well inside
+        // the 10% threshold either way (a slightly larger output takes the
+        // partial-request truncation branch, a slightly smaller one the
+        // padding branch; both complete).
+        let request = TranscodeRequest::new(url.clone(), 2, 32, None, 600, AudioCodec::MP3)
+            .expect("a whole-stream request of a positive length must build");
+        let expected_bytes_count = request.window.expected_bytes;
+        let transcoder = futures::executor::block_on(async {
+            Transcoder::with_request(&request, &FixedResolver(FixedSource::Url(url)))
+                .await
+                .expect("a file-URL request must build the transcoder")
+        });
 
         use futures::StreamExt;
         let mut stream = transcoder.get_transcode_stream();
@@ -685,8 +517,8 @@ mod test {
 
     use crate::transcoder::staging::{stage_gate_of, STAGED_FILE_PREFIX};
 
-    use crate::rss_transcodizer::streamable_bytes;
     use crate::test_support::{staging_test_limits, MediaFixture, OriginProvider};
+    use crate::transcoder::media_sizing::streamable_bytes;
     use crate::transcoder::staging::test_origin::{OriginScript, ScriptedOrigin};
     use crate::transcoder::staging::{StageLimits, StagingCheckStage};
 
@@ -697,23 +529,26 @@ mod test {
     }
 
     /// The size the enclosure would declare for `duration_secs` of audio at
-    /// the e2e bitrate — the same arithmetic the server serves with, so the
-    /// stdout pump's shortfall/truncation branches see a realistic contract.
+    /// the e2e bitrate — the same arithmetic the request derives its expected
+    /// count from, so the stdout pump's shortfall/truncation branches see a
+    /// realistic contract.
     fn e2e_expected_bytes(duration_secs: u64) -> usize {
         streamable_bytes(duration_secs, 32) as usize
     }
 
-    /// Params for the e2e transcodes: mp3 at 32k, no seek.
-    fn e2e_params(expected_bytes_count: usize) -> FfmpegParameters {
-        FfmpegParameters {
-            seek_time: 0.0,
-            url: e2e_media_url(),
-            audio_codec: AudioCodec::MP3,
-            bitrate_kbit: 32,
-            max_rate_kbit: 960,
-            expected_bytes_count,
-            timeout_in_seconds: 600,
-        }
+    /// The request for the e2e transcodes: `duration_secs` of audio at 32k,
+    /// mp3, no seek. The expected byte count is the request's own derivation
+    /// (issue #184) — the shared formula's answer for the same raw facts.
+    fn e2e_request(duration_secs: usize) -> TranscodeRequest {
+        TranscodeRequest::new(
+            e2e_media_url(),
+            duration_secs,
+            32,
+            None,
+            600,
+            AudioCodec::MP3,
+        )
+        .expect("a whole-stream request of a positive length must build")
     }
 
     /// The real staging check stage with tight test limits and an isolated
@@ -818,8 +653,8 @@ mod test {
         );
 
         let audio = collect_transcode(
-            Transcoder::with_resolver(
-                &e2e_params(e2e_expected_bytes(240)),
+            Transcoder::with_request(
+                &e2e_request(240),
                 &FixedResolver(FixedSource::Staged(staged_path.clone())),
             )
             .await
@@ -888,8 +723,8 @@ mod test {
         assert_eq!(origin.total_requests(), 2);
 
         let audio = collect_transcode(
-            Transcoder::with_resolver(
-                &e2e_params(e2e_expected_bytes(30)),
+            Transcoder::with_request(
+                &e2e_request(30),
                 &FixedResolver(FixedSource::Staged(staged_path.clone())),
             )
             .await
@@ -923,8 +758,8 @@ mod test {
         let expected = e2e_expected_bytes(30);
 
         // Legacy: the resolved Stream URL goes straight to ffmpeg.
-        let legacy = Transcoder::with_resolver(
-            &e2e_params(expected),
+        let legacy = Transcoder::with_request(
+            &e2e_request(30),
             &ProviderStreamUrlResolver::new(
                 Arc::new(OriginProvider(origin.url())),
                 Arc::new(stream_url::TcpPreflight::with_timeout(Duration::from_secs(
@@ -955,8 +790,8 @@ mod test {
         let staged_path = staged.path().to_path_buf();
         assert_eq!(std::fs::read(&staged_path).unwrap(), fixture.bytes);
         let staged_audio = collect_transcode(
-            Transcoder::with_resolver(
-                &e2e_params(expected),
+            Transcoder::with_request(
+                &e2e_request(30),
                 &FixedResolver(FixedSource::Staged(staged_path.clone())),
             )
             .await
@@ -993,8 +828,8 @@ mod test {
         let staged_path = staged.path().to_path_buf();
         assert!(staged_path.exists());
 
-        let transcoder = Transcoder::with_resolver(
-            &e2e_params(1000),
+        let transcoder = Transcoder::with_request(
+            &e2e_request(30),
             &FixedResolver(FixedSource::Staged(staged_path.clone())),
         )
         .await
@@ -1042,8 +877,8 @@ mod test {
         };
         let staged_path = staged.path().to_path_buf();
 
-        let transcoder = Transcoder::with_resolver(
-            &e2e_params(e2e_expected_bytes(30)),
+        let transcoder = Transcoder::with_request(
+            &e2e_request(30),
             &FixedResolver(FixedSource::Staged(staged_path.clone())),
         )
         .await
@@ -1129,16 +964,9 @@ mod test {
             let resolver = resolver.clone();
             let media = media.clone();
             transcodes.push(tokio::spawn(async move {
-                let params = FfmpegParameters {
-                    seek_time: 0.0,
-                    url: media,
-                    audio_codec: AudioCodec::MP3,
-                    bitrate_kbit: 32,
-                    max_rate_kbit: 960,
-                    expected_bytes_count: expected,
-                    timeout_in_seconds: 600,
-                };
-                let transcoder = Transcoder::with_resolver(&params, resolver.as_ref())
+                let request =
+                    TranscodeRequest::new(media, 30, 32, None, 600, AudioCodec::MP3).unwrap();
+                let transcoder = Transcoder::with_request(&request, resolver.as_ref())
                     .await
                     .expect("a staged transcode must build");
                 collect_transcode(transcoder.get_transcode_stream()).await

@@ -10,6 +10,10 @@ use rss::{Enclosure, Item};
 use crate::configs::{conf, AudioCodec, Conf, ConfName};
 use crate::episode_identity;
 use crate::provider::duration::parse_duration;
+// the enclosure `length` and the served Content-Length share the one
+// byte-count formula, owned by the transcoder's media-sizing module
+// (issue #184, ADR-0002)
+use crate::transcoder::media_sizing::streamable_bytes;
 
 pub fn inject_vod2pod_customizations(
     rss_body: String,
@@ -94,15 +98,6 @@ pub fn inject_vod2pod_customizations(
         })?;
 
     Ok(injected_feed.to_string())
-}
-
-/// Bytes the transcoder streams for `duration_secs` at `bitrate_kbps`
-/// (constant bitrate, kbits/s * 1000 / 8 = bytes/s). Single source of truth
-/// for the enclosure `length` attribute and the server's Content-Length /
-/// Content-Range arithmetic, so the advertised size always equals the served
-/// size.
-pub fn streamable_bytes(duration_secs: u64, bitrate_kbps: u64) -> u64 {
-    duration_secs * bitrate_kbps * 1000 / 8
 }
 
 fn get_description(item: &Item) -> String {

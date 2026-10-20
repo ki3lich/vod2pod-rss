@@ -91,6 +91,17 @@ disagree, one of them is wrong — fix it before moving on.
   included, and it applies preemptively while the Quota Breaker is open. A
   rung is skipped only when it cannot produce a result.
 
+## Transcode serving
+
+- **Transcode Request**: the raw facts a transcode route receives — the
+  media URL, duration, bitrate and byte range the client stated, plus the
+  deployment's ffmpeg timeout and target codec. Every derived fact — the
+  byte window, its seek offset, the expected byte count (the shared
+  byte-count formula, ADR 0002), the ffmpeg argv and the construction
+  deadline — is derived by the request itself (`TranscodeRequest` in
+  code, issue #184); the route only shapes HTTP around the derived value,
+  and no hand-off fact is computed by the caller.
+
 ## Source staging
 
 - **Source Stage**: the act of fetching an Episode's source media to a local

@@ -4,16 +4,18 @@ use actix_web::{
     dev::Server, guard, http, middleware, web, App, HttpRequest, HttpResponse, HttpServer,
 };
 use log::{debug, error, info, warn};
-use regex::Regex;
 use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    configs::{conf, conf_u64, Conf, ConfName, DEFAULT_FFMPEG_TIMEOUT_SECS},
+    configs::{conf, conf_u64, Conf, ConfName},
     feed_serving::{self, FeedServing, ServedFeed, ServingPolicy},
     provider::{self, MediaProvider},
     rss_transcodizer,
-    transcoder::{FfmpegParameters, Transcoder},
+    transcoder::{
+        request::{TranscodeRequest, TranscodeRequestError, TranscodeWindow},
+        Transcoder,
+    },
 };
 
 mod headers;
@@ -83,11 +85,11 @@ fn spawn_server_with(
 /// `None` there and the behavior is exactly what it was.
 async fn build_transcoder(
     req: &HttpRequest,
-    parameters: &FfmpegParameters,
+    request: &TranscodeRequest,
 ) -> eyre::Result<Transcoder> {
     match req.app_data::<Arc<dyn crate::transcoder::stream_url::StreamUrlResolver>>() {
-        Some(resolver) => Transcoder::with_resolver(parameters, resolver.as_ref()).await,
-        None => Transcoder::new(parameters).await,
+        Some(resolver) => Transcoder::with_request(request, resolver.as_ref()).await,
+        None => Transcoder::new(request).await,
     }
 }
 
@@ -340,123 +342,10 @@ struct TranscodizeQuery {
     duration: usize,
 }
 
-/// Parse a Range header into the requested byte window (inclusive on both
-/// ends), defaulting the end to the last advertised byte. Whether the window
-/// can be served at all is the decision core's call — the caller checks it
-/// before deriving any byte counts from the pair, so a reversed or
-/// past-the-end window never reaches arithmetic that would underflow on it
-/// (surfaced by the decision-core pins, issue #183).
-fn parse_range_header(
-    content_range_str: &str,
-    advertised_bytes: usize,
-) -> eyre::Result<(usize, usize)> {
-    let re = Regex::new(r"(?P<start>[0-9]{1,20})-?(?P<end>[0-9]{1,20})?")?;
-    let captures = if let Some(x) = re.captures_iter(content_range_str).next() {
-        x
-    } else {
-        return Err(eyre::eyre!("content range regex failed"));
-    };
-
-    let mut start = 0;
-    if let Some(x) = captures.name("start") {
-        start = x.as_str().parse()?;
-    }
-
-    if advertised_bytes == 0 {
-        error!("The requested Rage header with a length of 0 is invalid: {content_range_str}");
-        return Err(eyre::eyre!(
-            "The requested Rage header with a length of 0 is invalid: {content_range_str}"
-        ));
-    }
-    let mut end = advertised_bytes - 1;
-    if let Some(x) = captures.name("end") {
-        end = x.as_str().parse()?;
-    }
-
-    if end == start {
-        return Err(eyre::eyre!(
-            "The requested Rage header with a length of 0 is invalid: {content_range_str}"
-        ));
-    }
-
-    Ok((start, end))
-}
-
-/// The transcode route's decision core: from the raw request facts — the
-/// Range header (if any), the advertised byte count and the declared
-/// duration — decide the byte window to serve, the seek it maps to in the
-/// source, and the status. Pure, like `conditional_response` beside it: the
-/// route maps the decision onto HTTP and hands the window to the transcoder
-/// (issue #183).
-#[derive(Debug, PartialEq)]
-struct TranscodeWindow {
-    /// The advertised length both answers echo in Content-Range.
-    total_streamable_bytes: usize,
-    start_bytes: usize,
-    end_bytes: usize,
-    /// The count the transcode stream must deliver — the window's own
-    /// length; the stdout pump pads or truncates to exactly this.
-    expected_bytes: usize,
-    /// Where the window starts in the source, in seconds.
-    seek_secs: f32,
-    /// True when the window starts mid-stream: the answer is 206, not 200.
-    /// A seek within a tenth of a second of the start still counts as "from
-    /// the start" — podcatchers send `bytes=0-` with rounding noise.
-    partial: bool,
-}
-
-/// Why the route cannot serve the window: a malformed Range header maps to
-/// 400, a window past the advertised length to 416.
-#[derive(Debug, PartialEq)]
-enum TranscodeWindowError {
-    MalformedRange(String),
-    RangeNotSatisfiable,
-}
-
-fn decide_transcode_window(
-    range_header: Option<&http::header::HeaderValue>,
-    total_streamable_bytes: usize,
-    duration_secs: usize,
-) -> Result<TranscodeWindow, TranscodeWindowError> {
-    const DEFAULT_CONTENT_RANGE: &str = "0-";
-    let content_range_str = match range_header {
-        Some(x) => x.to_str().unwrap_or_default(),
-        None => DEFAULT_CONTENT_RANGE,
-    };
-
-    debug!("received content range {content_range_str}");
-
-    let (start_bytes, end_bytes) = parse_range_header(content_range_str, total_streamable_bytes)
-        .map_err(|e| TranscodeWindowError::MalformedRange(e.to_string()))?;
-
-    debug!("requested content-range: bytes {start_bytes}-{end_bytes}/{total_streamable_bytes}");
-
-    // Before any byte arithmetic: a window past the advertised length is
-    // not satisfiable. Checking here keeps the window count below free of
-    // the underflow a reversed or past-the-end start used to produce
-    // (surfaced by the decision-core pins, issue #183).
-    if start_bytes > end_bytes || start_bytes > total_streamable_bytes {
-        return Err(TranscodeWindowError::RangeNotSatisfiable);
-    }
-
-    let expected_bytes = end_bytes - start_bytes + 1;
-
-    let seek_secs =
-        ((start_bytes as f32) / (total_streamable_bytes as f32)) * (duration_secs as f32);
-    debug!("choosen seek_time: {seek_secs}");
-
-    Ok(TranscodeWindow {
-        total_streamable_bytes,
-        start_bytes,
-        end_bytes,
-        expected_bytes,
-        seek_secs,
-        partial: seek_secs > 0.1,
-    })
-}
-
 /// The window headers both answers carry — the HEAD probe and the streamed
-/// GET alike (issue #183).
+/// GET alike (issue #183). The window itself is the request module's derived
+/// [`TranscodeWindow`] (issue #184); this helper only shapes it into
+/// headers.
 fn insert_window_headers(
     mut builder: actix_web::HttpResponseBuilder,
     window: &TranscodeWindow,
@@ -476,13 +365,6 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
     let stream_url = &query.url;
     let bitrate = query.bitrate;
     let duration_secs = query.duration;
-    // same arithmetic the enclosure `length` attribute uses (see
-    // rss_transcodizer::streamable_bytes), so advertised size == served size
-    let total_streamable_bytes = usize::try_from(rss_transcodizer::streamable_bytes(
-        duration_secs as u64,
-        bitrate as u64,
-    ))
-    .unwrap_or(usize::MAX);
     info!("processing transcode at {bitrate}k for {stream_url}");
 
     if let Ok(value) = conf().get(ConfName::TranscodingEnabled) {
@@ -497,19 +379,11 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
         return forbidden;
     }
 
-    // The decisions, purely; what is left here is only shaping.
-    let window = match decide_transcode_window(
-        req.headers().get("Range"),
-        total_streamable_bytes,
-        duration_secs,
-    ) {
-        Ok(window) => window,
-        Err(TranscodeWindowError::MalformedRange(e)) => return HttpResponse::BadRequest().body(e),
-        Err(TranscodeWindowError::RangeNotSatisfiable) => {
-            return HttpResponse::RangeNotSatisfiable().finish()
-        }
-    };
-
+    // The deployment knobs the request is stated with: the ffmpeg timeout
+    // (the construction deadline derives from it) and the target codec (the
+    // answer's content type reads from it). Everything else — the window,
+    // the seek, the byte counts, the argv, the deadline — derives inside the
+    // request module (issue #184); what is left here is only shaping.
     let timeout_in_seconds = conf()
         .get(ConfName::FfmpegTimeoutSeconds)
         .unwrap()
@@ -518,47 +392,50 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
     debug!("choosen timeout in seconds: {timeout_in_seconds}");
 
     let codec = conf().get(ConfName::AudioCodec).unwrap().into();
-    let ffmpeg_paramenters = FfmpegParameters {
-        seek_time: window.seek_secs,
-        url: stream_url.clone(),
-        audio_codec: codec,
-        bitrate_kbit: bitrate,
-        max_rate_kbit: bitrate * 30,
-        expected_bytes_count: window.expected_bytes,
+    let request = match TranscodeRequest::new(
+        stream_url.clone(),
+        duration_secs,
+        bitrate,
+        req.headers().get("Range"),
         timeout_in_seconds,
+        codec,
+    ) {
+        Ok(request) => request,
+        Err(TranscodeRequestError::MalformedRange(e)) => return HttpResponse::BadRequest().body(e),
+        Err(TranscodeRequestError::RangeNotSatisfiable) => {
+            return HttpResponse::RangeNotSatisfiable().finish()
+        }
     };
     debug!("seconds: {duration_secs}, bitrate: {bitrate}");
 
     if req.method() == http::Method::HEAD {
-        // The HEAD probe derives its answer from the window alone — no
-        // resolution, no staging, no transcoder (issue #183).
-        return insert_window_headers(HttpResponse::Ok(), &window)
-            .content_type(codec.get_mime_type_str())
+        // The HEAD probe derives its answer from the request's window alone
+        // — no resolution, no staging, no transcoder (issue #183).
+        return insert_window_headers(HttpResponse::Ok(), &request.window)
+            .content_type(request.codec.get_mime_type_str())
             .finish();
     }
 
     match tokio::time::timeout(
-        Duration::from_secs(
-            timeout_in_seconds
-                .try_into()
-                .unwrap_or(DEFAULT_FFMPEG_TIMEOUT_SECS),
-        ),
-        build_transcoder(&req, &ffmpeg_paramenters),
+        // the construction deadline is the request's own derivation
+        // (issue #184)
+        request.construction_deadline(),
+        build_transcoder(&req, &request),
     )
     .await
     {
         Ok(Ok(transcoder)) => {
             let stream = transcoder.get_transcode_stream();
 
-            let response_builder = if window.partial {
+            let response_builder = if request.window.partial {
                 HttpResponse::PartialContent()
             } else {
                 HttpResponse::Ok()
             };
 
-            insert_window_headers(response_builder, &window)
-                .content_type(codec.get_mime_type_str())
-                .no_chunking((window.expected_bytes).try_into().unwrap())
+            insert_window_headers(response_builder, &request.window)
+                .content_type(request.codec.get_mime_type_str())
+                .no_chunking((request.window.expected_bytes).try_into().unwrap())
                 .streaming(stream)
         }
         Ok(Err(e)) => {
@@ -580,46 +457,9 @@ async fn transcode_to_mp3(req: HttpRequest, query: web::Query<TranscodizeQuery>)
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_get_start_and_end_start_to_end() {
-        let content_range_str = "bytes=0-99";
-        let advertised_bytes = 100;
-        let (start, end) = parse_range_header(content_range_str, advertised_bytes).unwrap();
-        assert_eq!((start, end), (0, 99));
-    }
-
-    #[test]
-    fn test_get_start_and_end_middle1_to_middle2() {
-        let content_range_str = "bytes=50-199";
-        let advertised_bytes = 200;
-        let (start, end) = parse_range_header(content_range_str, advertised_bytes).unwrap();
-        assert_eq!((start, end), (50, 199));
-    }
-
-    #[test]
-    fn test_get_start_and_end_middle_to_undefined() {
-        let content_range_str = "bytes=100-";
-        let advertised_bytes = 200;
-        let (start, end) = parse_range_header(content_range_str, advertised_bytes).unwrap();
-        assert_eq!((start, end), (100, 199));
-    }
-
-    #[test]
-    fn test_get_start_and_end_start_to_undefined() {
-        let content_range_str = "bytes=0-";
-        let advertised_bytes = 200;
-        let (start, end) = parse_range_header(content_range_str, advertised_bytes).unwrap();
-        assert_eq!((start, end), (0, 199));
-    }
-
-    #[test]
-    fn test_get_start_and_end_past_the_advertised_length_does_not_underflow() {
-        // The parse is window-shape only: a start past the advertised length
-        // is the 416 case, decided by the caller before any count is derived
-        // — it must not underflow the arithmetic on the way there.
-        let (start, end) = parse_range_header("bytes=9000-", 8000).unwrap();
-        assert_eq!((start, end), (9000, 7999));
-    }
+    // The range-parse and window-decision pins live in the transcoder's
+    // request module (issue #184), beside the core they pin. What lives here
+    // is the HTTP shaping and the route-level behavior suite (issue #183).
 
     #[test]
     fn test_conditional_response_declares_rss_content_type() {
@@ -784,10 +624,10 @@ mod tests {
     // the lock's contenders are other tests' threads, and nothing on the
     // test's own runtime ever locks it.
 
-    use crate::rss_transcodizer::streamable_bytes;
     use crate::test_support::{
         env_lock, staging_test_limits, EnvPin, MediaFixture, OriginProvider, TempDir,
     };
+    use crate::transcoder::media_sizing::streamable_bytes;
     use crate::transcoder::staging::test_origin::{OriginScript, ScriptedOrigin};
     use crate::transcoder::staging::{stage_gate_of, StageLimits, StagingCheckStage};
     use crate::transcoder::stream_url::{
@@ -1096,7 +936,8 @@ mod tests {
 
     /// The byte-count formula the route shares with the enclosure `length`
     /// attribute — pinned here so the route tests' literals above stay
-    /// honest about what they describe.
+    /// honest about what they describe. The formula's one owner is the
+    /// transcoder's media-sizing module (issue #184, ADR-0002).
     #[test]
     fn route_fixture_arithmetic_matches_the_shared_formula() {
         assert_eq!(
@@ -1105,99 +946,8 @@ mod tests {
         );
     }
 
-    // ---- the decision core's unit pins (issue #183) ----
-    //
-    // The route's decisions — window, seek, status — as a pure function,
-    // mirroring `conditional_response`. Each pin is a verdict a podcatcher
-    // would observe: which bytes, seeking where, 200 or 206 or an error.
-
-    fn range(value: &str) -> Option<&'static http::header::HeaderValue> {
-        // Leaked on purpose: the decision core borrows the header, and the
-        // pins have no owner to hold it.
-        Some(Box::leak(Box::new(
-            http::header::HeaderValue::from_str(value).unwrap(),
-        )))
-    }
-
-    #[test]
-    fn no_range_covers_the_whole_stream_from_the_start() {
-        let window = decide_transcode_window(None, ROUTE_TOTAL_BYTES, ROUTE_DURATION_SECS).unwrap();
-        assert_eq!(window.start_bytes, 0);
-        assert_eq!(window.end_bytes, ROUTE_TOTAL_BYTES - 1);
-        assert_eq!(window.expected_bytes, ROUTE_TOTAL_BYTES);
-        assert_eq!(window.seek_secs, 0.0);
-        assert!(!window.partial, "a whole-stream window is a 200");
-    }
-
-    #[test]
-    fn an_open_ended_mid_stream_window_seeks_and_serves_206() {
-        let window =
-            decide_transcode_window(range("bytes=4000-"), ROUTE_TOTAL_BYTES, ROUTE_DURATION_SECS)
-                .unwrap();
-        assert_eq!(window.start_bytes, 4000);
-        assert_eq!(window.end_bytes, ROUTE_TOTAL_BYTES - 1);
-        assert_eq!(window.expected_bytes, ROUTE_TOTAL_BYTES - 4000);
-        assert_eq!(
-            window.seek_secs, 1.0,
-            "4000 of 8000 bytes into a 2 s stream"
-        );
-        assert!(window.partial, "a mid-stream window is a 206");
-    }
-
-    #[test]
-    fn a_bounded_window_keeps_the_requested_end_and_serves_200_while_the_seek_is_tiny() {
-        // `bytes=50-199` of an 8000-byte stream: the seek is 50/8000 × 2 s =
-        // 0.0125 s — inside the "from the start" threshold, so 200.
-        let window = decide_transcode_window(
-            range("bytes=50-199"),
-            ROUTE_TOTAL_BYTES,
-            ROUTE_DURATION_SECS,
-        )
-        .unwrap();
-        assert_eq!(
-            (window.start_bytes, window.end_bytes, window.expected_bytes),
-            (50, 199, 150)
-        );
-        assert!(!window.partial);
-    }
-
-    #[test]
-    fn a_seek_of_exactly_a_tenth_of_a_second_is_still_from_the_start() {
-        // 400 of 8000 bytes into a 2 s stream is exactly the 0.1 s
-        // threshold — `<=` keeps it a 200. Podcatchers send `bytes=0-` with
-        // rounding noise; the threshold absorbs it.
-        let window =
-            decide_transcode_window(range("bytes=400-"), ROUTE_TOTAL_BYTES, ROUTE_DURATION_SECS)
-                .unwrap();
-        assert_eq!(window.seek_secs, 0.1);
-        assert!(!window.partial);
-    }
-
-    #[test]
-    fn a_window_past_the_advertised_length_is_not_satisfiable() {
-        assert_eq!(
-            decide_transcode_window(range("bytes=9000-"), ROUTE_TOTAL_BYTES, ROUTE_DURATION_SECS),
-            Err(TranscodeWindowError::RangeNotSatisfiable)
-        );
-    }
-
-    #[test]
-    fn a_malformed_range_is_a_bad_request() {
-        assert!(matches!(
-            decide_transcode_window(range("bytes=abc"), ROUTE_TOTAL_BYTES, ROUTE_DURATION_SECS),
-            Err(TranscodeWindowError::MalformedRange(_))
-        ));
-    }
-
-    #[test]
-    fn a_zero_advertised_length_cannot_serve_any_window() {
-        // duration 0 advertises 0 bytes — the enclosure arithmetic rejects
-        // the zero-length window before any byte math can divide by it.
-        assert!(matches!(
-            decide_transcode_window(range("bytes=0-"), 0, 0),
-            Err(TranscodeWindowError::MalformedRange(_))
-        ));
-    }
+    // The decision core's unit pins (issue #183) live in the transcoder's
+    // request module (issue #184), beside the core they pin.
 
     // ---- the source-authorization guard's pins (issue #183) ----
     // One guard, both routes: a URL is served only when the provider it
