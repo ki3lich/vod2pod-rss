@@ -1,6 +1,13 @@
 //! Test-only helpers shared across the modules' test suites.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use async_trait::async_trait;
+use regex::Regex;
+use url::Url;
+
+use crate::provider::{GeneratedFeed, MediaProvider};
 
 /// A unique temp directory, removed when the guard drops — the sandbox a
 /// test's staged files live in, isolated from parallel tests.
@@ -34,37 +41,92 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Pin `REDIS_ADDRESS`/`REDIS_PORT` to a dead port for one test, restoring
-/// the ambient values on drop — even when the test panics mid-await. The
-/// integration binaries keep their own copy of this shape: `pub(crate)` is
+/// Pin one environment variable to a value for one test, restoring the
+/// ambient value on drop — even when the test panics mid-await. Hold the
+/// env lock for the pin's whole life: env is process-global while cargo
+/// runs a binary's tests in parallel threads. The integration binaries
+/// under tests/ keep their own copies of this shape — `pub(crate)` is
 /// invisible across the tests/ crate boundary.
-pub(crate) struct DeadRedisEnvPin {
-    prev: (Option<String>, Option<String>),
+pub(crate) struct EnvPin {
+    name: &'static str,
+    prev: Option<String>,
 }
 
-impl DeadRedisEnvPin {
-    pub(crate) fn new() -> Self {
-        let prev = (
-            std::env::var("REDIS_ADDRESS").ok(),
-            std::env::var("REDIS_PORT").ok(),
-        );
-        std::env::set_var("REDIS_ADDRESS", "127.0.0.1");
-        // Port 1 hosts no Redis in any environment.
-        std::env::set_var("REDIS_PORT", "1");
-        Self { prev }
+impl EnvPin {
+    pub(crate) fn set(name: &'static str, value: &str) -> Self {
+        let prev = std::env::var(name).ok();
+        std::env::set_var(name, value);
+        Self { name, prev }
     }
 }
 
-impl Drop for DeadRedisEnvPin {
+impl Drop for EnvPin {
     fn drop(&mut self) {
-        match self.prev.0.take() {
-            Some(v) => std::env::set_var("REDIS_ADDRESS", v),
-            None => std::env::remove_var("REDIS_ADDRESS"),
+        match self.prev.take() {
+            Some(v) => std::env::set_var(self.name, v),
+            None => std::env::remove_var(self.name),
         }
-        match self.prev.1.take() {
-            Some(v) => std::env::set_var("REDIS_PORT", v),
-            None => std::env::remove_var("REDIS_PORT"),
-        }
+    }
+}
+
+/// Provider fake whose Stream URL is the media bytes themselves — a
+/// YouTube-like direct-media source resolved to a scripted origin. No
+/// yt-dlp, no Redis. Its whitelist is never consulted — the transcoder
+/// consumes only resolution, and the transcode route's guard dispatches the
+/// provider from the media URL, not the resolver's — so it is empty.
+pub(crate) struct OriginProvider(pub(crate) Url);
+
+#[async_trait]
+impl MediaProvider for OriginProvider {
+    async fn generate_rss_feed(&self, _channel_url: Url) -> eyre::Result<GeneratedFeed> {
+        panic!("staged e2e never converts feeds")
+    }
+
+    async fn get_stream_url(&self, _media_url: &Url) -> eyre::Result<Url> {
+        Ok(self.0.clone())
+    }
+
+    fn streams_direct_media(&self) -> bool {
+        true
+    }
+
+    fn domain_whitelist_regexes(&self) -> Vec<Regex> {
+        Vec::new()
+    }
+}
+
+/// A small real mp3 fixture generated with ffmpeg's lavfi tone generator —
+/// the source a scripted origin serves and transcodes re-encode. The fixture
+/// dir is removed when the test ends.
+pub(crate) struct MediaFixture {
+    _dir: TempDir,
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl MediaFixture {
+    pub(crate) fn new(tag: &str, duration_secs: u32) -> Self {
+        let dir = TempDir::new(&format!("e2e-{tag}"));
+        let fixture = dir.path().join("source.mp3");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={duration_secs}"),
+                "-acodec",
+                "libmp3lame",
+                "-ab",
+                "64k",
+                fixture.to_str().unwrap(),
+            ])
+            .status()
+            .expect("ffmpeg must be available to run this test");
+        assert!(generated.success(), "failed to generate test fixture");
+        let bytes = std::fs::read(&fixture).unwrap();
+        Self { _dir: dir, bytes }
     }
 }
 

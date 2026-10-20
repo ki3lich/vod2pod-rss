@@ -1,7 +1,10 @@
 // pub(crate): the crate-root test_support shares the staging test knobs.
 pub(crate) mod staging;
 mod stdout_pump;
-mod stream_url;
+// pub(crate): the server's route tests drive the real transcode route with
+// fakes installed behind this seam (issue #183) — the resolver types must be
+// nameable across the crate, not just inside this module.
+pub(crate) mod stream_url;
 
 pub use self::staging::{
     assert_ffmpeg_dominates_staging, init_stage_gate, sweep_stale_staged_sources,
@@ -94,8 +97,9 @@ impl Transcoder {
 
     /// Builds the transcoder from the stream URL resolved behind the
     /// [`StreamUrlResolver`] seam — the injection point tests use to drive
-    /// resolution with fakes.
-    async fn with_resolver(
+    /// resolution with fakes, including the server's route-level tests
+    /// (issue #183).
+    pub(crate) async fn with_resolver(
         ffmpeg_paramenters: &FfmpegParameters,
         resolver: &dyn StreamUrlResolver,
     ) -> eyre::Result<Self> {
@@ -681,9 +685,8 @@ mod test {
 
     use crate::transcoder::staging::{stage_gate_of, STAGED_FILE_PREFIX};
 
-    use crate::provider::{GeneratedFeed, MediaProvider};
     use crate::rss_transcodizer::streamable_bytes;
-    use crate::test_support::staging_test_limits;
+    use crate::test_support::{staging_test_limits, MediaFixture, OriginProvider};
     use crate::transcoder::staging::test_origin::{OriginScript, ScriptedOrigin};
     use crate::transcoder::staging::{StageLimits, StagingCheckStage};
 
@@ -710,65 +713,6 @@ mod test {
             max_rate_kbit: 960,
             expected_bytes_count,
             timeout_in_seconds: 600,
-        }
-    }
-
-    /// Provider fake whose Stream URL is the media bytes themselves — a
-    /// YouTube-like direct-media source resolved to the scripted origin.
-    /// No yt-dlp, no Redis.
-    struct OriginProvider(Url);
-
-    #[async_trait]
-    impl MediaProvider for OriginProvider {
-        async fn generate_rss_feed(&self, _channel_url: Url) -> eyre::Result<GeneratedFeed> {
-            panic!("staged end-to-end never converts feeds")
-        }
-
-        async fn get_stream_url(&self, _media_url: &Url) -> eyre::Result<Url> {
-            Ok(self.0.clone())
-        }
-
-        fn streams_direct_media(&self) -> bool {
-            true
-        }
-
-        fn domain_whitelist_regexes(&self) -> Vec<regex::Regex> {
-            Vec::new()
-        }
-    }
-
-    /// A small real mp3 fixture generated with ffmpeg's lavfi tone
-    /// generator — the source the scripted origin serves and the transcodes
-    /// re-encode. The fixture dir is removed when the test ends.
-    struct MediaFixture {
-        _dir: crate::test_support::TempDir,
-        bytes: Vec<u8>,
-    }
-
-    impl MediaFixture {
-        fn new(tag: &str, duration_secs: u32) -> Self {
-            let dir = crate::test_support::TempDir::new(&format!("e2e-{tag}"));
-            let fixture = dir.path().join("source.mp3");
-            let generated = Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &format!("sine=frequency=440:duration={duration_secs}"),
-                    "-acodec",
-                    "libmp3lame",
-                    "-ab",
-                    "64k",
-                    fixture.to_str().unwrap(),
-                ])
-                .status()
-                .expect("ffmpeg must be available to run this test");
-            assert!(generated.success(), "failed to generate test fixture");
-            let bytes = std::fs::read(&fixture).unwrap();
-            Self { _dir: dir, bytes }
         }
     }
 
