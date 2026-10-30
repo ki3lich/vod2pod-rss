@@ -1,0 +1,23 @@
+# .msb/sandbox.yaml — vod2pod-rss committed sandbox policy (msb-poc ticket 12;
+# first cutover). Composed by the ac launcher with its always-on base (repo rw
+# at /work/vod2pod-rss, agent home + skills + shared caches, client identity,
+# workdir, user agent + security restricted, idle_timeout 60m, network public)
+# and the gitignored .msb/sandbox.local.yaml. Full contract: ac --help.
+
+cpus: 2                         # rust-link grade (cargo test link headroom — F6)
+memory: "8G"                    # lazy cap; high-water returns to the host
+max_duration: "12h"             # work-session ceiling; rarely binds
+rlimits:                        # pilot-proven (poc session 3)
+  - { resource: nofile, soft: 8192, hard: 65535 }
+  - { resource: nproc, soft: 512, hard: 1024 }
+hostname: "vod2pod-rss"
+
+# ---- destination-bound secrets: the token never enters the guest ------------
+secrets:
+  GH_TOKEN: "github.com,api.github.com"   # gh talks to BOTH hosts (session 3)
+
+# ---- raw env forward: the F4 declared-risk escape hatch, with its reason ----
+env_forward:
+  YT_API_KEY:
+    host: YOUTUBE_API_KEY
+    reason: "vod2pod form-encodes the key into the query string (reqwest .param), percent-encoding msb's $-placeholder — the substitution match misses silently (upstream 400, F4/F4b); header/query substitution cannot serve this client, so the raw forward is the declared fallback (poc-finding G3 caveat: the value persists in msb.db-wal past msb rm)"

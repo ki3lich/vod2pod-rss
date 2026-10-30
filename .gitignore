@@ -14,3 +14,5 @@ devcontainerInstall.log
 .vscode/settings.json
 
 .mise.toml
+# msb local override (machine tweaks — never commit)
+.msb/sandbox.local.yaml
