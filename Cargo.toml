@@ -45,4 +45,4 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring"] }
 temp-env ={ version = "=0.3.6", features = ["async_closure"] }
 env_logger = "*"
 test-log = "0.2.11"
-ctor = "=1.0.13"
+ctor = "=1.0.14"
