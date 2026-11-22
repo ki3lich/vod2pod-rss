@@ -13,6 +13,29 @@
     ":semanticCommits",
     ":timezone(Europe/Warsaw)",
   ],
+  // cargo-chef tags aren't version-first, so Docker versioning skips them as
+  // invalid-value; this manager tracks the rust version inside the tag.
+  customManagers: [
+    {
+      customType: "regex",
+      fileMatch: ["(^|/)Dockerfile$"],
+      matchStrings: [
+        "lukemathwalker/cargo-chef:latest-rust-(?<currentValue>\\d+(?:\\.\\d+)*)-",
+      ],
+      depNameTemplate: "lukemathwalker/cargo-chef",
+      datasourceTemplate: "docker",
+      versioningTemplate: "semver-coerced",
+      extractVersionTemplate: "^latest-rust-(?<version>\\d+(?:\\.\\d+)*)-[a-z]+$",
+    },
+  ],
+  packageRules: [
+    {
+      description: "The dockerfile manager would rewrite this tag without its codename suffix",
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["lukemathwalker/cargo-chef"],
+      enabled: false,
+    },
+  ],
   dependencyDashboardTitle: "Renovate Dashboard 🤖",
   suppressNotifications: [
     "prEditedNotification",

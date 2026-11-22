@@ -5,7 +5,7 @@
 # (debian) base tags: the binary must be compiled against the same glibc as the
 # runtime image's, or it will not start ("GLIBC_x.y not found")
 ARG DEBIAN_CODENAME=bookworm
-FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-1.92-${DEBIAN_CODENAME} AS chef
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-1.100.0-${DEBIAN_CODENAME} AS chef
 WORKDIR /app
 
 # ----------

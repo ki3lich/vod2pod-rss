@@ -2,6 +2,9 @@
 authors = ["madiele92@gmail.com"]
 edition = "2021"
 name = "vod2pod-rss"
+# Keep <= the Dockerfile builder image's rustc; resolver 3 keeps fresh resolves compatible.
+rust-version = "1.95"
+resolver = "3"
 version = "1.2.18"
 
 [lib]
