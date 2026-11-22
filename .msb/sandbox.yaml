@@ -4,17 +4,26 @@
 # workdir, user agent + security restricted, idle_timeout 60m, network public)
 # and the gitignored .msb/sandbox.local.yaml. Full contract: ac --help.
 
-cpus: 2                         # rust-link grade (cargo test link headroom — F6)
-memory: "8G"                    # lazy cap; high-water returns to the host
-max_duration: "12h"             # work-session ceiling; rarely binds
-rlimits:                        # pilot-proven (poc session 3)
+cpus: 2 # rust-link grade (cargo test link headroom — F6)
+memory: "8G" # lazy cap; high-water returns to the host
+max_duration: "12h" # work-session ceiling; rarely binds
+rlimits: # pilot-proven (poc session 3)
   - { resource: nofile, soft: 8192, hard: 65535 }
   - { resource: nproc, soft: 512, hard: 1024 }
 hostname: "vod2pod-rss"
 
+network:
+  policy: public
+  tls:
+    bypass:
+      - "youtube.com"
+      - "*.youtube.com"
+      - "*.googleapis.com"
+      - "*.googlevideo.com"
+
 # ---- destination-bound secrets: the token never enters the guest ------------
 secrets:
-  GH_TOKEN: "github.com,api.github.com"   # gh talks to BOTH hosts (session 3)
+  GH_TOKEN: "github.com,api.github.com" # gh talks to BOTH hosts (session 3)
 
 # ---- raw env forward: the F4 declared-risk escape hatch, with its reason ----
 env_forward:
