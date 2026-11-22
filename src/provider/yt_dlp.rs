@@ -43,8 +43,8 @@ impl std::error::Error for YtDlpError {
 /// Runs `yt-dlp` with `args` and returns its raw output.
 ///
 /// The child is killed if the future is dropped; a hung invocation fails
-/// with [`YtDlpError::Timeout`]. The exit status is not inspected: callers
-/// parse `stdout` and decide for themselves, as they always have.
+/// with [`YtDlpError::Timeout`]. The exit status is not inspected here:
+/// callers parse `stdout` and read the status alongside it.
 pub(super) async fn run(args: &[&str]) -> Result<std::process::Output, YtDlpError> {
     let mut command = Command::new("yt-dlp");
     command.kill_on_drop(true).args(args);
@@ -56,26 +56,54 @@ pub(super) async fn run(args: &[&str]) -> Result<std::process::Output, YtDlpErro
     }
 }
 
+/// The format selector every resolved stream URL is asked for.
+///
+/// `bestaudio` alone fails the whole transcode when a client advertises no
+/// URL-bearing audio-only format: YouTube's SABR-only streaming experiment
+/// (yt-dlp issue 12482) leaves the muxed formats valid while their separate
+/// audio tracks have no URL, and yt-dlp then answers "Requested format is
+/// not available" for anything audio-only (seen 2026-11-22, video
+/// GCGp6oa4fj8). The `/best` fallback picks the best combined format, so a
+/// muxed source still transcodes — and `best` is a single format, never a
+/// merge, so the answer stays one URL.
+const FORMAT_SELECTOR: &str = "bestaudio/best";
+
 /// Resolves the audio stream URL for `url` via
-/// `yt-dlp -f bestaudio --get-url`, plus provider-specific `extra_args`.
+/// `yt-dlp -f <FORMAT_SELECTOR> --get-url`, plus provider-specific `extra_args`.
 pub(super) async fn stream_url(url: &Url, extra_args: &[String]) -> eyre::Result<Url> {
     debug!("getting stream_url via yt-dlp for video: {}", url);
 
-    let mut args: Vec<&str> = vec!["-f", "bestaudio", "--get-url", url.as_str()];
+    let mut args: Vec<&str> = vec!["-f", FORMAT_SELECTOR, "--get-url", url.as_str()];
     args.extend(extra_args.iter().map(String::as_str));
 
     let output = run(&args).await.map_err(eyre::Error::new)?;
-    let raw_url = std::str::from_utf8(&output.stdout).unwrap_or_default();
+    parse_stream_url(&output.stdout, &output.stderr, output.status)
+}
+
+/// Reads the stream URL out of one yt-dlp invocation's output, or reports
+/// what yt-dlp said instead.
+///
+/// A failing yt-dlp exits non-zero with empty stdout and puts its diagnosis
+/// on stderr, so the error carrying that stderr is the only readable account
+/// of the failure the operator and the podcatcher's 503 body get.
+fn parse_stream_url(
+    stdout: &[u8],
+    stderr: &[u8],
+    status: std::process::ExitStatus,
+) -> eyre::Result<Url> {
+    let raw_url = std::str::from_utf8(stdout).unwrap_or_default();
+    let stderr = std::str::from_utf8(stderr).unwrap_or_default().trim();
+
     match Url::from_str(raw_url) {
         Ok(url) => Ok(url),
         Err(e) => {
             warn!(
                 "error while parsing stream url using yt-dlp:\nerror: {}\nyt-dlp stdout: {}\nyt-dlp stderr: {}",
-                e,
-                raw_url,
-                std::str::from_utf8(&output.stderr).unwrap_or_default()
+                e, raw_url, stderr
             );
-            Err(eyre::eyre!(e))
+            Err(eyre::eyre!(
+                "yt-dlp gave no stream url ({status}): {e}\nyt-dlp stderr: {stderr}"
+            ))
         }
     }
 }
@@ -83,6 +111,53 @@ pub(super) async fn stream_url(url: &Url, extra_args: &[String]) -> eyre::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 503 body's account of a failed resolution is yt-dlp's, not the
+    /// url parser's complaint about an empty stdout.
+    #[cfg(unix)]
+    #[test]
+    fn failed_invocation_error_carries_yt_dlp_stderr() {
+        let stderr = b"WARNING: [youtube] GCGp6oa4fj8: Some android client https formats have been skipped as they are missing a URL.\nERROR: [youtube] GCGp6oa4fj8: Requested format is not available. Use --list-formats for a list of available formats\n";
+
+        let error = parse_stream_url(b"", stderr, exit_status(1))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Requested format is not available"),
+            "the error must carry yt-dlp's own diagnosis, got: {error}"
+        );
+        assert!(
+            error.contains("exit status: 1"),
+            "the error must name how yt-dlp ended, got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn printed_url_is_the_resolved_stream_url() {
+        let stdout = b"https://rr2---sn-x0gvoxu2a-f5fl.googlevideo.com/videoplayback?itag=251\n";
+
+        let url = parse_stream_url(stdout, b"", exit_status(0)).unwrap();
+
+        assert_eq!(
+            url.host_str(),
+            Some("rr2---sn-x0gvoxu2a-f5fl.googlevideo.com")
+        );
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// The fallback is load-bearing: `bestaudio` alone leaves a SABR-only
+    /// video unservable, so the selector only changes deliberately.
+    #[test]
+    fn format_selector_keeps_the_muxed_fallback() {
+        assert_eq!(FORMAT_SELECTOR, "bestaudio/best");
+    }
 
     /// The timeout message is part of the observable behavior of every
     /// former inline wrapper: a changed budget must change this string

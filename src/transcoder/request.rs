@@ -110,6 +110,10 @@ impl TranscodeRequest {
                 "-i",
                 input_url.as_str(),
             ])
+            // the source may be muxed (yt-dlp's combined-format fallback):
+            // without this ffmpeg maps the video stream too and the webm
+            // codecs fail trying to encode it
+            .arg("-vn")
             .args(["-acodec", self.codec.get_ffmpeg_codec_str()])
             .args(["-threads", "0"])
             .args(["-ab", format!("{}k", self.bitrate_kbit).as_str()])
@@ -454,9 +458,11 @@ mod tests {
             assert_eq!(x, "ffmpeg");
         }
         let mut args = command.get_args();
+        let mut audio_only = false;
 
         while let Some(arg) = args.next() {
             match arg.to_str() {
+                Some("-vn") => audio_only = true,
                 Some("-ss") => {
                     let value = args.next().unwrap().to_str().unwrap();
                     info!("-ss {}", value);
@@ -517,5 +523,6 @@ mod tests {
                 None => panic!("ffmpeg run with no options"),
             }
         }
+        assert!(audio_only, "ffmpeg must be told to drop any video stream");
     }
 }
