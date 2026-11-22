@@ -15,3 +15,4 @@ devcontainerInstall.log
 
 # msb local override (machine tweaks — never commit)
 .msb/sandbox.local.yaml
+.msb/env-refs
