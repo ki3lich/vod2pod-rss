@@ -2,4 +2,4 @@
 yt-dlp = "latest"
 # `make test` needs these.
 ffmpeg = "9.0.2"
-redis = "8.10.3"
+redis = "8.12.0"
