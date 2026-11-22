@@ -22,9 +22,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ secrets.YT_API_KEY }}" != '' ]; then
-            echo "defined=true" >> $GITHUB_OUTPUT;
+            echo "defined=true" >> "$GITHUB_OUTPUT";
           else
-            echo "defined=false" >> $GITHUB_OUTPUT;
+            echo "defined=false" >> "$GITHUB_OUTPUT";
           fi
 
   build:
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose --locked
       - name: update apt
         run: sudo apt-get update
       - name: Install ffmpeg and redis
@@ -45,8 +45,8 @@ jobs:
       - name: Start Redis server
         run: redis-server --daemonize yes
       - name: Run tests with secrets
-        run: cargo test --verbose
+        run: cargo test --verbose --locked
         if: needs.check-secret.outputs.has_secrets == 'true'
       - name: Run tests without secrets
-        run: cargo test --verbose -- --skip requires_api_key
+        run: cargo test --verbose --locked -- --skip requires_api_key
         if: needs.check-secret.outputs.has_secrets == 'false'
