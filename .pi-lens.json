@@ -1,0 +1,6 @@
+{
+  "rules": {
+    "json:519": { "ignorePaths": ["*.json5"] },
+    "json:528": { "ignorePaths": ["*.json5"] }
+  }
+}
