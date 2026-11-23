@@ -69,6 +69,70 @@ impl Drop for EnvPin {
     }
 }
 
+/// A stub `yt-dlp` installed on `PATH` that records the argv it was handed
+/// and answers with a fixed stdout, stderr and exit code — the spawn seam,
+/// where the wrapper's argv and its account of a failure are observable
+/// without YouTube. Hold [`env_lock`] for the stub's whole life: it mutates
+/// `PATH`.
+#[cfg(unix)]
+pub(crate) struct StubYtDlp {
+    _dir: TempDir,
+    args_file: PathBuf,
+    _path: EnvPin,
+}
+
+#[cfg(unix)]
+impl StubYtDlp {
+    /// Install a stub that prints `stdout`, prints `stderr` on stderr and
+    /// exits with `exit_code`.
+    pub(crate) fn install(tag: &str, stdout: &str, stderr: &str, exit_code: i32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new(&format!("yt-dlp-stub-{tag}"));
+        let args_file = dir.path().join("argv");
+        let stdout_file = dir.path().join("stdout");
+        let stderr_file = dir.path().join("stderr");
+        std::fs::write(&stdout_file, stdout).unwrap();
+        std::fs::write(&stderr_file, stderr).unwrap();
+
+        // every interpolated path is a generated UUID name, so single-quoting
+        // it in the script is safe
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\ncat '{}' >&2\nexit {}\n",
+            args_file.display(),
+            stdout_file.display(),
+            stderr_file.display(),
+            exit_code
+        );
+        let program = dir.path().join("yt-dlp");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let path = EnvPin::set("PATH", &path);
+
+        Self {
+            _dir: dir,
+            args_file,
+            _path: path,
+        }
+    }
+
+    /// The argv the stub was invoked with. A missing record means the stub
+    /// never ran, so it panics rather than passing off an empty invocation.
+    pub(crate) fn recorded_args(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.args_file)
+            .expect("the stub must record the argv it was handed")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
 /// Provider fake whose Stream URL is the media bytes themselves — a
 /// YouTube-like direct-media source resolved to a scripted origin. No
 /// yt-dlp, no Redis. Its whitelist is never consulted — the transcoder
