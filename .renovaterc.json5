@@ -35,6 +35,11 @@
       matchPackageNames: ["lukemathwalker/cargo-chef"],
       enabled: false,
     },
+    {
+      description: "feed-rs 3.0.0 rejects the atom feeds we serve; the upstream fix (feed-rs#302) is unreleased, so 3.0.0 is skipped until a later 3.x carries it",
+      matchPackageNames: ["feed-rs"],
+      allowedVersions: ">=2.4.0 <3.0.0 || >=3.0.1",
+    },
   ],
   dependencyDashboardTitle: "Renovate Dashboard 🤖",
   suppressNotifications: [
