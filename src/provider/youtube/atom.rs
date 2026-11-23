@@ -30,7 +30,7 @@ use super::identity::find_yt_channel_url_with_c_id;
 /// durations resolved through yt-dlp. Used both when no API key is configured
 /// and as the quota-free rung of the Degradation Ladder.
 pub(super) async fn generate_rss_feed_via_atom(channel_url: Url) -> eyre::Result<String> {
-    let feed = match channel_url.path() {
+    let feed_url = match channel_url.path() {
         path if path.starts_with("/playlist") => feed_url_for_yt_playlist(&channel_url).await,
         path if path.starts_with("/feeds/") => feed_url_for_yt_atom(&channel_url).await,
         path if path.starts_with("/channel/") => feed_url_for_yt_channel(&channel_url).await,
@@ -39,7 +39,7 @@ pub(super) async fn generate_rss_feed_via_atom(channel_url: Url) -> eyre::Result
         path if path.starts_with("/@") => feed_url_for_yt_channel(&channel_url).await,
         _ => Err(eyre!("unsupported youtube url")),
     }?;
-    let response = reqwest::get(feed).await?;
+    let response = reqwest::get(feed_url.clone()).await?;
     if !response.status().is_success() {
         return Err(eyre!(
             "YouTube feed returned error: {} {}",
@@ -49,7 +49,7 @@ pub(super) async fn generate_rss_feed_via_atom(channel_url: Url) -> eyre::Result
     }
     let raw_atom_feed = response.text().await?;
     let feed = feed_rs::parser::parse(&raw_atom_feed.into_bytes()[..])
-        .map_err(|e| eyre!("Failed to parse YouTube feed: {}", e))?;
+        .map_err(|e| eyre!("Failed to parse YouTube feed {feed_url}: {e}"))?;
     let mut duration_map: HashMap<String, Option<usize>> = HashMap::default();
     let urls: Vec<String> = feed
         .entries
