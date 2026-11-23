@@ -58,6 +58,7 @@ pub enum ConfName {
     FfmpegTimeoutSeconds,
     PreflightTimeoutSeconds,
     StageSources,
+    SquareEpisodeArtwork,
     StageChunkSizeBytes,
     StageChunkConcurrency,
     StageConcurrency,
@@ -171,15 +172,15 @@ impl Conf for EnvConf {
             ConfName::StageSources => {
                 // Source staging kill switch (issues #166–#170): staged
                 // fetching is the production path, so this defaults to on.
-                // Parsed opt-out by the consumer: only the exact rollback
-                // spellings ("false", "0", "off", "no" — case insensitive,
-                // trimmed) return every request to the legacy path — the
-                // resolved Stream URL straight to ffmpeg with the TCP
-                // preflight. A typo of one of them keeps staging on: the
-                // rollback value a struggling operator types is the one
-                // that must work, and exact matching is what keeps a typo
-                // from silently flipping the meaning.
+                // The consumer reads it with `enabled_from` below.
                 Ok(std::env::var("STAGE_SOURCES").unwrap_or_else(|_| "True".to_string()))
+            }
+            ConfName::SquareEpisodeArtwork => {
+                // Square Episode Artwork kill switch: on by default, because
+                // a square image is the only shape Apple Podcasts can show
+                // without cropping the video still (docs/adr/0004). Turning
+                // it off serves the upstream thumbnail URL untouched.
+                Ok(std::env::var("SQUARE_EPISODE_ARTWORK").unwrap_or_else(|_| "True".to_string()))
             }
             ConfName::StageChunkSizeBytes => {
                 // Size of one ranged GET of a Source Stage. The measured
@@ -280,6 +281,20 @@ impl AudioCodec {
     }
 }
 
+/// The one reading of a kill switch's raw value, shared by [`ConfName::StageSources`]
+/// and [`ConfName::SquareEpisodeArtwork`]. Only the exact rollback spellings —
+/// "false", "0", "off", "no", case-insensitive and trimmed — switch a
+/// production path off; anything else, above all a typo of one of them, keeps
+/// it on. The rollback value a struggling operator types is the one that must
+/// work, and exact matching is what keeps a typo from silently flipping the
+/// meaning.
+pub fn enabled_from(raw: &str) -> bool {
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "off" | "no"
+    )
+}
+
 impl From<String> for AudioCodec {
     fn from(value: String) -> Self {
         match value.as_str() {
@@ -287,6 +302,21 @@ impl From<String> for AudioCodec {
             "OPUS" => AudioCodec::Opus,
             "OGG_VORBIS" => AudioCodec::OGGVorbis,
             _ => AudioCodec::MP3,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enabled_from;
+
+    #[test]
+    fn test_only_exact_rollback_spellings_switch_a_path_off() {
+        for raw in ["false", "FALSE", "0", "off", " No "] {
+            assert!(!enabled_from(raw), "{raw:?} must read as a rollback");
+        }
+        for raw in ["true", "True", "1", "on", "yes", "", "flase", "of"] {
+            assert!(enabled_from(raw), "{raw:?} must keep the path on");
         }
     }
 }

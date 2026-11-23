@@ -315,16 +315,12 @@ fn staging_enabled_from_conf() -> bool {
     staging_enabled_from(&conf().get(ConfName::StageSources).unwrap_or_default())
 }
 
-/// The kill-switch verdict for one raw `STAGE_SOURCES` value. Only the
-/// exact rollback spellings — "false", "0", "off", "no", case-insensitive
-/// and trimmed — disable staging; anything else, above all a typo of one
-/// of them, keeps staging on. Staging is the production path, so the safe
-/// reading of an unrecognized value is "not a rollback".
+/// The kill-switch verdict for one raw `STAGE_SOURCES` value, read by the one
+/// shared rule every kill switch uses (`configs::enabled_from`, pinned there).
+/// Staging is the production path, so the safe reading of an unrecognized
+/// value is "not a rollback".
 fn staging_enabled_from(raw: &str) -> bool {
-    !matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "false" | "0" | "off" | "no"
-    )
+    crate::configs::enabled_from(raw)
 }
 
 #[async_trait]

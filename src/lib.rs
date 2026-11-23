@@ -1,5 +1,6 @@
 use configs::{conf, Conf, ConfName};
 
+pub mod artwork;
 pub mod configs;
 pub mod episode_identity;
 pub mod feed_serving;

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
+    artwork,
     configs::{conf, conf_u64, Conf, ConfName},
     feed_serving::{self, FeedServing, ServedFeed, ServingPolicy},
     provider::{self, MediaProvider},
@@ -21,7 +22,7 @@ use crate::{
 mod headers;
 
 pub fn spawn_server(listener: TcpListener) -> eyre::Result<Server> {
-    spawn_server_with(listener, None)
+    spawn_server_with(listener, None, None)
 }
 
 /// Test wiring for the route-level transcode tests (issue #183): the real
@@ -34,12 +35,26 @@ pub(crate) fn spawn_server_with_resolver(
     listener: TcpListener,
     resolver: Arc<dyn crate::transcoder::stream_url::StreamUrlResolver>,
 ) -> eyre::Result<Server> {
-    spawn_server_with(listener, Some(resolver))
+    spawn_server_with(listener, Some(resolver), None)
+}
+
+/// Test wiring for the artwork route: the real server with one
+/// [`artwork::ThumbnailFetcher`] installed behind it, so the route's
+/// composition and fallback run against a scripted upstream instead of
+/// YouTube. Production installs none: the route then fetches the real
+/// thumbnail host.
+#[cfg(test)]
+pub(crate) fn spawn_server_with_thumbnail_fetcher(
+    listener: TcpListener,
+    fetcher: Arc<dyn artwork::ThumbnailFetcher>,
+) -> eyre::Result<Server> {
+    spawn_server_with(listener, None, Some(fetcher))
 }
 
 fn spawn_server_with(
     listener: TcpListener,
     transcode_resolver: Option<Arc<dyn crate::transcoder::stream_url::StreamUrlResolver>>,
+    thumbnail_fetcher: Option<Arc<dyn artwork::ThumbnailFetcher>>,
 ) -> eyre::Result<Server> {
     let root = conf().get(ConfName::SubfolderPath).unwrap();
     Ok(HttpServer::new(move || {
@@ -63,14 +78,27 @@ fn spawn_server_with(
                             .guard(guard::Any(guard::Get()).or(guard::Head()))
                             .to(transcode_to_mp3),
                     )
+                    .service(
+                        // Square Episode Artwork (docs/adr/0004): the square
+                        // composed for one video id. GET and HEAD, like the
+                        // transcode route — players may probe with HEAD.
+                        web::resource("artwork")
+                            .name("episode_art")
+                            .guard(guard::Any(guard::Get()).or(guard::Head()))
+                            .to(episode_art),
+                    )
                     .route("transcodize_rss", web::get().to(transcodize_rss))
                     .route("transcodize_rss", web::head().to(transcodize_rss))
                     .route("health", web::get().to(health))
                     .route("/", web::get().to(index))
                     .route("", web::get().to(index)),
             );
-        match transcode_resolver.clone() {
+        let app = match transcode_resolver.clone() {
             Some(resolver) => app.app_data(resolver),
+            None => app,
+        };
+        match thumbnail_fetcher.clone() {
+            Some(fetcher) => app.app_data(fetcher),
             None => app,
         }
     })
@@ -176,6 +204,7 @@ async fn transcodize_rss(
     };
 
     let transcode_service_url = req.url_for("transcode_mp3", [""]).unwrap();
+    let artwork_service_url = artwork_service_url(&req);
 
     let parsed_url = match Url::parse(url) {
         Ok(x) => x,
@@ -218,13 +247,37 @@ async fn transcodize_rss(
                 // the module logs the conversion itself
                 feed_serving::Freshness::FreshlyGenerated => {}
             }
-            serve_feed(&req, served, should_transcode, &transcode_service_url)
+            serve_feed(
+                &req,
+                served,
+                should_transcode,
+                &transcode_service_url,
+                artwork_service_url.as_ref(),
+            )
         }
         // the ladder is exhausted: no cached copy, the conversion failed and
         // the quota-free rung could not produce anything either
         Err(e) => {
             debug!("degradation ladder exhausted for {parsed_url}: {e}");
             HttpResponse::Conflict().finish()
+        }
+    }
+}
+
+/// Where feed items point their artwork (docs/adr/0004). `None` means the
+/// `SQUARE_EPISODE_ARTWORK` kill switch is off: items then keep the upstream
+/// thumbnail URL exactly as they did before this route existed.
+fn artwork_service_url(req: &HttpRequest) -> Option<Url> {
+    if !artwork::enabled() {
+        return None;
+    }
+    match req.url_for("episode_art", Vec::<&str>::new()) {
+        Ok(url) => Some(url),
+        Err(e) => {
+            // never fatal: a feed without composed artwork is still a feed,
+            // but a broken route name would otherwise hide the feature
+            warn!("could not build the artwork route url: {e}");
+            None
         }
     }
 }
@@ -271,10 +324,12 @@ fn serve_feed(
     served: ServedFeed,
     should_transcode: bool,
     transcode_service_url: &Url,
+    artwork_service_url: Option<&Url>,
 ) -> HttpResponse {
     match rss_transcodizer::inject_vod2pod_customizations(
         served.body,
         should_transcode.then(|| transcode_service_url.clone()),
+        artwork_service_url.cloned(),
     ) {
         Ok(body) => conditional_response(
             req.headers(),
@@ -288,6 +343,57 @@ fn serve_feed(
             HttpResponse::Conflict().finish()
         }
     }
+}
+
+/// Serve the square composed for one video id (docs/adr/0004). The id is the
+/// only input: the upstream URL is built here, never taken from the request,
+/// so this route cannot be pointed at a host of the caller's choosing.
+async fn episode_art(req: HttpRequest, query: web::Query<HashMap<String, String>>) -> HttpResponse {
+    let Some(video_id) = query.get("id") else {
+        return HttpResponse::BadRequest().finish();
+    };
+    if !artwork::is_video_id(video_id) {
+        return HttpResponse::BadRequest().finish();
+    }
+    let installed = req
+        .app_data::<Arc<dyn artwork::ThumbnailFetcher>>()
+        .cloned();
+    let fetcher: &dyn artwork::ThumbnailFetcher = match installed.as_ref() {
+        Some(fetcher) => fetcher.as_ref(),
+        None => production_thumbnail_fetcher(),
+    };
+    match artwork::square_artwork(video_id, fetcher).await {
+        Ok(square) => square_artwork_response(square),
+        Err(e) => {
+            // the player still gets a picture: the upstream still, which it
+            // crops exactly as it did before this route existed. A redirect
+            // costs nothing and never leaves a broken tile in the app.
+            warn!("could not compose square artwork for {video_id}: {e}");
+            HttpResponse::Found()
+                .insert_header((http::header::LOCATION, artwork::fallback_url(video_id)))
+                .finish()
+        }
+    }
+}
+
+/// The production fetcher, built once: one HTTP client, so its connection
+/// pool and TLS sessions are reused across artwork requests.
+fn production_thumbnail_fetcher() -> &'static artwork::HttpThumbnailFetcher {
+    static FETCHER: std::sync::OnceLock<artwork::HttpThumbnailFetcher> = std::sync::OnceLock::new();
+    FETCHER.get_or_init(artwork::HttpThumbnailFetcher::default)
+}
+
+fn square_artwork_response(square: Vec<u8>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("image/jpeg")
+        .insert_header((
+            http::header::CACHE_CONTROL,
+            // a square for one video id never changes: the composition is a
+            // pure function of the still, and the cache key carries the
+            // composition version. Players can keep it forever.
+            "public, max-age=31536000, immutable",
+        ))
+        .body(square)
 }
 
 /// Build the HTTP response for a feed body with ETag / Last-Modified /
@@ -625,7 +731,8 @@ mod tests {
     // test's own runtime ever locks it.
 
     use crate::test_support::{
-        env_lock, staging_test_limits, EnvPin, MediaFixture, OriginProvider, TempDir,
+        env_lock, staging_test_limits, uncached_video_id, EnvPin, MediaFixture, OriginProvider,
+        TempDir,
     };
     use crate::transcoder::media_sizing::streamable_bytes;
     use crate::transcoder::staging::test_origin::{OriginScript, ScriptedOrigin};
@@ -978,5 +1085,123 @@ mod tests {
             .expect("a URL no provider whitelists must be rejected");
 
         assert_eq!(error.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    // -- the artwork route (docs/adr/0004) -------------------------------------
+    //
+    // Apple Podcasts crops a 16:9 still in its square slot; the route hands it
+    // a square instead. These tests drive the route end to end with a scripted
+    // thumbnail upstream, the way the transcode tests drive the resolver seam.
+
+    /// A thumbnail upstream with one scripted answer for every URL.
+    struct ScriptedThumbnails {
+        answer: Option<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl artwork::ThumbnailFetcher for ScriptedThumbnails {
+        async fn fetch(&self, _url: &str) -> eyre::Result<Option<Vec<u8>>> {
+            Ok(self.answer.clone())
+        }
+    }
+
+    fn spawn_artwork_server(answer: Option<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fetcher = Arc::new(ScriptedThumbnails { answer });
+        tokio::spawn(spawn_server_with_thumbnail_fetcher(listener, fetcher).unwrap());
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[actix_rt::test]
+    async fn artwork_route_serves_a_square_jpeg() {
+        let still = crate::test_support::still_16_9();
+        let address = spawn_artwork_server(Some(still));
+        let video_id = uncached_video_id();
+
+        let response = reqwest::Client::new()
+            .get(format!("{address}/artwork"))
+            .query(&[("id", video_id.as_str())])
+            .send()
+            .await
+            .expect("the artwork route must answer");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(header(&response, "content-type"), Some("image/jpeg"));
+        assert_eq!(
+            header(&response, "cache-control"),
+            Some("public, max-age=31536000, immutable"),
+            "a square for one id never changes, so players may keep it"
+        );
+        let body = response.bytes().await.unwrap().to_vec();
+        assert_eq!(
+            crate::test_support::jpeg_dimensions(&body),
+            (artwork::CANVAS_PX, artwork::CANVAS_PX),
+            "the player receives the square Apple Podcasts can show uncropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn artwork_route_answers_head_without_a_body() {
+        let still = crate::test_support::still_16_9();
+        let address = spawn_artwork_server(Some(still));
+        let video_id = uncached_video_id();
+
+        let response = reqwest::Client::new()
+            .head(format!("{address}/artwork"))
+            .query(&[("id", video_id.as_str())])
+            .send()
+            .await
+            .expect("the artwork route must answer HEAD");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            response.bytes().await.unwrap().is_empty(),
+            "HEAD carries no body"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn artwork_route_redirects_to_the_upstream_still_when_nothing_can_be_composed() {
+        let address = spawn_artwork_server(None);
+        let video_id = uncached_video_id();
+
+        let response = reqwest::Client::builder()
+            // the redirect itself is what this test pins: following it would
+            // leave the sandbox and ask YouTube for a fake video id
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{address}/artwork"))
+            .query(&[("id", video_id.as_str())])
+            .send()
+            .await
+            .expect("the artwork route must answer");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(
+            header(&response, "location"),
+            Some(artwork::fallback_url(&video_id).as_str()),
+            "a player must still get a picture, never a broken tile"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn artwork_route_refuses_an_id_that_is_path_shaped() {
+        let address = spawn_artwork_server(Some(crate::test_support::still_16_9()));
+
+        for id in ["../etc/passwd", "id.jpg", "", "a b"] {
+            let response = reqwest::Client::new()
+                .get(format!("{address}/artwork"))
+                .query(&[("id", id)])
+                .send()
+                .await
+                .expect("the artwork route must answer");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{id:?} must be refused before anything is fetched"
+            );
+        }
     }
 }

@@ -51,6 +51,14 @@ disagree, one of them is wrong — fix it before moving on.
   title, description, artwork, publish date — what a podcatcher renders for an
   Episode. Distinct from Episode Guid and Enclosure URL, which identify and
   deliver an Episode rather than present it.
+- **Upstream Artwork**: the artwork URL a provider publishes for an Episode, as
+  it published it — for YouTube, a 16:9 video still. Served untouched when
+  Square Episode Artwork is off, and the redirect target when composition
+  fails.
+- **Square Episode Artwork**: the square version of an Episode's Upstream
+  Artwork that this service composes itself, so a player whose slot is square
+  shows all of the picture instead of cropping it (docs/adr/0004). Exists only
+  for a YouTube Episode that already had Upstream Artwork.
 - **Episode Guid**: the identifier a podcatcher uses to dedupe Episodes. One
   Episode has exactly one Episode Guid, independent of which Ladder rung
   produced the Feed that carried it (real conversion or Degraded Feed) and of

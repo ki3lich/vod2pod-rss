@@ -111,6 +111,19 @@ Note: These can also be set using Docker [.env files](https://docs.docker.com/co
 - `MAX_FRESH_PERIOD`: (optional) Upper bound on how long freshness probes may keep a cached feed "fresh" without a full regeneration, in seconds. Default is 86400 (24 hours)
 - `YOUTUBE_YT_DLP_GET_URL_EXTRA_ARGS`
 
+### Episode artwork
+
+Apple Podcasts shows episode artwork in a square slot and crops anything else:
+a 16:9 video still loses about a fifth of its width on each side. vod2pod-rss
+composes a square instead (docs/adr/0004): 1400×1400, the whole still sharp in
+the middle and a blurred, darkened copy of that same still filling the canvas
+— the ambient-fill composition Apple's artwork guide describes. It costs one
+ffmpeg run per episode (the ffmpeg that transcodes the audio already), cached
+in Redis and served with a one-year `immutable` cache header, so a player
+fetches each square once.
+
+- `SQUARE_EPISODE_ARTWORK`: (optional) Set to "false" (or "0", "off", "no" — exact spellings only, case-insensitive) to serve the provider's own thumbnail URL untouched, exactly as before this feature existed. Anything else, including a typo of one of those, keeps composed artwork on (the default)
+
 ### Source staging
 
 For direct-media sources (YouTube), the episode's source media is staged to a
@@ -169,6 +182,9 @@ present, `itunes:block=Yes` keeps private instances out of Apple's
 public directory, and enclosure URLs are stable per episode so Apple's
 central crawler can use conditional GET (`304`) instead of re-downloading
 every feed body.
+
+Episode artwork is composed square instead of handed over as the raw 16:9
+thumbnail — see [Episode artwork](#episode-artwork).
 
 One caveat: Apple Podcasts plays MP3/M4A only. The default `AUDIO_CODEC=MP3`
 is fully compatible; `OPUS` and `OGG_VORBIS` work in other podcatchers but
