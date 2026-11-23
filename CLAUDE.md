@@ -17,7 +17,7 @@ Five canonical roles, each label string equal to its role name (`needs-triage`, 
 
 ### Agent tooling
 
-Renovate config checks and pi-lens rule scoping: see `docs/agents/tooling.md`.
+Renovate config checks, CI logs, pi-lens rule scoping: see `docs/agents/tooling.md`.
 
 ### Domain docs
 
