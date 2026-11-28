@@ -21,7 +21,7 @@ google-apis-common = "=8.0.0"
 hyper-util = { version = "=0.1.21", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 actix-web = "=4.20.0"
 async-trait = "=0.1.92"
-url = { version="=2.5.8", features = ["serde"]}
+url = { version="=2.5.9", features = ["serde"]}
 futures = "=0.3.34"
 log = "=0.4.35"
 regex = "=1.13.2"
